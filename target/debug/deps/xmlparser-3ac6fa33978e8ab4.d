@@ -1,0 +1,11 @@
+/home/runner/work/pixelforge/pixelforge/target/debug/deps/xmlparser-3ac6fa33978e8ab4.d: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/error.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/stream.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/strspan.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/xmlchar.rs
+
+/home/runner/work/pixelforge/pixelforge/target/debug/deps/libxmlparser-3ac6fa33978e8ab4.rlib: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/error.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/stream.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/strspan.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/xmlchar.rs
+
+/home/runner/work/pixelforge/pixelforge/target/debug/deps/libxmlparser-3ac6fa33978e8ab4.rmeta: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/error.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/stream.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/strspan.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/xmlchar.rs
+
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/lib.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/error.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/stream.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/strspan.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xmlparser-0.13.6/src/xmlchar.rs:
