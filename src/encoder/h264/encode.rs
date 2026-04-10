@@ -96,9 +96,9 @@ impl H264Encoder {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags::new_bitfield_1(
                 0, // direct_spatial_mv_pred_flag
-                1, // num_ref_idx_active_override_flag: always override so decoders use the
-                // per-slice active count instead of the PPS default, which prevents
-                // "Missing reference picture" errors when the DPB is not yet full.
+                // Always override the PPS default so decoders use the per-slice active count,
+                // preventing "Missing reference picture" errors when the DPB is not yet full.
+                1, // num_ref_idx_active_override_flag
                 0, // reserved
             ),
         };
