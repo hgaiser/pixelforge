@@ -1,3 +1,0 @@
-        @PACKAGE_INIT@
-        include("@PACKAGE_PATH_EXPORT_TARGETS@")
-    

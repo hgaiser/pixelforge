@@ -1,9 +1,0 @@
-prefix=/home/runner/work/pixelforge/pixelforge/target/debug/build/shaderc-sys-c90f2387041ca536/out
-includedir=${prefix}/include
-
-Name: SPIRV-Headers
-Description: Header files from the SPIR-V registry
-Version: 1.5.5
-Requires:
-Libs:
-Cflags: -I${includedir}
