@@ -92,14 +92,17 @@ impl H264Encoder {
         };
 
         // Build StdVideoEncodeH264SliceHeader.
+        // num_ref_idx_active_override_flag is only present in P/B/SP slice headers per the H.264
+        // spec. For P/B slices we set it to 1 so each slice signals the actual available
+        // reference count instead of relying on the PPS default, preventing "Missing reference
+        // picture" errors when the DPB is not yet full.
+        let use_ref_override = !is_idr as u32;
         let slice_header_flags = ash::vk::native::StdVideoEncodeH264SliceHeaderFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags::new_bitfield_1(
-                0, // direct_spatial_mv_pred_flag
-                // Always override the PPS default so decoders use the per-slice active count,
-                // preventing "Missing reference picture" errors when the DPB is not yet full.
-                1, // num_ref_idx_active_override_flag
-                0, // reserved
+                0,                // direct_spatial_mv_pred_flag
+                use_ref_override, // num_ref_idx_active_override_flag
+                0,                // reserved
             ),
         };
 
@@ -175,20 +178,19 @@ impl H264Encoder {
                 (0, 0)
             }
         } else if !is_idr && !self.l0_references.is_empty() {
-            // P-frame: L0 reference list using actual available references.
-            // Clamp to the negotiated active count maximum.
+            // P-frame: L0 reference list using actual available references,
+            // clamped to the negotiated active count (which is itself ≤32 at init time).
             let actual_count = self
                 .l0_references
                 .len()
-                .min(self.active_reference_count as usize);
+                .min(self.active_reference_count as usize)
+                .min(32);
 
             for (i, ref_info) in self.l0_references.iter().take(actual_count).enumerate() {
-                if i < 32 {
-                    ref_list0[i] = ref_info.dpb_slot;
-                }
+                ref_list0[i] = ref_info.dpb_slot;
             }
 
-            (actual_count.min(32), 0)
+            (actual_count, 0)
         } else {
             // IDR: no references.
             (0, 0)
