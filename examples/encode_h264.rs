@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input_image.upload_yuv420(frame)?;
 
         // Encode the image.
-        for packet in encoder.encode(input_image.image())? {
+        for packet in encoder.encode(input_image.image(), None)? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
             println!(

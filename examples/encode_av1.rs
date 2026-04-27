@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Encode the image (passing InputImage's image, which triggers
         // an internal copy to the encoder's input image with proper
         // layout transitions).
-        for packet in encoder.encode(input_image.image())? {
+        for packet in encoder.encode(input_image.image(), None)? {
             total_bytes += packet.data.len();
             output.write_all(&packet.data)?;
             println!(

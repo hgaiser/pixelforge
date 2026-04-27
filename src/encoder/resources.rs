@@ -1099,77 +1099,6 @@ pub(crate) fn upload_image_to_input(
     Ok(())
 }
 
-/// Parameters for cleaning up shared encoder resources.
-pub(crate) struct EncoderResources<'a> {
-    pub query_pool: vk::QueryPool,
-    pub upload_fence: vk::Fence,
-    pub encode_fence: vk::Fence,
-    pub command_pool: vk::CommandPool,
-    pub upload_command_pool: vk::CommandPool,
-    pub bitstream_buffer: vk::Buffer,
-    pub bitstream_buffer_memory: vk::DeviceMemory,
-    pub input_image: vk::Image,
-    pub input_image_memory: vk::DeviceMemory,
-    pub input_image_view: vk::ImageView,
-    pub dpb_images: &'a [vk::Image],
-    pub dpb_image_memories: &'a [vk::DeviceMemory],
-    pub dpb_image_views: &'a [vk::ImageView],
-    pub session: vk::VideoSessionKHR,
-    pub session_params: vk::VideoSessionParametersKHR,
-    pub session_memory: &'a [vk::DeviceMemory],
-}
-
-/// Destroy all shared encoder resources.
-///
-/// # Safety
-///
-/// All queues that may reference these resources (transfer and video encode)
-/// must be idle before calling this function.
-pub(crate) unsafe fn destroy_encoder_resources(
-    device: &ash::Device,
-    video_queue_fn: &ash::khr::video_queue::Device,
-    res: &EncoderResources,
-) {
-    device.destroy_query_pool(res.query_pool, None);
-    device.destroy_fence(res.upload_fence, None);
-    device.destroy_fence(res.encode_fence, None);
-    device.destroy_command_pool(res.command_pool, None);
-    if res.upload_command_pool != res.command_pool {
-        device.destroy_command_pool(res.upload_command_pool, None);
-    }
-
-    device.unmap_memory(res.bitstream_buffer_memory);
-    device.destroy_buffer(res.bitstream_buffer, None);
-    device.free_memory(res.bitstream_buffer_memory, None);
-
-    device.destroy_image_view(res.input_image_view, None);
-    device.destroy_image(res.input_image, None);
-    device.free_memory(res.input_image_memory, None);
-
-    for view in res.dpb_image_views {
-        device.destroy_image_view(*view, None);
-    }
-    for image in res.dpb_images {
-        device.destroy_image(*image, None);
-    }
-    for memory in res.dpb_image_memories {
-        device.free_memory(*memory, None);
-    }
-
-    if res.session_params != vk::VideoSessionParametersKHR::null() {
-        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
-            device.handle(),
-            res.session_params,
-            std::ptr::null(),
-        );
-    }
-    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
-
-    for memory in res.session_memory {
-        device.free_memory(*memory, None);
-    }
-}
-
 /// Record DPB image barriers for encode.
 ///
 /// Transitions the setup DPB slot from UNDEFINED to VIDEO_ENCODE_DPB and
@@ -1337,55 +1266,75 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
     );
 }
 
-/// Submit an encode command buffer and wait for completion.
+/// Submit an encode command buffer to the encode queue without waiting.
 ///
-/// Submits the command buffer to the encode queue, waits for the fence,
-/// then reads query results and copies the encoded bitstream data.
-/// The fence is reset before submission so it may be in any state on entry.
+/// This is the asynchronous half of the encode submit. Use `wait_and_read_bitstream`
+/// later to drain the result. Lets pipelined encoders (H.265 with depth > 1) keep
+/// multiple encodes in flight on the encode queue.
+///
+/// The fence is reset before submission so it may be in any state on entry, and
+/// will be signaled when the GPU encode finishes.
 ///
 /// # Safety
 ///
 /// The command buffer must have been ended.
-/// The bitstream buffer pointer must be valid and the buffer must be persistently mapped.
-pub(crate) unsafe fn submit_encode_and_read_bitstream(
+pub(crate) unsafe fn submit_encode_only(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
-    query_pool: vk::QueryPool,
-    bitstream_buffer_ptr: *const u8,
-) -> Result<Vec<u8>> {
-    let submit_info =
+    wait_semaphore: Option<vk::Semaphore>,
+) -> Result<()> {
+    let wait_semaphores: Vec<vk::Semaphore>;
+    let wait_dst_stage_mask: Vec<vk::PipelineStageFlags>;
+
+    let mut submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
 
-    // Reset the fence before submit (it may be signaled from a previous encode
-    // or from initial creation with SIGNALED_BIT). This ensures the fence is
-    // unsignaled for queue_submit, and after wait_for_fences it stays signaled —
-    // which lets set_color_description() safely wait on it between encodes.
+    if let Some(sem) = wait_semaphore {
+        wait_semaphores = vec![sem];
+        wait_dst_stage_mask = vec![vk::PipelineStageFlags::ALL_COMMANDS];
+        submit_info = submit_info
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_dst_stage_mask);
+    }
+
     device
         .reset_fences(&[fence])
         .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-
     device
         .queue_submit(encode_queue, &[submit_info], fence)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    Ok(())
+}
 
+/// Wait on the encode fence and read the bitstream produced by a prior
+/// `submit_encode_only` call on the same fence/query_pool/buffer triple.
+///
+/// # Safety
+///
+/// The fence must be the one signaled by the encode submission whose bitstream
+/// is being drained here, and `bitstream_buffer_ptr` must point to the
+/// persistently-mapped bitstream buffer for that submission.
+pub(crate) unsafe fn wait_and_read_bitstream(
+    device: &ash::Device,
+    fence: vk::Fence,
+    query_pool: vk::QueryPool,
+    bitstream_buffer_ptr: *const u8,
+) -> Result<Vec<u8>> {
     device
         .wait_for_fences(&[fence], true, u64::MAX)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-    // Read query results (offset + bytes_written).
     #[repr(C)]
     struct QueryResult {
         offset: u32,
         bytes_written: u32,
     }
-
     let mut query_results = [QueryResult {
         offset: 0,
         bytes_written: 0,
     }];
-
     device
         .get_query_pool_results(
             query_pool,
@@ -1397,19 +1346,16 @@ pub(crate) unsafe fn submit_encode_and_read_bitstream(
 
     let offset = query_results[0].offset as usize;
     let size = query_results[0].bytes_written as usize;
-
     if size == 0 {
         return Err(PixelForgeError::QueryPool(
             "Encoder produced 0 bytes".to_string(),
         ));
     }
-
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
 
     let mut encoded_data = vec![0u8; size];
     let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
     encoded_data.copy_from_slice(src);
-
     Ok(encoded_data)
 }
 

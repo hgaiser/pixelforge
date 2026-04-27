@@ -216,6 +216,13 @@ pub struct ColorConverter {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+
+    // Semaphore signaled when convert completes on GPU.
+    // The encoder waits on this before reading the target image.
+    signal_semaphore: vk::Semaphore,
+
+    // Whether a submission is in flight (fence hasn't been waited on yet).
+    in_flight: bool,
 }
 
 impl ColorConverter {
@@ -525,13 +532,33 @@ impl ColorConverter {
     ///
     /// # Returns
     /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
+    /// Convert an RGB source image to YUV, writing to the target image.
+    ///
+    /// Returns a semaphore that will be signaled when the GPU conversion
+    /// completes. The caller should pass this semaphore to the encoder's
+    /// submit as a wait semaphore to overlap convert and encode on the GPU.
+    ///
+    /// The function does NOT block waiting for the GPU — it returns as soon
+    /// as the command buffer is submitted.
     pub fn convert(
         &mut self,
         src_image: vk::Image,
         src_layout: vk::ImageLayout,
         target_image: vk::Image,
-    ) -> Result<()> {
+    ) -> Result<vk::Semaphore> {
         let start = std::time::Instant::now();
+
+        // Wait for the previous frame's submission to complete before
+        // re-recording the command buffer.
+        if self.in_flight {
+            let device = self.context.device();
+            unsafe {
+                device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            }
+            self.in_flight = false;
+        }
 
         // Get or create ImageView for the source image (must happen before
         // borrowing device immutably, since this takes &mut self).
@@ -771,28 +798,31 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        // Submit and wait.
+        // Submit with semaphore signal — do NOT wait for completion.
+        // The caller passes the returned semaphore to the encoder's submit
+        // as a wait dependency, so convert and encode overlap on the GPU.
         unsafe {
             device
                 .reset_fences(&[self.fence])
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
             let command_buffers = [self.command_buffer];
-            let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            let signal_semaphores = [self.signal_semaphore];
+            let submit_info = vk::SubmitInfo::default()
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
 
             device
                 .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-            device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            self.in_flight = true;
         }
 
         let elapsed = start.elapsed();
         debug!("ColorConverter::convert() took {:?}", elapsed);
 
-        Ok(())
+        Ok(self.signal_semaphore)
     }
 
     /// Get or create an ImageView for the source image.
@@ -853,6 +883,11 @@ impl Drop for ColorConverter {
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             // Destroy command resources.
+            // Wait for any in-flight work before destroying resources.
+            if self.in_flight {
+                let _ = device.wait_for_fences(&[self.fence], true, u64::MAX);
+            }
+            device.destroy_semaphore(self.signal_semaphore, None);
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
         }

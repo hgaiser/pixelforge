@@ -157,10 +157,10 @@ impl H264ReferenceListBuilder {
         }
 
         // Sort short-term by descending PicNum.
-        short_term_refs.sort_by(|a, b| b.pic_num.cmp(&a.pic_num));
+        short_term_refs.sort_by_key(|r| std::cmp::Reverse(r.pic_num));
 
         // Sort long-term by ascending LongTermPicNum.
-        long_term_refs.sort_by(|a, b| a.long_term_pic_num.cmp(&b.long_term_pic_num));
+        long_term_refs.sort_by_key(|r| r.long_term_pic_num);
 
         // Build L0: short-term first, then long-term.
         for r in short_term_refs {
@@ -237,13 +237,13 @@ impl H264ReferenceListBuilder {
         }
 
         // Sort refs_before by descending POC (closest to current first)
-        refs_before.sort_by(|a, b| b.poc.cmp(&a.poc));
+        refs_before.sort_by_key(|r| std::cmp::Reverse(r.poc));
 
         // Sort refs_after by ascending POC (closest to current first)
-        refs_after.sort_by(|a, b| a.poc.cmp(&b.poc));
+        refs_after.sort_by_key(|r| r.poc);
 
         // Sort long-term by ascending LongTermPicNum.
-        long_term_refs.sort_by(|a, b| a.long_term_pic_num.cmp(&b.long_term_pic_num));
+        long_term_refs.sort_by_key(|r| r.long_term_pic_num);
 
         // Build L0: refs_before, refs_after, long_term.
         for r in &refs_before {

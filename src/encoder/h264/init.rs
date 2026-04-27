@@ -418,16 +418,6 @@ impl H264Encoder {
         profile_for_resources.p_next =
             (&mut h264_profile_for_resources as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
 
-        // Create input image.
-        let (input_image, input_image_memory, input_image_view) = create_image(
-            &context,
-            aligned_width,
-            aligned_height,
-            picture_format,
-            false,
-            &profile_for_resources,
-        )?;
-
         // Determine DPB mode: use layered DPB when the driver does not advertise
         // support for separate reference images (required for AMD RADV).
         let supports_separate_dpb = capabilities
@@ -438,7 +428,7 @@ impl H264Encoder {
             info!("Using layered DPB (driver does not support separate reference images)");
         }
 
-        // Create DPB images.
+        // Create DPB images (shared across slots).
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
             aligned_width,
@@ -449,77 +439,122 @@ impl H264Encoder {
             use_layered_dpb,
         )?;
 
-        // Create bitstream buffer.
-        let (bitstream_buffer, bitstream_buffer_memory) =
-            create_bitstream_buffer(&context, MIN_BITSTREAM_BUFFER_SIZE, &profile_for_resources)?;
-
-        // Persistently map the bitstream buffer to avoid per-frame map/unmap overhead.
-        let bitstream_buffer_ptr =
-            map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
-
-        // Create command pool, buffers, and fences.
-        // Use the transfer queue family for upload commands when the encode queue
-        // doesn't support transfer operations (AMD RADV).
+        // Create command pool and shared upload resources. Encode command
+        // buffers (one per slot) are allocated below from `command_pool`.
         let upload_queue_family = context.transfer_queue_family();
         let cmd_resources =
             create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
         let upload_command_pool = cmd_resources.upload_command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
-        let encode_command_buffer = cmd_resources.encode_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
-        let encode_fence = cmd_resources.encode_fence;
 
-        // Clear the input image so padding between user dimensions and the
-        // aligned coded extent is zero-initialized.
-        clear_input_image(
-            &context,
-            &ClearImageParams {
-                command_buffer: upload_command_buffer,
-                fence: upload_fence,
-                queue: context.transfer_queue(),
-                image: input_image,
-                width: aligned_width,
-                height: aligned_height,
-                pixel_format: config.pixel_format,
-                bit_depth: config.bit_depth,
-            },
-        )?;
+        // Allocate ENCODE_PIPELINE_DEPTH-1 additional encode command buffers.
+        let extra_buffers_needed = super::ENCODE_PIPELINE_DEPTH.saturating_sub(1) as u32;
+        let extra_encode_buffers: Vec<vk::CommandBuffer> = if extra_buffers_needed > 0 {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(extra_buffers_needed);
+            unsafe { context.device().allocate_command_buffers(&alloc_info) }
+                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+        } else {
+            Vec::new()
+        };
 
-        // Create query pool.
-        let mut h264_profile_info_query =
-            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        // Build per-slot resources.
+        let mut slots: Vec<super::EncodeSlot> = Vec::with_capacity(super::ENCODE_PIPELINE_DEPTH);
+        for slot_idx in 0..super::ENCODE_PIPELINE_DEPTH {
+            let (input_image, input_image_memory, input_image_view) = create_image(
+                &context,
+                aligned_width,
+                aligned_height,
+                picture_format,
+                false,
+                &profile_for_resources,
+            )?;
 
-        let mut profile_info_query = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(chroma_subsampling)
-            .luma_bit_depth(luma_bit_depth)
-            .chroma_bit_depth(chroma_bit_depth);
-        profile_info_query.p_next =
-            (&mut h264_profile_info_query as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            let (bitstream_buffer, bitstream_buffer_memory) = create_bitstream_buffer(
+                &context,
+                MIN_BITSTREAM_BUFFER_SIZE,
+                &profile_for_resources,
+            )?;
+            let bitstream_buffer_ptr =
+                map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
 
-        let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(
-                vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
-                    | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
-            );
+            clear_input_image(
+                &context,
+                &ClearImageParams {
+                    command_buffer: upload_command_buffer,
+                    fence: upload_fence,
+                    queue: context.transfer_queue(),
+                    image: input_image,
+                    width: aligned_width,
+                    height: aligned_height,
+                    pixel_format: config.pixel_format,
+                    bit_depth: config.bit_depth,
+                },
+            )?;
 
-        encode_feedback_create.p_next =
-            (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
+            let encode_command_buffer = if slot_idx == 0 {
+                cmd_resources.encode_command_buffer
+            } else {
+                extra_encode_buffers[slot_idx - 1]
+            };
 
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next = (&mut encode_feedback_create
-            as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
-            .cast();
+            let encode_fence = if slot_idx == 0 {
+                cmd_resources.encode_fence
+            } else {
+                let signaled = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+                unsafe { context.device().create_fence(&signaled, None) }
+                    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+            };
 
-        let query_pool = unsafe {
-            context
-                .device()
-                .create_query_pool(&query_pool_create_info, None)
+            // Per-slot single-query pool.
+            let mut h264_profile_info_query =
+                vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+            let mut profile_info_query = vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                .chroma_subsampling(chroma_subsampling)
+                .luma_bit_depth(luma_bit_depth)
+                .chroma_bit_depth(chroma_bit_depth);
+            profile_info_query.p_next =
+                (&mut h264_profile_info_query as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            let mut encode_feedback_create =
+                vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default().encode_feedback_flags(
+                    vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
+                        | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+                );
+            encode_feedback_create.p_next =
+                (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
+            let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1);
+            query_pool_create_info.p_next = (&mut encode_feedback_create
+                as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
+                .cast();
+            let query_pool = unsafe {
+                context
+                    .device()
+                    .create_query_pool(&query_pool_create_info, None)
+            }
+            .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+
+            slots.push(super::EncodeSlot {
+                input_image,
+                input_image_memory,
+                input_image_view,
+                input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+                bitstream_buffer,
+                bitstream_buffer_memory,
+                bitstream_buffer_ptr,
+                encode_command_buffer,
+                encode_fence,
+                query_pool,
+                in_flight: false,
+                pending_metadata: None,
+            });
         }
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
 
         // Create DPB and GOP structure.
         // The DPB size should match the actual number of allocated DPB slots.
@@ -565,10 +600,8 @@ impl H264Encoder {
             encode_frame_num: 0,
             frame_num_syntax: 0,
             idr_pic_id: 0,
-            input_image,
-            input_image_memory,
-            input_image_view,
-            input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            slots,
+            current_slot: 0,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,
@@ -578,16 +611,11 @@ impl H264Encoder {
             current_dpb_slot: 0,
             l0_references: Vec::new(),
             active_reference_count: max_active_reference_pictures as u32,
-            bitstream_buffer,
-            bitstream_buffer_memory,
-            bitstream_buffer_ptr,
             command_pool,
             upload_command_pool,
             upload_command_buffer,
             upload_fence,
-            encode_command_buffer,
-            encode_fence,
-            query_pool,
+            pending_wait_semaphore: None,
             sps_written: false,
             // has_reference: false, // removed
             // reference_frame_num: 0, // removed

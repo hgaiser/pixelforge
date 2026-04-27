@@ -280,18 +280,7 @@ impl AV1Encoder {
             .color_description
             .unwrap_or(ColorDescription::bt709());
 
-        // Create input image.
-        let (input_image, input_image_memory, input_image_view) = create_image(
-            &context,
-            aligned_width,
-            aligned_height,
-            picture_format,
-            false, // is_dpb
-            &profile_info,
-        )?;
-        let input_image_layout = vk::ImageLayout::UNDEFINED;
-
-        // Create DPB images.
+        // Create DPB images (shared across slots).
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
             aligned_width,
@@ -301,59 +290,111 @@ impl AV1Encoder {
             &profile_info,
             false,
         )?;
-        // Create bitstream buffer.
+
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE.max(width as usize * height as usize);
-        let (bitstream_buffer, bitstream_buffer_memory) =
-            create_bitstream_buffer(&context, bitstream_buffer_size, &profile_info)?;
-        // Map bitstream buffer persistently.
-        let bitstream_buffer_ptr =
-            map_bitstream_buffer(&context, bitstream_buffer_memory, bitstream_buffer_size)?;
-        // Create command resources.
+
+        // Shared command pool / upload resources.
         let upload_queue_family = context.transfer_queue_family();
         let cmd_resources =
             create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
-        let encode_command_buffer = cmd_resources.encode_command_buffer;
-        let encode_fence = cmd_resources.encode_fence;
-        // Clear the input image so padding between user dimensions and the
-        // aligned coded extent is zero-initialized.
-        clear_input_image(
-            &context,
-            &ClearImageParams {
-                command_buffer: upload_command_buffer,
-                fence: upload_fence,
-                queue: context.transfer_queue(),
-                image: input_image,
-                width: aligned_width,
-                height: aligned_height,
-                pixel_format: config.pixel_format,
-                bit_depth: config.bit_depth,
-            },
-        )?;
-        // Create query pool for bitstream size queries.
-        // Need 1 query to capture bitstream offset and size.
-        // Need to provide profile info and feedback flags in pNext chain.
-        let mut query_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(
-                vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
-                    | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
-            );
-        query_feedback_info.p_next = (&profile_info as *const vk::VideoProfileInfoKHR).cast();
 
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next =
-            (&query_feedback_info as *const vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR).cast();
-
-        let query_pool = unsafe {
-            context
-                .device()
-                .create_query_pool(&query_pool_create_info, None)
-                .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?
+        // Allocate ENCODE_PIPELINE_DEPTH-1 additional encode command buffers.
+        let extra_buffers_needed = super::ENCODE_PIPELINE_DEPTH.saturating_sub(1) as u32;
+        let extra_encode_buffers: Vec<vk::CommandBuffer> = if extra_buffers_needed > 0 {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(extra_buffers_needed);
+            unsafe { context.device().allocate_command_buffers(&alloc_info) }
+                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+        } else {
+            Vec::new()
         };
+
+        // Build per-slot resources.
+        let mut slots: Vec<super::EncodeSlot> = Vec::with_capacity(super::ENCODE_PIPELINE_DEPTH);
+        for slot_idx in 0..super::ENCODE_PIPELINE_DEPTH {
+            let (input_image, input_image_memory, input_image_view) = create_image(
+                &context,
+                aligned_width,
+                aligned_height,
+                picture_format,
+                false,
+                &profile_info,
+            )?;
+
+            let (bitstream_buffer, bitstream_buffer_memory) =
+                create_bitstream_buffer(&context, bitstream_buffer_size, &profile_info)?;
+            let bitstream_buffer_ptr =
+                map_bitstream_buffer(&context, bitstream_buffer_memory, bitstream_buffer_size)?;
+
+            clear_input_image(
+                &context,
+                &ClearImageParams {
+                    command_buffer: upload_command_buffer,
+                    fence: upload_fence,
+                    queue: context.transfer_queue(),
+                    image: input_image,
+                    width: aligned_width,
+                    height: aligned_height,
+                    pixel_format: config.pixel_format,
+                    bit_depth: config.bit_depth,
+                },
+            )?;
+
+            let encode_command_buffer = if slot_idx == 0 {
+                cmd_resources.encode_command_buffer
+            } else {
+                extra_encode_buffers[slot_idx - 1]
+            };
+
+            let encode_fence = if slot_idx == 0 {
+                cmd_resources.encode_fence
+            } else {
+                let signaled = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+                unsafe { context.device().create_fence(&signaled, None) }
+                    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+            };
+
+            // Per-slot single-query pool.
+            let mut query_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
+                .encode_feedback_flags(
+                    vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
+                        | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+                );
+            query_feedback_info.p_next = (&profile_info as *const vk::VideoProfileInfoKHR).cast();
+            let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1);
+            query_pool_create_info.p_next = (&query_feedback_info
+                as *const vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
+                .cast();
+            let query_pool = unsafe {
+                context
+                    .device()
+                    .create_query_pool(&query_pool_create_info, None)
+                    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?
+            };
+
+            slots.push(super::EncodeSlot {
+                input_image,
+                input_image_memory,
+                input_image_view,
+                input_image_layout: vk::ImageLayout::UNDEFINED,
+                bitstream_buffer,
+                bitstream_buffer_memory,
+                bitstream_buffer_size,
+                bitstream_buffer_ptr,
+                encode_command_buffer,
+                encode_fence,
+                query_pool,
+                in_flight: false,
+                pending_metadata: None,
+            });
+        }
 
         // Initialize GOP structure.
         let gop = GopStructure::new(config.gop_size, config.b_frame_count, config.gop_size);
@@ -371,26 +412,18 @@ impl AV1Encoder {
             encode_frame_num: 0,
             frame_num: 0,
             order_hint: 0,
-            input_image,
-            input_image_memory,
-            input_image_view,
-            input_image_layout,
+            slots,
+            current_slot: 0,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count: requested_dpb_slots,
             dpb_slot_active: vec![false; requested_dpb_slots],
-            bitstream_buffer,
-            bitstream_buffer_memory,
-            bitstream_buffer_size,
-            bitstream_buffer_ptr,
             command_pool,
             upload_command_pool: cmd_resources.upload_command_pool,
             upload_command_buffer,
             upload_fence,
-            encode_command_buffer,
-            encode_fence,
-            query_pool,
+            pending_wait_semaphore: None,
             header_data: None,
             current_dpb_slot: 0,
             references: Vec::new(),

@@ -164,6 +164,11 @@ pub fn create_converter(
     let fence = unsafe { device.create_fence(&fence_info, None) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
+    // Create semaphore for signaling encode queue.
+    let semaphore_info = vk::SemaphoreCreateInfo::default();
+    let signal_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
     Ok(ColorConverter {
         context,
         config,
@@ -179,6 +184,8 @@ pub fn create_converter(
         command_pool,
         command_buffer,
         fence,
+        signal_semaphore,
+        in_flight: false,
     })
 }
 

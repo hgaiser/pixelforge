@@ -442,10 +442,10 @@ impl DpbH265 {
         }
 
         // Sort negative refs by POC descending (closest to current first)
-        negative_refs.sort_by(|a, b| b.0.cmp(&a.0));
+        negative_refs.sort_by_key(|r| std::cmp::Reverse(r.0));
 
         // Sort positive refs by POC ascending (closest to current first)
-        positive_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        positive_refs.sort_by_key(|r| r.0);
 
         // Limit to DPB size - 1.
         let max_refs = (self.max_dpb_size - 1) as usize;

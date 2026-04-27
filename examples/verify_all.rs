@@ -171,7 +171,7 @@ fn run_test(
                 _ => return Err("Unsupported format".into()),
             }
 
-            for packet in encoder.encode(encoder_image)? {
+            for packet in encoder.encode(encoder_image, None)? {
                 output_file.write_all(&packet.data)?;
             }
         }

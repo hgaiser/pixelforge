@@ -466,16 +466,20 @@ impl Encoder {
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// input.upload_yuv420(&yuv_data)?;
     ///
-    /// // Encode the image
-    /// let packets = encoder.encode(input.image())?;
+    /// // Encode the image (no GPU wait semaphore needed when uploaded synchronously).
+    /// let packets = encoder.encode(input.image(), None)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+    pub fn encode(
+        &mut self,
+        src_image: vk::Image,
+        wait_semaphore: Option<vk::Semaphore>,
+    ) -> Result<Vec<EncodedPacket>> {
         match self {
-            Encoder::H264(encoder) => encoder.encode(src_image),
-            Encoder::H265(encoder) => encoder.encode(src_image),
-            Encoder::AV1(encoder) => encoder.encode(src_image),
+            Encoder::H264(encoder) => encoder.encode(src_image, wait_semaphore),
+            Encoder::H265(encoder) => encoder.encode(src_image, wait_semaphore),
+            Encoder::AV1(encoder) => encoder.encode(src_image, wait_semaphore),
         }
     }
 
