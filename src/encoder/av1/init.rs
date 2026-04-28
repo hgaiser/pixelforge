@@ -2,9 +2,10 @@ use super::{AV1Encoder, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    allocate_session_memory, clear_input_image, create_bitstream_buffer, create_command_resources,
-    create_dpb_images, create_image, get_video_format, make_codec_name, map_bitstream_buffer,
-    query_supported_video_formats, ClearImageParams,
+    allocate_session_memory, clear_input_image, clear_rgb_input_image, create_bitstream_buffer,
+    create_command_resources, create_dpb_images, create_image, get_video_format, make_codec_name,
+    map_bitstream_buffer, query_supported_video_formats, rgb_conversion_model,
+    rgb_conversion_range, rgb_input_format, ClearImageParams,
 };
 use crate::encoder::{ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -46,6 +47,15 @@ impl AV1Encoder {
         let video_encode_fn =
             ash::khr::video_encode_queue::Device::load(context.instance(), context.device());
 
+        if config.use_rgb_input && !context.supports_rgb_direct_encode() {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "EncodeConfig::use_rgb_input requires VK_VALVE_video_encode_rgb_conversion, \
+                 which this device does not support."
+                    .to_string(),
+            ));
+        }
+        let use_rgb_input = config.use_rgb_input;
+
         // Get chroma subsampling from pixel format.
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
         let luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
@@ -62,8 +72,18 @@ impl AV1Encoder {
         // Preferred input format based on pixel format and bit depth.
         let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
 
-        // Create AV1 encode profile.
+        // Create AV1 encode profile. When RGB-direct is enabled we chain
+        // VkVideoEncodeProfileRgbConversionInfoVALVE inside av1_profile_info
+        // so all downstream uses (capability query, session create, image
+        // creation, query pool) see a profile that matches.
+        let mut rgb_conv_profile_info = vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+            .perform_encode_rgb_conversion(true);
         let mut av1_profile_info = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
+        if use_rgb_input {
+            av1_profile_info.p_next = (&mut rgb_conv_profile_info
+                as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                .cast();
+        }
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
@@ -182,7 +202,17 @@ impl AV1Encoder {
         info!("Supported SRC formats: {:?}", supported_src_formats);
         info!("Supported DPB formats: {:?}", supported_dpb_formats);
 
-        let picture_format = if supported_src_formats.contains(&preferred_src_format) {
+        let picture_format = if use_rgb_input {
+            let rgb_fmt = rgb_input_format(config.bit_depth);
+            if !supported_src_formats.contains(&rgb_fmt) {
+                return Err(PixelForgeError::NoSuitableDevice(format!(
+                    "RGB-direct encode requested but driver does not advertise {:?} as a \
+                     VIDEO_ENCODE_SRC_KHR format for this AV1 profile. Supported: {:?}",
+                    rgb_fmt, supported_src_formats
+                )));
+            }
+            rgb_fmt
+        } else if supported_src_formats.contains(&preferred_src_format) {
             preferred_src_format
         } else {
             return Err(PixelForgeError::NoSuitableDevice(format!(
@@ -191,11 +221,19 @@ impl AV1Encoder {
             )));
         };
 
-        let reference_picture_format = supported_dpb_formats
-            .iter()
-            .copied()
-            .find(|f| *f == picture_format)
-            .unwrap_or(supported_dpb_formats[0]);
+        let reference_picture_format = if use_rgb_input {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == preferred_src_format)
+                .unwrap_or(supported_dpb_formats[0])
+        } else {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == picture_format)
+                .unwrap_or(supported_dpb_formats[0])
+        };
 
         debug!(
             "Selected formats: picture={:?}, reference={:?}",
@@ -244,7 +282,18 @@ impl AV1Encoder {
             max_active_reference_pictures_supported
         );
 
-        let session_create_info = vk::VideoSessionCreateInfoKHR::default()
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
+
+        let mut session_rgb_conv_info =
+            vk::VideoEncodeSessionRgbConversionCreateInfoVALVE::default()
+                .rgb_model(rgb_conversion_model(&color_desc))
+                .rgb_range(rgb_conversion_range(&color_desc))
+                .x_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::COSITED_EVEN)
+                .y_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::MIDPOINT);
+
+        let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(encode_queue_family)
             .video_profile(&profile_info)
             .picture_format(picture_format)
@@ -256,6 +305,11 @@ impl AV1Encoder {
             .max_dpb_slots(requested_dpb_slots as u32)
             .max_active_reference_pictures(target_active_refs as u32)
             .std_header_version(&std_header_version);
+        if use_rgb_input {
+            session_create_info.p_next = (&mut session_rgb_conv_info
+                as *mut vk::VideoEncodeSessionRgbConversionCreateInfoVALVE)
+                .cast();
+        }
 
         let mut session = vk::VideoSessionKHR::null();
         let result = unsafe {
@@ -275,10 +329,6 @@ impl AV1Encoder {
 
         // Allocate session memory.
         let session_memory = allocate_session_memory(&context, session, &video_queue_fn)?;
-
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
 
         // Create DPB images (shared across slots).
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
@@ -331,19 +381,29 @@ impl AV1Encoder {
             let bitstream_buffer_ptr =
                 map_bitstream_buffer(&context, bitstream_buffer_memory, bitstream_buffer_size)?;
 
-            clear_input_image(
-                &context,
-                &ClearImageParams {
-                    command_buffer: upload_command_buffer,
-                    fence: upload_fence,
-                    queue: context.transfer_queue(),
-                    image: input_image,
-                    width: aligned_width,
-                    height: aligned_height,
-                    pixel_format: config.pixel_format,
-                    bit_depth: config.bit_depth,
-                },
-            )?;
+            if use_rgb_input {
+                clear_rgb_input_image(
+                    &context,
+                    upload_command_buffer,
+                    upload_fence,
+                    context.transfer_queue(),
+                    input_image,
+                )?;
+            } else {
+                clear_input_image(
+                    &context,
+                    &ClearImageParams {
+                        command_buffer: upload_command_buffer,
+                        fence: upload_fence,
+                        queue: context.transfer_queue(),
+                        image: input_image,
+                        width: aligned_width,
+                        height: aligned_height,
+                        pixel_format: config.pixel_format,
+                        bit_depth: config.bit_depth,
+                    },
+                )?;
+            }
 
             let encode_command_buffer = if slot_idx == 0 {
                 cmd_resources.encode_command_buffer

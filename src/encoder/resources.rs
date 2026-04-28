@@ -716,6 +716,149 @@ pub(crate) struct ClearImageParams {
     pub bit_depth: BitDepth,
 }
 
+/// Pick the input image format for the hardware-direct RGB encode path
+/// (`VK_VALVE_video_encode_rgb_conversion`). 8-bit picks B8G8R8A8_UNORM,
+/// 10-bit picks A2B10G10R10_UNORM_PACK32 — these match the formats RADV's
+/// VCN5 driver accepts for the RGB-conversion path, and are the
+/// `B`/`ABGR` variants that gamescope's override-surface DMA-BUFs
+/// typically arrive in (avoiding a channel swap).
+pub(crate) fn rgb_input_format(bit_depth: BitDepth) -> vk::Format {
+    match bit_depth {
+        BitDepth::Eight => vk::Format::B8G8R8A8_UNORM,
+        BitDepth::Ten => vk::Format::A2B10G10R10_UNORM_PACK32,
+    }
+}
+
+/// Pick the RGB→YUV model the hardware should apply, based on the
+/// configured colour description (BT.709 vs BT.2020).
+pub(crate) fn rgb_conversion_model(
+    desc: &crate::encoder::ColorDescription,
+) -> vk::VideoEncodeRgbModelConversionFlagsVALVE {
+    if desc.matrix_coefficients == 9 {
+        vk::VideoEncodeRgbModelConversionFlagsVALVE::YCBCR_2020
+    } else {
+        vk::VideoEncodeRgbModelConversionFlagsVALVE::YCBCR_709
+    }
+}
+
+/// Pick the RGB range compression flag (full vs limited) from the colour
+/// description.
+pub(crate) fn rgb_conversion_range(
+    desc: &crate::encoder::ColorDescription,
+) -> vk::VideoEncodeRgbRangeCompressionFlagsVALVE {
+    if desc.full_range {
+        vk::VideoEncodeRgbRangeCompressionFlagsVALVE::FULL_RANGE
+    } else {
+        vk::VideoEncodeRgbRangeCompressionFlagsVALVE::NARROW_RANGE
+    }
+}
+
+/// Clear an RGB-formatted encode input image (used by the
+/// `VK_VALVE_video_encode_rgb_conversion` path) to opaque black, then
+/// transition it to `VIDEO_ENCODE_SRC_KHR`.
+///
+/// RGB encode inputs are single-plane `COLOR` aspect images, so the
+/// multi-plane buffer-copy path used for YUV doesn't apply. We just
+/// `vkCmdClearColorImage` to zero, then barrier into encode layout.
+pub(crate) fn clear_rgb_input_image(
+    context: &VideoContext,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    queue: vk::Queue,
+    image: vk::Image,
+) -> Result<()> {
+    let device = context.device();
+
+    unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let subresource = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+    }
+
+    let clear_color = vk::ClearColorValue {
+        float32: [0.0, 0.0, 0.0, 1.0],
+    };
+    unsafe {
+        device.cmd_clear_color_image(
+            command_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &clear_color,
+            &[subresource],
+        );
+    }
+
+    let to_encode = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::empty());
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_encode],
+        );
+    }
+
+    unsafe { device.end_command_buffer(command_buffer) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let submit_info =
+        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+    unsafe { device.reset_fences(&[fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
+    unsafe { device.queue_submit(queue, &[submit_info], fence) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("submit rgb clear: {}", e)))?;
+    unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("wait rgb clear: {}", e)))?;
+    unsafe { device.reset_fences(&[fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
+
+    Ok(())
+}
+
 /// Clear the input image by filling it with zeros via a staging buffer.
 ///
 /// This must be called once after creating the input image to ensure

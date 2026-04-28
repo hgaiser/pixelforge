@@ -3,9 +3,10 @@ use super::{H264Encoder, MB_SIZE};
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    align_up, allocate_session_memory, clear_input_image, create_bitstream_buffer,
-    create_command_resources, create_dpb_images, create_image, get_video_format, lcm,
-    map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
+    align_up, allocate_session_memory, clear_input_image, clear_rgb_input_image,
+    create_bitstream_buffer, create_command_resources, create_dpb_images, create_image,
+    get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
+    rgb_conversion_model, rgb_conversion_range, rgb_input_format, ClearImageParams,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::ColorDescription;
@@ -42,6 +43,15 @@ impl H264Encoder {
         let video_encode_fn =
             ash::khr::video_encode_queue::Device::load(context.instance(), context.device());
 
+        if config.use_rgb_input && !context.supports_rgb_direct_encode() {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "EncodeConfig::use_rgb_input requires VK_VALVE_video_encode_rgb_conversion, \
+                 which this device does not support."
+                    .to_string(),
+            ));
+        }
+        let use_rgb_input = config.use_rgb_input;
+
         // Get chroma subsampling from pixel format via `From` impl.
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
 
@@ -62,9 +72,19 @@ impl H264Encoder {
         // Note: the DPB format may differ and must be queried separately.
         let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
 
-        // Create H.264 encode profile.
+        // Create H.264 encode profile. When RGB-direct is enabled we chain
+        // VkVideoEncodeProfileRgbConversionInfoVALVE on every profile we
+        // build (capability query, image creation, query pool) — profiles
+        // must match across all of those.
+        let mut rgb_conv_profile_info = vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+            .perform_encode_rgb_conversion(true);
         let mut h264_profile_info =
             vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        if use_rgb_input {
+            h264_profile_info.p_next = (&mut rgb_conv_profile_info
+                as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                .cast();
+        }
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
@@ -249,8 +269,21 @@ impl H264Encoder {
         }
         info!("Supported DPB formats: {:?}", supported_dpb_formats);
 
-        // For input uploads, we currently require the preferred 2-plane formats.
-        let picture_format = if supported_src_formats.contains(&preferred_src_format) {
+        // For input uploads, we currently require the preferred 2-plane
+        // formats — unless RGB-direct is enabled, in which case the SRC
+        // image must be one of the RGB formats VCN5 accepts and the DPB
+        // stays YUV.
+        let picture_format = if use_rgb_input {
+            let rgb_fmt = rgb_input_format(config.bit_depth);
+            if !supported_src_formats.contains(&rgb_fmt) {
+                return Err(PixelForgeError::NoSuitableDevice(format!(
+                    "RGB-direct encode requested but driver does not advertise {:?} as a \
+                     VIDEO_ENCODE_SRC_KHR format for this profile. Supported: {:?}",
+                    rgb_fmt, supported_src_formats
+                )));
+            }
+            rgb_fmt
+        } else if supported_src_formats.contains(&preferred_src_format) {
             preferred_src_format
         } else {
             return Err(PixelForgeError::NoSuitableDevice(format!(
@@ -259,12 +292,22 @@ impl H264Encoder {
             )));
         };
 
-        // DPB format can differ from the input format; prefer matching when possible.
-        let reference_picture_format = supported_dpb_formats
-            .iter()
-            .copied()
-            .find(|f| *f == picture_format)
-            .unwrap_or(supported_dpb_formats[0]);
+        // DPB format can differ from the input format; in RGB-direct mode
+        // DPB stays YUV (matching the encoder's internal pixel_format/
+        // bit_depth), otherwise prefer matching the picture_format.
+        let reference_picture_format = if use_rgb_input {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == preferred_src_format)
+                .unwrap_or(supported_dpb_formats[0])
+        } else {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == picture_format)
+                .unwrap_or(supported_dpb_formats[0])
+        };
 
         debug!(
             "Selected Vulkan Video formats: picture_format={:?}, reference_picture_format={:?} (preferred_src={:?})",
@@ -333,7 +376,18 @@ impl H264Encoder {
             PixelForgeError::NoSuitableDevice("No video encode queue family available".to_string())
         })?;
 
-        let session_create_info = vk::VideoSessionCreateInfoKHR::default()
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
+
+        let mut session_rgb_conv_info =
+            vk::VideoEncodeSessionRgbConversionCreateInfoVALVE::default()
+                .rgb_model(rgb_conversion_model(&color_desc))
+                .rgb_range(rgb_conversion_range(&color_desc))
+                .x_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::COSITED_EVEN)
+                .y_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::MIDPOINT);
+
+        let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(encode_queue_family)
             .flags(vk::VideoSessionCreateFlagsKHR::empty())
             .video_profile(&profile_info)
@@ -346,6 +400,11 @@ impl H264Encoder {
             .max_dpb_slots(dpb_slot_count as u32)
             .max_active_reference_pictures(max_active_reference_pictures as u32)
             .std_header_version(&std_header_version);
+        if use_rgb_input {
+            session_create_info.p_next = (&mut session_rgb_conv_info
+                as *mut vk::VideoEncodeSessionRgbConversionCreateInfoVALVE)
+                .cast();
+        }
 
         let mut session = vk::VideoSessionKHR::null();
         let result = unsafe {
@@ -403,13 +462,17 @@ impl H264Encoder {
             )));
         }
 
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
-
-        // Create profile info for images/buffers.
+        // Create profile info for images/buffers (shared across slots).
+        let mut rgb_conv_profile_for_resources =
+            vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+                .perform_encode_rgb_conversion(true);
         let mut h264_profile_for_resources =
             vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        if use_rgb_input {
+            h264_profile_for_resources.p_next = (&mut rgb_conv_profile_for_resources
+                as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                .cast();
+        }
         let mut profile_for_resources = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(chroma_subsampling)
@@ -482,19 +545,29 @@ impl H264Encoder {
             let bitstream_buffer_ptr =
                 map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
 
-            clear_input_image(
-                &context,
-                &ClearImageParams {
-                    command_buffer: upload_command_buffer,
-                    fence: upload_fence,
-                    queue: context.transfer_queue(),
-                    image: input_image,
-                    width: aligned_width,
-                    height: aligned_height,
-                    pixel_format: config.pixel_format,
-                    bit_depth: config.bit_depth,
-                },
-            )?;
+            if use_rgb_input {
+                clear_rgb_input_image(
+                    &context,
+                    upload_command_buffer,
+                    upload_fence,
+                    context.transfer_queue(),
+                    input_image,
+                )?;
+            } else {
+                clear_input_image(
+                    &context,
+                    &ClearImageParams {
+                        command_buffer: upload_command_buffer,
+                        fence: upload_fence,
+                        queue: context.transfer_queue(),
+                        image: input_image,
+                        width: aligned_width,
+                        height: aligned_height,
+                        pixel_format: config.pixel_format,
+                        bit_depth: config.bit_depth,
+                    },
+                )?;
+            }
 
             let encode_command_buffer = if slot_idx == 0 {
                 cmd_resources.encode_command_buffer
@@ -511,8 +584,16 @@ impl H264Encoder {
             };
 
             // Per-slot single-query pool.
+            let mut rgb_conv_profile_query =
+                vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+                    .perform_encode_rgb_conversion(true);
             let mut h264_profile_info_query =
                 vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+            if use_rgb_input {
+                h264_profile_info_query.p_next = (&mut rgb_conv_profile_query
+                    as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                    .cast();
+            }
             let mut profile_info_query = vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
                 .chroma_subsampling(chroma_subsampling)
