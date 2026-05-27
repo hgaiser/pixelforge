@@ -47,7 +47,7 @@ pub fn create_converter(
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(28); // 7 x u32: width, height, input_format, output_format, color_space, full_range, sdr_white_nits(f32)
+        .size(40); // 10 x u32, matching the GLSL PushConstants block.
 
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&descriptor_set_layout))
@@ -87,11 +87,10 @@ pub fn create_converter(
         .output_format
         .output_size(config.width, config.height);
 
-    // Create a nearest-neighbor sampler for texelFetch (the sampler state doesn't
-    // matter for texelFetch, but Vulkan requires a valid one for combined image sampler).
+    // Create a linear sampler for optional source scaling and aspect-preserving padding.
     let sampler_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::NEAREST)
-        .min_filter(vk::Filter::NEAREST)
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);

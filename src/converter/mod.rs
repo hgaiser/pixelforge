@@ -146,10 +146,16 @@ impl OutputFormat {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ColorConverterConfig {
-    /// Input frame width.
+    /// Output frame width.
     pub width: u32,
-    /// Input frame height.
+    /// Output frame height.
     pub height: u32,
+    /// Source image width.
+    pub source_width: u32,
+    /// Source image height.
+    pub source_height: u32,
+    /// Preserve the source aspect ratio when source and output sizes differ.
+    pub preserve_aspect: bool,
     /// Input pixel format.
     pub input_format: InputFormat,
     /// Output YUV format.
@@ -178,12 +184,28 @@ impl ColorConverterConfig {
         Self {
             width,
             height,
+            source_width: width,
+            source_height: height,
+            preserve_aspect: false,
             input_format,
             output_format,
             color_space: ColorSpace::Bt709,
             full_range: true,
             sdr_reference_white_nits: 203.0,
         }
+    }
+
+    /// Set the source image size.
+    pub fn with_source_size(mut self, width: u32, height: u32) -> Self {
+        self.source_width = width;
+        self.source_height = height;
+        self
+    }
+
+    /// Set whether source aspect ratio should be preserved.
+    pub fn with_preserve_aspect(mut self, preserve_aspect: bool) -> Self {
+        self.preserve_aspect = preserve_aspect;
+        self
     }
 }
 
@@ -200,7 +222,7 @@ pub struct ColorConverter {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
-    // Sampler for texelFetch on the source image.
+    // Sampler for source image reads.
     sampler: vk::Sampler,
 
     // Cached ImageView for the source image (avoids per-frame recreation).
@@ -711,8 +733,8 @@ impl ColorConverter {
                 &offsets,
             );
 
-            // Push constants: width, height, input_format, output_format, color_space, full_range, sdr_white_nits.
-            let push_constants: [u32; 7] = [
+            // Push constants mirror the GLSL PushConstants block.
+            let push_constants: [u32; 10] = [
                 self.config.width,
                 self.config.height,
                 self.config.input_format as u32,
@@ -720,6 +742,9 @@ impl ColorConverter {
                 self.config.color_space as u32,
                 self.config.full_range as u32,
                 self.config.sdr_reference_white_nits.to_bits(),
+                self.config.source_width.max(1),
+                self.config.source_height.max(1),
+                self.config.preserve_aspect as u32,
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -1073,6 +1098,9 @@ mod tests {
         let config = ColorConverterConfig {
             width: 1920,
             height: 1080,
+            source_width: 1920,
+            source_height: 1080,
+            preserve_aspect: false,
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
@@ -1094,6 +1122,9 @@ mod tests {
         let config = ColorConverterConfig {
             width: 640,
             height: 480,
+            source_width: 640,
+            source_height: 480,
+            preserve_aspect: false,
             input_format: InputFormat::RGBA,
             output_format: OutputFormat::I420,
             color_space: ColorSpace::Bt709,
@@ -1136,6 +1167,9 @@ mod tests {
         let config = ColorConverterConfig {
             width: 64,
             height: 64,
+            source_width: 64,
+            source_height: 64,
+            preserve_aspect: false,
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
@@ -1171,6 +1205,9 @@ mod tests {
                 let config = ColorConverterConfig {
                     width: 32,
                     height: 32,
+                    source_width: 32,
+                    source_height: 32,
+                    preserve_aspect: false,
                     input_format: *input_format,
                     output_format: *output_format,
                     color_space: ColorSpace::Bt709,

@@ -43,6 +43,9 @@ layout(push_constant) uniform PushConstants {
     uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ
     uint full_range;     // 0=limited/studio range, 1=full range
     float sdr_white_nits; // SDR reference white (nits), used for sRGB→BT.2020+PQ
+    uint source_width;
+    uint source_height;
+    uint preserve_aspect;
 } params;
 
 // Source image sampled directly — eliminates the image-to-buffer copy.
@@ -113,7 +116,7 @@ vec3 bt709_to_bt2020(vec3 rgb709) {
     );
 }
 
-// Read normalized RGB from source image via texelFetch.
+// Read normalized RGB from source image via the sampler.
 // Returns values in [0, 1] range representing the final signal level for YUV conversion.
 //
 // The compositor (Smithay) does NOT perform color-managed compositing: it blits
@@ -124,8 +127,10 @@ vec3 bt709_to_bt2020(vec3 rgb709) {
 //
 // color_space 0 (BT.709) and 1 (BT.2020): passthrough — data is already encoded.
 // color_space 2 (sRGB→BT.2020+PQ): decode sRGB, convert gamut, apply PQ.
-vec3 read_rgb(ivec2 coord) {
-    vec4 rgba = texelFetch(inputImage, coord, 0);
+vec3 read_source_rgb(vec2 source_coord) {
+    vec2 source_size = vec2(float(max(params.source_width, 1u)), float(max(params.source_height, 1u)));
+    vec2 uv = (source_coord + vec2(0.5)) / source_size;
+    vec4 rgba = texture(inputImage, uv);
     if (params.color_space == 2u) {
         // sRGB→BT.2020+PQ: decode sRGB gamma → linear BT.709 → BT.2020 gamut → PQ.
         vec3 linear_709 = srgb_to_linear(rgba.rgb);
@@ -136,6 +141,43 @@ vec3 read_rgb(ivec2 coord) {
     }
     // BT.709 or BT.2020 passthrough: values are already properly encoded.
     return rgba.rgb;
+}
+
+bool source_coord_for_output(uint out_x, uint out_y, out vec2 source_coord) {
+    float source_w = float(max(params.source_width, 1u));
+    float source_h = float(max(params.source_height, 1u));
+    float output_w = float(max(params.width, 1u));
+    float output_h = float(max(params.height, 1u));
+
+    vec2 content_origin = vec2(0.0);
+    vec2 content_size = vec2(output_w, output_h);
+    if (params.preserve_aspect != 0u) {
+        float scale = min(output_w / source_w, output_h / source_h);
+        content_size = vec2(source_w * scale, source_h * scale);
+        content_origin = (vec2(output_w, output_h) - content_size) * 0.5;
+    }
+
+    vec2 output_coord = vec2(float(out_x) + 0.5, float(out_y) + 0.5);
+    if (output_coord.x < content_origin.x ||
+        output_coord.y < content_origin.y ||
+        output_coord.x >= content_origin.x + content_size.x ||
+        output_coord.y >= content_origin.y + content_size.y) {
+        source_coord = vec2(0.0);
+        return false;
+    }
+
+    vec2 normalized = (output_coord - content_origin) / content_size;
+    source_coord = normalized * vec2(source_w, source_h) - vec2(0.5);
+    source_coord = clamp(source_coord, vec2(0.0), vec2(source_w - 1.0, source_h - 1.0));
+    return true;
+}
+
+vec3 read_rgb(uint out_x, uint out_y) {
+    vec2 source_coord;
+    if (!source_coord_for_output(out_x, out_y, source_coord)) {
+        return vec3(0.0);
+    }
+    return read_source_rgb(source_coord);
 }
 
 // Convert normalized RGB [0,1] to YUV.
@@ -194,7 +236,7 @@ void main() {
     if (x >= params.width || y >= params.height) return;
 
     uint pixel_idx = y * params.width + x;
-    vec3 rgb = read_rgb(ivec2(x, y));
+    vec3 rgb = read_rgb(x, y);
     vec3 yuv = rgb_to_yuv(rgb);
 
     uint pixel_count = params.width * params.height;
@@ -242,11 +284,11 @@ void main() {
 
             vec3 yuv00 = yuv;
             vec3 yuv10 = (x + 1u < params.width) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
+                rgb_to_yuv(read_rgb(x + 1u, y)) : yuv00;
             vec3 yuv01 = (y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
+                rgb_to_yuv(read_rgb(x, y + 1u)) : yuv00;
             vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
+                rgb_to_yuv(read_rgb(x + 1u, y + 1u)) : yuv00;
 
             float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
             float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
@@ -271,11 +313,11 @@ void main() {
 
             vec3 yuv00 = yuv;
             vec3 yuv10 = (x + 1u < params.width) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
+                rgb_to_yuv(read_rgb(x + 1u, y)) : yuv00;
             vec3 yuv01 = (y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
+                rgb_to_yuv(read_rgb(x, y + 1u)) : yuv00;
             vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
+                rgb_to_yuv(read_rgb(x + 1u, y + 1u)) : yuv00;
 
             float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
             float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
