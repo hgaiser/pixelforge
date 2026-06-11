@@ -716,6 +716,149 @@ pub(crate) struct ClearImageParams {
     pub bit_depth: BitDepth,
 }
 
+/// Pick the input image format for the hardware-direct RGB encode path
+/// (`VK_VALVE_video_encode_rgb_conversion`). 8-bit picks B8G8R8A8_UNORM,
+/// 10-bit picks A2B10G10R10_UNORM_PACK32 — these match the formats RADV's
+/// VCN5 driver accepts for the RGB-conversion path, and are the
+/// `B`/`ABGR` variants that gamescope's override-surface DMA-BUFs
+/// typically arrive in (avoiding a channel swap).
+pub(crate) fn rgb_input_format(bit_depth: BitDepth) -> vk::Format {
+    match bit_depth {
+        BitDepth::Eight => vk::Format::B8G8R8A8_UNORM,
+        BitDepth::Ten => vk::Format::A2B10G10R10_UNORM_PACK32,
+    }
+}
+
+/// Pick the RGB→YUV model the hardware should apply, based on the
+/// configured colour description (BT.709 vs BT.2020).
+pub(crate) fn rgb_conversion_model(
+    desc: &crate::encoder::ColorDescription,
+) -> vk::VideoEncodeRgbModelConversionFlagsVALVE {
+    if desc.matrix_coefficients == 9 {
+        vk::VideoEncodeRgbModelConversionFlagsVALVE::YCBCR_2020
+    } else {
+        vk::VideoEncodeRgbModelConversionFlagsVALVE::YCBCR_709
+    }
+}
+
+/// Pick the RGB range compression flag (full vs limited) from the colour
+/// description.
+pub(crate) fn rgb_conversion_range(
+    desc: &crate::encoder::ColorDescription,
+) -> vk::VideoEncodeRgbRangeCompressionFlagsVALVE {
+    if desc.full_range {
+        vk::VideoEncodeRgbRangeCompressionFlagsVALVE::FULL_RANGE
+    } else {
+        vk::VideoEncodeRgbRangeCompressionFlagsVALVE::NARROW_RANGE
+    }
+}
+
+/// Clear an RGB-formatted encode input image (used by the
+/// `VK_VALVE_video_encode_rgb_conversion` path) to opaque black, then
+/// transition it to `VIDEO_ENCODE_SRC_KHR`.
+///
+/// RGB encode inputs are single-plane `COLOR` aspect images, so the
+/// multi-plane buffer-copy path used for YUV doesn't apply. We just
+/// `vkCmdClearColorImage` to zero, then barrier into encode layout.
+pub(crate) fn clear_rgb_input_image(
+    context: &VideoContext,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    queue: vk::Queue,
+    image: vk::Image,
+) -> Result<()> {
+    let device = context.device();
+
+    unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let subresource = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+    }
+
+    let clear_color = vk::ClearColorValue {
+        float32: [0.0, 0.0, 0.0, 1.0],
+    };
+    unsafe {
+        device.cmd_clear_color_image(
+            command_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &clear_color,
+            &[subresource],
+        );
+    }
+
+    let to_encode = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::empty());
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_encode],
+        );
+    }
+
+    unsafe { device.end_command_buffer(command_buffer) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let submit_info =
+        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+    unsafe { device.reset_fences(&[fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
+    unsafe { device.queue_submit(queue, &[submit_info], fence) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("submit rgb clear: {}", e)))?;
+    unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("wait rgb clear: {}", e)))?;
+    unsafe { device.reset_fences(&[fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
+
+    Ok(())
+}
+
 /// Clear the input image by filling it with zeros via a staging buffer.
 ///
 /// This must be called once after creating the input image to ensure
@@ -1159,77 +1302,6 @@ pub(crate) fn upload_image_to_input(
     Ok(())
 }
 
-/// Parameters for cleaning up shared encoder resources.
-pub(crate) struct EncoderResources<'a> {
-    pub query_pool: vk::QueryPool,
-    pub upload_fence: vk::Fence,
-    pub encode_fence: vk::Fence,
-    pub command_pool: vk::CommandPool,
-    pub upload_command_pool: vk::CommandPool,
-    pub bitstream_buffer: vk::Buffer,
-    pub bitstream_buffer_memory: vk::DeviceMemory,
-    pub input_image: vk::Image,
-    pub input_image_memory: vk::DeviceMemory,
-    pub input_image_view: vk::ImageView,
-    pub dpb_images: &'a [vk::Image],
-    pub dpb_image_memories: &'a [vk::DeviceMemory],
-    pub dpb_image_views: &'a [vk::ImageView],
-    pub session: vk::VideoSessionKHR,
-    pub session_params: vk::VideoSessionParametersKHR,
-    pub session_memory: &'a [vk::DeviceMemory],
-}
-
-/// Destroy all shared encoder resources.
-///
-/// # Safety
-///
-/// All queues that may reference these resources (transfer and video encode)
-/// must be idle before calling this function.
-pub(crate) unsafe fn destroy_encoder_resources(
-    device: &ash::Device,
-    video_queue_fn: &ash::khr::video_queue::Device,
-    res: &EncoderResources,
-) {
-    device.destroy_query_pool(res.query_pool, None);
-    device.destroy_fence(res.upload_fence, None);
-    device.destroy_fence(res.encode_fence, None);
-    device.destroy_command_pool(res.command_pool, None);
-    if res.upload_command_pool != res.command_pool {
-        device.destroy_command_pool(res.upload_command_pool, None);
-    }
-
-    device.unmap_memory(res.bitstream_buffer_memory);
-    device.destroy_buffer(res.bitstream_buffer, None);
-    device.free_memory(res.bitstream_buffer_memory, None);
-
-    device.destroy_image_view(res.input_image_view, None);
-    device.destroy_image(res.input_image, None);
-    device.free_memory(res.input_image_memory, None);
-
-    for view in res.dpb_image_views {
-        device.destroy_image_view(*view, None);
-    }
-    for image in res.dpb_images {
-        device.destroy_image(*image, None);
-    }
-    for memory in res.dpb_image_memories {
-        device.free_memory(*memory, None);
-    }
-
-    if res.session_params != vk::VideoSessionParametersKHR::null() {
-        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
-            device.handle(),
-            res.session_params,
-            std::ptr::null(),
-        );
-    }
-    (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
-
-    for memory in res.session_memory {
-        device.free_memory(*memory, None);
-    }
-}
-
 /// Record DPB image barriers for encode.
 ///
 /// Transitions the setup DPB slot from UNDEFINED to VIDEO_ENCODE_DPB and
@@ -1397,55 +1469,75 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
     );
 }
 
-/// Submit an encode command buffer and wait for completion.
+/// Submit an encode command buffer to the encode queue without waiting.
 ///
-/// Submits the command buffer to the encode queue, waits for the fence,
-/// then reads query results and copies the encoded bitstream data.
-/// The fence is reset before submission so it may be in any state on entry.
+/// This is the asynchronous half of the encode submit. Use `wait_and_read_bitstream`
+/// later to drain the result. Lets pipelined encoders (H.265 with depth > 1) keep
+/// multiple encodes in flight on the encode queue.
+///
+/// The fence is reset before submission so it may be in any state on entry, and
+/// will be signaled when the GPU encode finishes.
 ///
 /// # Safety
 ///
 /// The command buffer must have been ended.
-/// The bitstream buffer pointer must be valid and the buffer must be persistently mapped.
-pub(crate) unsafe fn submit_encode_and_read_bitstream(
+pub(crate) unsafe fn submit_encode_only(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
-    query_pool: vk::QueryPool,
-    bitstream_buffer_ptr: *const u8,
-) -> Result<Vec<u8>> {
-    let submit_info =
+    wait_semaphore: Option<vk::Semaphore>,
+) -> Result<()> {
+    let wait_semaphores: Vec<vk::Semaphore>;
+    let wait_dst_stage_mask: Vec<vk::PipelineStageFlags>;
+
+    let mut submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
 
-    // Reset the fence before submit (it may be signaled from a previous encode
-    // or from initial creation with SIGNALED_BIT). This ensures the fence is
-    // unsignaled for queue_submit, and after wait_for_fences it stays signaled —
-    // which lets set_color_description() safely wait on it between encodes.
+    if let Some(sem) = wait_semaphore {
+        wait_semaphores = vec![sem];
+        wait_dst_stage_mask = vec![vk::PipelineStageFlags::ALL_COMMANDS];
+        submit_info = submit_info
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_dst_stage_mask);
+    }
+
     device
         .reset_fences(&[fence])
         .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-
     device
         .queue_submit(encode_queue, &[submit_info], fence)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    Ok(())
+}
 
+/// Wait on the encode fence and read the bitstream produced by a prior
+/// `submit_encode_only` call on the same fence/query_pool/buffer triple.
+///
+/// # Safety
+///
+/// The fence must be the one signaled by the encode submission whose bitstream
+/// is being drained here, and `bitstream_buffer_ptr` must point to the
+/// persistently-mapped bitstream buffer for that submission.
+pub(crate) unsafe fn wait_and_read_bitstream(
+    device: &ash::Device,
+    fence: vk::Fence,
+    query_pool: vk::QueryPool,
+    bitstream_buffer_ptr: *const u8,
+) -> Result<Vec<u8>> {
     device
         .wait_for_fences(&[fence], true, u64::MAX)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-    // Read query results (offset + bytes_written).
     #[repr(C)]
     struct QueryResult {
         offset: u32,
         bytes_written: u32,
     }
-
     let mut query_results = [QueryResult {
         offset: 0,
         bytes_written: 0,
     }];
-
     device
         .get_query_pool_results(
             query_pool,
@@ -1457,19 +1549,16 @@ pub(crate) unsafe fn submit_encode_and_read_bitstream(
 
     let offset = query_results[0].offset as usize;
     let size = query_results[0].bytes_written as usize;
-
     if size == 0 {
         return Err(PixelForgeError::QueryPool(
             "Encoder produced 0 bytes".to_string(),
         ));
     }
-
     tracing::debug!("Encoded frame: offset={}, size={}", offset, size);
 
     let mut encoded_data = vec![0u8; size];
     let src = std::slice::from_raw_parts(bitstream_buffer_ptr.add(offset), size);
     encoded_data.copy_from_slice(src);
-
     Ok(encoded_data)
 }
 

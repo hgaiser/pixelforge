@@ -559,6 +559,12 @@ impl ColorConverter {
     ///
     /// # Returns
     /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
+    /// Convert an RGB source image to YUV, writing to the target image.
+    ///
+    /// Submits the command buffer and waits synchronously on a fence before
+    /// returning. The caller is responsible for any further sync between
+    /// convert and downstream consumers (e.g. an encoder reading the target
+    /// image).
     pub fn convert(
         &mut self,
         src_image: vk::Image,
@@ -856,7 +862,8 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        // Submit and wait.
+        // Submit and wait synchronously on the fence — no semaphore overlap
+        // with the encoder; the caller is responsible for any further sync.
         unsafe {
             device
                 .reset_fences(&[self.fence])

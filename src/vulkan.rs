@@ -78,6 +78,12 @@ struct VideoContextInner {
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
     has_descriptor_buffer: bool,
+    /// `true` when `VK_VALVE_video_encode_rgb_conversion` was both reported by
+    /// the device and enabled at `vkCreateDevice` time. Encoder codepaths
+    /// can use this to opt into the hardware-direct RGB→YUV path that lets
+    /// VCN do the colour conversion inline (skipping a separate compute
+    /// shader). When `false`, callers must run their own RGB→YUV step.
+    rgb_conversion_supported: bool,
 }
 
 impl Drop for VideoContextInner {
@@ -158,6 +164,17 @@ impl VideoContext {
     /// Returns true if `VK_EXT_descriptor_buffer` is available and enabled.
     pub fn has_descriptor_buffer(&self) -> bool {
         self.inner.has_descriptor_buffer
+    }
+
+    /// Returns `true` when the device supports — and we have enabled —
+    /// `VK_VALVE_video_encode_rgb_conversion`. When this is true, encoders
+    /// may opt into the hardware-direct RGB input path (VCN performs the
+    /// RGB→YUV conversion inline during the encode pass), eliminating the
+    /// need for a separate compute-shader colour converter. Currently only
+    /// AMD's RADV driver supports this; on other vendors the answer is
+    /// `false` and the caller must keep its own conversion path.
+    pub fn supports_rgb_direct_encode(&self) -> bool {
+        self.inner.rgb_conversion_supported
     }
 }
 
@@ -465,6 +482,36 @@ impl VideoContext {
         // Add the 2-plane 444 formats extension.
         push_ext(ash::ext::ycbcr_2plane_444_formats::NAME.as_ptr());
 
+        // Probe for VK_VALVE_video_encode_rgb_conversion. When the device
+        // supports it we enable both the extension and its feature, which
+        // lets encoders take RGB images directly and have VCN do RGB→YUV
+        // conversion inline. Vendors without the extension (NVIDIA, Intel,
+        // most non-RADV stacks today) fall through and callers continue
+        // using their own RGB→YUV step.
+        let device_exts =
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .unwrap_or_default();
+        let rgb_conversion_supported = video_encode_queue_family.is_some()
+            && device_exts.iter().any(|ext| {
+                ext.extension_name_as_c_str()
+                    .map(|n| n == ash::valve::video_encode_rgb_conversion::NAME)
+                    .unwrap_or(false)
+            });
+        let mut rgb_conv_features =
+            vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default()
+                .video_encode_rgb_conversion(true);
+        if rgb_conversion_supported {
+            push_ext(ash::valve::video_encode_rgb_conversion::NAME.as_ptr());
+            info!(
+                "VK_VALVE_video_encode_rgb_conversion supported, enabling RGB-direct encode path"
+            );
+        } else if video_encode_queue_family.is_some() {
+            debug!(
+                "VK_VALVE_video_encode_rgb_conversion not supported on this device — \
+                 encoders will run with caller-provided YUV input"
+            );
+        }
+
         // Enable AV1 video encode feature only if AV1 is supported.
         // Only include AV1 features in the pNext chain when AV1 is actually supported,
         // to avoid chaining unknown feature structs on devices without AV1.
@@ -536,6 +583,24 @@ impl VideoContext {
             && desc_buf_features.descriptor_buffer != 0
             && desc_buf_features.descriptor_buffer_capture_replay != 0;
 
+        // Splice the RGB conversion feature onto the end of the chain when
+        // the device supports it. Walks from `sync2_features` (which the
+        // descriptor-buffer block leaves at the middle of the chain) to the
+        // tail and appends — keeping it conditional avoids passing an
+        // unknown feature struct on devices that don't recognise it.
+        if rgb_conversion_supported {
+            unsafe {
+                let mut cursor: *mut vk::BaseOutStructure =
+                    (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast();
+                while !(*cursor).p_next.is_null() {
+                    cursor = (*cursor).p_next.cast();
+                }
+                (*cursor).p_next = (&mut rgb_conv_features
+                    as *mut vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE)
+                    .cast();
+            }
+        }
+
         // Log all extensions being enabled
         debug!("Enabling {} device extensions:", extension_names.len());
         for ext_name_ptr in &extension_names {
@@ -589,6 +654,7 @@ impl VideoContext {
                 device_properties,
                 supported_encode_codecs,
                 has_descriptor_buffer,
+                rgb_conversion_supported,
             }),
         })
     }

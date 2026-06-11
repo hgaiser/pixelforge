@@ -23,6 +23,41 @@ const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// AV1 superblock size in pixels (64x64, matching use_128x128_superblock=0 in the sequence header).
 pub const SUPERBLOCK_SIZE: u32 = 64;
 
+/// Number of in-flight encode slots. Depth=2 lets frame N+1 begin encoding
+/// while frame N is still on the encode hardware.
+pub(crate) const ENCODE_PIPELINE_DEPTH: usize = 2;
+
+/// One slot's worth of per-frame encode resources. Mirrors encoder::h265::EncodeSlot.
+pub(crate) struct EncodeSlot {
+    pub input_image: vk::Image,
+    pub input_image_memory: vk::DeviceMemory,
+    pub input_image_view: vk::ImageView,
+    pub input_image_layout: vk::ImageLayout,
+
+    pub bitstream_buffer: vk::Buffer,
+    pub bitstream_buffer_memory: vk::DeviceMemory,
+    pub bitstream_buffer_size: usize,
+    pub bitstream_buffer_ptr: *mut u8,
+
+    pub encode_command_buffer: vk::CommandBuffer,
+    pub encode_fence: vk::Fence,
+    pub query_pool: vk::QueryPool,
+
+    pub in_flight: bool,
+    pub pending_metadata: Option<SlotPacketMetadata>,
+}
+
+/// Metadata stashed at submit-time, returned with the bitstream when this
+/// slot's encode is drained.
+pub(crate) struct SlotPacketMetadata {
+    pub frame_type: crate::encoder::FrameType,
+    pub is_key_frame: bool,
+    pub pts: u64,
+    pub dts: u64,
+    /// AV1 sequence header OBU to prepend (Some only for IDR/key frames).
+    pub header: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReferenceInfo {
     pub dpb_slot: u8,
@@ -49,12 +84,10 @@ pub struct AV1Encoder {
     frame_num: u32,
     order_hint: u32,
 
-    // Resources
-    input_image: vk::Image,
-    input_image_memory: vk::DeviceMemory,
-    input_image_view: vk::ImageView,
-    /// Current Vulkan image layout of `input_image` (tracked to avoid UB when transitioning).
-    input_image_layout: vk::ImageLayout,
+    /// Per-frame encode slots. See encoder::h265 for invariants.
+    pub(crate) slots: Vec<EncodeSlot>,
+    pub(crate) current_slot: usize,
+
     /// DPB images for reference frames.
     dpb_images: Vec<vk::Image>,
     dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -63,21 +96,14 @@ pub struct AV1Encoder {
     dpb_slot_count: usize,
     /// Whether each DPB slot has been activated (written to at least once).
     dpb_slot_active: Vec<bool>,
-    bitstream_buffer: vk::Buffer,
-    bitstream_buffer_memory: vk::DeviceMemory,
-    /// Size of the allocated bitstream buffer in bytes.
-    bitstream_buffer_size: usize,
-    /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
-    bitstream_buffer_ptr: *mut u8,
 
-    // Command resources.
+    // Command pool (encode command buffers per slot allocated from this pool).
     command_pool: vk::CommandPool,
     upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
-    encode_command_buffer: vk::CommandBuffer,
-    encode_fence: vk::Fence,
-    query_pool: vk::QueryPool,
+
+    // Optional semaphore to wait on before encoding (from color converter).
 
     // Cached AV1 sequence header OBU (retrieved from session parameters).
     header_data: Option<Vec<u8>>,
@@ -97,7 +123,8 @@ impl AV1Encoder {
     /// encoder's configured pixel format and dimensions, and should be in
     /// GENERAL layout.
     fn upload_from_image(&mut self, src_image: vk::Image) -> Result<()> {
-        if src_image == self.input_image {
+        let slot = &mut self.slots[self.current_slot];
+        if src_image == slot.input_image {
             debug!("Source image is the encoder's input image, skipping upload copy");
             return Ok(());
         }
@@ -106,18 +133,17 @@ impl AV1Encoder {
             upload_command_buffer: self.upload_command_buffer,
             upload_fence: self.upload_fence,
             src_image,
-            dst_image: self.input_image,
+            dst_image: slot.input_image,
             width: self.config.dimensions.width,
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
-            input_image_layout: self.input_image_layout,
+            input_image_layout: slot.input_image_layout,
             upload_queue: self.context.transfer_queue(),
         };
 
         upload_image_to_input(&self.context, &params)?;
 
-        // Update tracked layout.
-        self.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
+        slot.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
 
         Ok(())
     }
@@ -130,48 +156,33 @@ unsafe impl Send for AV1Encoder {}
 impl Drop for AV1Encoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.context.device().device_wait_idle();
-            self.context
-                .device()
-                .destroy_query_pool(self.query_pool, None);
-            self.context.device().destroy_fence(self.upload_fence, None);
-            self.context.device().destroy_fence(self.encode_fence, None);
-            self.context
-                .device()
-                .destroy_command_pool(self.command_pool, None);
-            if self.upload_command_pool != self.command_pool {
-                self.context
-                    .device()
-                    .destroy_command_pool(self.upload_command_pool, None);
+            let device = self.context.device();
+            let _ = device.device_wait_idle();
+
+            for slot in &mut self.slots {
+                if !slot.bitstream_buffer_ptr.is_null() {
+                    device.unmap_memory(slot.bitstream_buffer_memory);
+                    slot.bitstream_buffer_ptr = std::ptr::null_mut();
+                }
+                device.destroy_query_pool(slot.query_pool, None);
+                device.destroy_fence(slot.encode_fence, None);
+                device.destroy_buffer(slot.bitstream_buffer, None);
+                device.free_memory(slot.bitstream_buffer_memory, None);
+                device.destroy_image_view(slot.input_image_view, None);
+                device.destroy_image(slot.input_image, None);
+                device.free_memory(slot.input_image_memory, None);
             }
-            self.context
-                .device()
-                .destroy_buffer(self.bitstream_buffer, None);
-            // Unmap the persistently mapped bitstream buffer before freeing memory.
-            self.context
-                .device()
-                .unmap_memory(self.bitstream_buffer_memory);
-            self.context
-                .device()
-                .free_memory(self.bitstream_buffer_memory, None);
-            self.context
-                .device()
-                .destroy_image_view(self.input_image_view, None);
-            self.context.device().destroy_image(self.input_image, None);
-            self.context
-                .device()
-                .free_memory(self.input_image_memory, None);
+
+            device.destroy_fence(self.upload_fence, None);
+            device.destroy_command_pool(self.command_pool, None);
+            if self.upload_command_pool != self.command_pool {
+                device.destroy_command_pool(self.upload_command_pool, None);
+            }
 
             for i in 0..self.dpb_images.len() {
-                self.context
-                    .device()
-                    .destroy_image_view(self.dpb_image_views[i], None);
-                self.context
-                    .device()
-                    .destroy_image(self.dpb_images[i], None);
-                self.context
-                    .device()
-                    .free_memory(self.dpb_image_memories[i], None);
+                device.destroy_image_view(self.dpb_image_views[i], None);
+                device.destroy_image(self.dpb_images[i], None);
+                device.free_memory(self.dpb_image_memories[i], None);
             }
 
             if self.session_params != vk::VideoSessionParametersKHR::null() {
@@ -181,7 +192,7 @@ impl Drop for AV1Encoder {
             self.video_queue_fn
                 .destroy_video_session(self.session, None);
             for mem in &self.session_memory {
-                self.context.device().free_memory(*mem, None);
+                device.free_memory(*mem, None);
             }
         }
     }

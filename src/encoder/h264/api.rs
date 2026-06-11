@@ -14,36 +14,71 @@ impl H264Encoder {
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        self.input_image
+        self.slots[self.current_slot].input_image
     }
 
-    /// Encode a frame from a GPU image.
+    /// Encode a frame from a GPU image (depth-2 pipelined).
     ///
-    /// This accepts a source NV12 image on the GPU and encodes it directly without.
-    /// any CPU-side data copies. The source image must be in NV12 format with the
-    /// same dimensions as the encoder configuration, and should be in GENERAL layout.
+    /// Submits the frame to the encode queue without waiting, drains the
+    /// previous in-flight frame from the slot we are about to overwrite,
+    /// and returns *that* drained frame's packet. The first call returns
+    /// an empty Vec (pipeline still filling); subsequent calls return one
+    /// packet per call. Use `flush()` to drain remaining slots at end of stream.
     ///
     /// # Panics
     ///
-    /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
-    /// as B-frame encoding is not yet supported.
+    /// The encoder will panic at creation time if B-frames are enabled
+    /// (b_frame_count > 0), as B-frame encoding is not yet supported.
     pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+        let prev_packet = self.drain_current_slot()?;
+
         let gop_position = self.gop.get_next_frame();
         let display_order = self.input_frame_num;
         self.input_frame_num += 1;
 
         debug!(
-            "Encoding frame {} from GPU image: type={:?}, poc={}",
-            display_order, gop_position.frame_type, gop_position.pic_order_cnt
+            "Encoding frame {} from GPU image: type={:?}, poc={}, slot={}",
+            display_order, gop_position.frame_type, gop_position.pic_order_cnt, self.current_slot
         );
 
-        // Upload from GPU image.
         self.upload_from_image(src_image)?;
+        self.encode_current_frame(&gop_position, display_order)?;
 
-        // Encode immediately.
-        let packet = self.encode_current_frame(&gop_position, display_order)?;
+        self.current_slot = (self.current_slot + 1) % self.slots.len();
+        Ok(prev_packet.into_iter().collect())
+    }
 
-        Ok(vec![packet])
+    fn drain_current_slot(&mut self) -> Result<Option<EncodedPacket>> {
+        if !self.slots[self.current_slot].in_flight {
+            return Ok(None);
+        }
+        let bitstream = unsafe {
+            crate::encoder::resources::wait_and_read_bitstream(
+                self.context.device(),
+                self.slots[self.current_slot].encode_fence,
+                self.slots[self.current_slot].query_pool,
+                self.slots[self.current_slot].bitstream_buffer_ptr,
+            )?
+        };
+        self.slots[self.current_slot].in_flight = false;
+        let meta = self.slots[self.current_slot]
+            .pending_metadata
+            .take()
+            .ok_or_else(|| {
+                PixelForgeError::CommandBuffer(
+                    "Drained slot has bitstream but no metadata; encoder state corrupted"
+                        .to_string(),
+                )
+            })?;
+        let mut data = meta.header.unwrap_or_default();
+        data.extend_from_slice(&bitstream);
+        Ok(Some(EncodedPacket {
+            data,
+            frame_type: meta.frame_type,
+            is_key_frame: meta.is_key_frame,
+            pts: meta.pts,
+            dts: meta.dts,
+        }))
     }
 
     /// Internal method to encode the current frame already uploaded to input_image.
@@ -51,7 +86,7 @@ impl H264Encoder {
         &mut self,
         gop_position: &GopPosition,
         display_order: u64,
-    ) -> Result<EncodedPacket> {
+    ) -> Result<()> {
         let is_idr = gop_position.frame_type.is_idr();
         let is_reference = gop_position.is_reference;
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
@@ -86,23 +121,32 @@ impl H264Encoder {
         let pic_order_cnt = gop_position.pic_order_cnt;
         let frame_num = self.frame_num_syntax;
 
-        let mut encoded_data = Vec::new();
-        if is_idr {
-            encoded_data.extend_from_slice(&self.get_h264_header()?);
+        // For IDR frames, capture SPS/PPS header to be prepended at drain time.
+        let header = if is_idr {
+            let h = self.get_h264_header()?;
             self.sps_written = true;
-        }
+            Some(h)
+        } else {
+            None
+        };
 
-        encoded_data.extend_from_slice(&self.encode_frame_internal(
-            gop_position,
-            frame_num,
-            pic_order_cnt,
-            is_idr,
-        )?);
+        // Submit the encode (no wait, no readback). Marks the slot in_flight.
+        self.encode_frame_internal(gop_position, frame_num, pic_order_cnt, is_idr)?;
 
+        let dts = self.encode_frame_num;
         self.encode_frame_num += 1;
         if is_reference && !is_b_frame {
             self.frame_num_syntax = (self.frame_num_syntax + 1) % 256;
         }
+
+        // Stash metadata so drain_current_slot() can build the packet later.
+        self.slots[self.current_slot].pending_metadata = Some(super::SlotPacketMetadata {
+            frame_type,
+            is_key_frame: is_idr,
+            pts: display_order,
+            dts,
+            header,
+        });
 
         if is_reference {
             let pic_type = if is_idr {
@@ -146,19 +190,25 @@ impl H264Encoder {
             }
         }
 
-        Ok(EncodedPacket {
-            data: encoded_data,
-            frame_type,
-            is_key_frame: is_idr,
-            pts: display_order,
-            dts: self.encode_frame_num - 1,
-        })
+        Ok(())
     }
 
-    /// Flush the encoder and get any remaining packets.
+    /// Flush the encoder and drain any remaining in-flight slots.
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        // No buffered frames in the current implementation.
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        for offset in 0..self.slots.len() {
+            let idx = (self.current_slot + offset) % self.slots.len();
+            if !self.slots[idx].in_flight {
+                continue;
+            }
+            let saved_current = self.current_slot;
+            self.current_slot = idx;
+            if let Some(packet) = self.drain_current_slot()? {
+                out.push(packet);
+            }
+            self.current_slot = saved_current;
+        }
+        Ok(out)
     }
 
     /// Request that the next frame be an IDR frame.
@@ -244,17 +294,17 @@ impl H264Encoder {
     /// updated VUI color primaries, transfer characteristics, and matrix coefficients.
     /// The next encoded frame will be an IDR with the new SPS/PPS prepended.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        // Wait for any in-flight encode to complete before modifying session params.
-        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
-        // before queue_submit. Leaving the fence signaled allows consecutive
-        // set_color_description() calls without deadlock.
+        // Wait for ALL slot fences before modifying session params. Do NOT reset
+        // here; submit_encode_only resets each fence on submit so leaving them
+        // signaled lets consecutive set_color_description() calls work safely.
+        let fences: Vec<vk::Fence> = self.slots.iter().map(|s| s.encode_fence).collect();
         unsafe {
             self.context
                 .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .wait_for_fences(&fences, true, u64::MAX)
                 .map_err(|e| {
                     PixelForgeError::Synchronization(format!(
-                        "Failed to wait for encode fence: {:?}",
+                        "Failed to wait for encode fences: {:?}",
                         e
                     ))
                 })?;

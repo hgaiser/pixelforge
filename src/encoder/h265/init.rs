@@ -3,9 +3,10 @@ use super::H265Encoder;
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    align_up, allocate_session_memory, clear_input_image, create_bitstream_buffer,
-    create_command_resources, create_dpb_images, create_image, get_video_format, lcm,
-    make_codec_name, map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
+    align_up, allocate_session_memory, clear_input_image, clear_rgb_input_image,
+    create_bitstream_buffer, create_command_resources, create_dpb_images, create_image,
+    get_video_format, lcm, make_codec_name, map_bitstream_buffer, query_supported_video_formats,
+    rgb_conversion_model, rgb_conversion_range, rgb_input_format, ClearImageParams,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
@@ -41,6 +42,15 @@ impl H265Encoder {
         let video_encode_fn =
             ash::khr::video_encode_queue::Device::load(context.instance(), context.device());
 
+        if config.use_rgb_input && !context.supports_rgb_direct_encode() {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "EncodeConfig::use_rgb_input requires VK_VALVE_video_encode_rgb_conversion, \
+                 which this device does not support."
+                    .to_string(),
+            ));
+        }
+        let use_rgb_input = config.use_rgb_input;
+
         // Get chroma subsampling from pixel format via `From` impl
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
 
@@ -74,9 +84,19 @@ impl H265Encoder {
             }
         };
 
-        // Create H.265 encode profile
+        // Create H.265 encode profile. When RGB-direct is enabled we chain
+        // VkVideoEncodeProfileRgbConversionInfoVALVE on every profile we
+        // build (capability query, image creation, query pool) — profiles
+        // must match across all of those.
+        let mut rgb_conv_profile_info = vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+            .perform_encode_rgb_conversion(true);
         let mut h265_profile_info =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        if use_rgb_input {
+            h265_profile_info.p_next = (&mut rgb_conv_profile_info
+                as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                .cast();
+        }
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
@@ -189,7 +209,17 @@ impl H265Encoder {
         }
         info!("Supported DPB formats: {:?}", supported_dpb_formats);
 
-        let picture_format = if supported_src_formats.contains(&video_format) {
+        let picture_format = if use_rgb_input {
+            let rgb_fmt = rgb_input_format(config.bit_depth);
+            if !supported_src_formats.contains(&rgb_fmt) {
+                return Err(PixelForgeError::NoSuitableDevice(format!(
+                    "RGB-direct encode requested but driver does not advertise {:?} as a \
+                     VIDEO_ENCODE_SRC_KHR format for this profile. Supported: {:?}",
+                    rgb_fmt, supported_src_formats
+                )));
+            }
+            rgb_fmt
+        } else if supported_src_formats.contains(&video_format) {
             video_format
         } else {
             return Err(PixelForgeError::NoSuitableDevice(format!(
@@ -198,11 +228,19 @@ impl H265Encoder {
             )));
         };
 
-        let reference_picture_format = supported_dpb_formats
-            .iter()
-            .copied()
-            .find(|f| *f == picture_format)
-            .unwrap_or(supported_dpb_formats[0]);
+        let reference_picture_format = if use_rgb_input {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == video_format)
+                .unwrap_or(supported_dpb_formats[0])
+        } else {
+            supported_dpb_formats
+                .iter()
+                .copied()
+                .find(|f| *f == picture_format)
+                .unwrap_or(supported_dpb_formats[0])
+        };
 
         debug!(
             "Selected Vulkan Video formats: picture_format={:?}, reference_picture_format={:?}",
@@ -264,7 +302,18 @@ impl H265Encoder {
             PixelForgeError::NoSuitableDevice("No video encode queue family available".to_string())
         })?;
 
-        let session_create_info = vk::VideoSessionCreateInfoKHR::default()
+        let color_desc = config
+            .color_description
+            .unwrap_or(ColorDescription::bt709());
+
+        let mut session_rgb_conv_info =
+            vk::VideoEncodeSessionRgbConversionCreateInfoVALVE::default()
+                .rgb_model(rgb_conversion_model(&color_desc))
+                .rgb_range(rgb_conversion_range(&color_desc))
+                .x_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::COSITED_EVEN)
+                .y_chroma_offset(vk::VideoEncodeRgbChromaOffsetFlagsVALVE::MIDPOINT);
+
+        let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(encode_queue_family)
             .flags(vk::VideoSessionCreateFlagsKHR::empty())
             .video_profile(&profile_info)
@@ -277,6 +326,11 @@ impl H265Encoder {
             .max_dpb_slots(dpb_slot_count as u32)
             .max_active_reference_pictures(max_active_reference_pictures as u32)
             .std_header_version(&std_header_version);
+        if use_rgb_input {
+            session_create_info.p_next = (&mut session_rgb_conv_info
+                as *mut vk::VideoEncodeSessionRgbConversionCreateInfoVALVE)
+                .cast();
+        }
 
         let mut session = vk::VideoSessionKHR::null();
         let result = unsafe {
@@ -297,14 +351,17 @@ impl H265Encoder {
         // Query and allocate session memory.
         let session_memory = allocate_session_memory(&context, session, &video_queue_fn)?;
 
-        // Build VPS/SPS/PPS and session parameters via shared helper.
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
-
-        // Create profile info for images/buffers
+        // Create profile info for images/buffers (shared across slots).
+        let mut rgb_conv_profile_for_resources =
+            vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+                .perform_encode_rgb_conversion(true);
         let mut h265_profile_for_resources =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        if use_rgb_input {
+            h265_profile_for_resources.p_next = (&mut rgb_conv_profile_for_resources
+                as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                .cast();
+        }
         let mut profile_for_resources = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
@@ -312,16 +369,6 @@ impl H265Encoder {
             .chroma_bit_depth(bit_depth_flags);
         profile_for_resources.p_next =
             (&mut h265_profile_for_resources as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
-
-        // Create input image
-        let (input_image, input_image_memory, input_image_view) = create_image(
-            &context,
-            aligned_width,
-            aligned_height,
-            picture_format,
-            false,
-            &profile_for_resources,
-        )?;
 
         // Determine DPB mode: use layered DPB when the driver does not advertise
         // support for separate reference images (required for AMD RADV).
@@ -333,7 +380,8 @@ impl H265Encoder {
             info!("Using layered DPB (driver does not support separate reference images)");
         }
 
-        // Create DPB images.
+        // Create DPB images (shared across all slots — references for the
+        // entire encode session, not per-frame).
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
             aligned_width,
@@ -344,77 +392,153 @@ impl H265Encoder {
             use_layered_dpb,
         )?;
 
-        // Create bitstream buffer.
-        let (bitstream_buffer, bitstream_buffer_memory) =
-            create_bitstream_buffer(&context, MIN_BITSTREAM_BUFFER_SIZE, &profile_for_resources)?;
-
-        // Persistently map the bitstream buffer to avoid per-frame map/unmap overhead.
-        let bitstream_buffer_ptr =
-            map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
-
-        // Create command pool, buffers, and fences.
-        // Use the transfer queue family for upload commands when the encode queue
-        // doesn't support transfer operations (AMD RADV).
+        // Create command pool and shared upload resources. The encode command
+        // buffers (one per slot) are allocated below from `command_pool`.
         let upload_queue_family = context.transfer_queue_family();
         let cmd_resources =
             create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
         let upload_command_pool = cmd_resources.upload_command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
-        let encode_command_buffer = cmd_resources.encode_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
-        let encode_fence = cmd_resources.encode_fence;
+        // The first slot reuses cmd_resources.encode_command_buffer and encode_fence;
+        // additional slots get fresh buffers/fences below. (Re-using avoids
+        // changing create_command_resources, which is also used by H264/AV1.)
 
-        // Clear the input image so padding between user dimensions and the
-        // aligned coded extent is zero-initialized.
-        clear_input_image(
-            &context,
-            &ClearImageParams {
-                command_buffer: upload_command_buffer,
-                fence: upload_fence,
-                queue: context.transfer_queue(),
-                image: input_image,
-                width: aligned_width,
-                height: aligned_height,
-                pixel_format: config.pixel_format,
-                bit_depth: config.bit_depth,
-            },
-        )?;
+        // Allocate ENCODE_PIPELINE_DEPTH-1 additional encode command buffers
+        // from the same pool.
+        let extra_buffers_needed = super::ENCODE_PIPELINE_DEPTH.saturating_sub(1) as u32;
+        let extra_encode_buffers: Vec<vk::CommandBuffer> = if extra_buffers_needed > 0 {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(extra_buffers_needed);
+            unsafe { context.device().allocate_command_buffers(&alloc_info) }
+                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+        } else {
+            Vec::new()
+        };
 
-        // Create query pool
-        let mut h265_profile_info_query =
-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        // Build per-slot resources.
+        let mut slots: Vec<super::EncodeSlot> = Vec::with_capacity(super::ENCODE_PIPELINE_DEPTH);
+        for slot_idx in 0..super::ENCODE_PIPELINE_DEPTH {
+            // Input image for this slot.
+            let (input_image, input_image_memory, input_image_view) = create_image(
+                &context,
+                aligned_width,
+                aligned_height,
+                picture_format,
+                false,
+                &profile_for_resources,
+            )?;
 
-        let mut profile_info_query = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-            .chroma_subsampling(chroma_subsampling)
-            .luma_bit_depth(bit_depth_flags)
-            .chroma_bit_depth(bit_depth_flags);
-        profile_info_query.p_next =
-            (&mut h265_profile_info_query as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            // Bitstream buffer for this slot.
+            let (bitstream_buffer, bitstream_buffer_memory) = create_bitstream_buffer(
+                &context,
+                MIN_BITSTREAM_BUFFER_SIZE,
+                &profile_for_resources,
+            )?;
+            let bitstream_buffer_ptr =
+                map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
 
-        let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(
-                vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
-                    | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
-            );
+            // Clear the input image so padding between user dimensions and the
+            // aligned coded extent is zero-initialized. RGB-direct uses the
+            // single-plane COLOR-aspect path; YUV uses a multi-plane buffer copy.
+            if use_rgb_input {
+                clear_rgb_input_image(
+                    &context,
+                    upload_command_buffer,
+                    upload_fence,
+                    context.transfer_queue(),
+                    input_image,
+                )?;
+            } else {
+                clear_input_image(
+                    &context,
+                    &ClearImageParams {
+                        command_buffer: upload_command_buffer,
+                        fence: upload_fence,
+                        queue: context.transfer_queue(),
+                        image: input_image,
+                        width: aligned_width,
+                        height: aligned_height,
+                        pixel_format: config.pixel_format,
+                        bit_depth: config.bit_depth,
+                    },
+                )?;
+            }
 
-        encode_feedback_create.p_next =
-            (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
+            // Encode command buffer: slot 0 reuses the one create_command_resources
+            // already allocated; slots 1..N pull from the extras vec.
+            let encode_command_buffer = if slot_idx == 0 {
+                cmd_resources.encode_command_buffer
+            } else {
+                extra_encode_buffers[slot_idx - 1]
+            };
 
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next = (&mut encode_feedback_create
-            as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
-            .cast();
+            // Encode fence: slot 0 reuses the one create_command_resources already
+            // created (signaled); additional slots get fresh signaled fences.
+            let encode_fence = if slot_idx == 0 {
+                cmd_resources.encode_fence
+            } else {
+                let signaled = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+                unsafe { context.device().create_fence(&signaled, None) }
+                    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
+            };
 
-        let query_pool = unsafe {
-            context
-                .device()
-                .create_query_pool(&query_pool_create_info, None)
+            // Per-slot single-query pool (one feedback query per encode submit).
+            let mut rgb_conv_profile_query =
+                vk::VideoEncodeProfileRgbConversionInfoVALVE::default()
+                    .perform_encode_rgb_conversion(true);
+            let mut h265_profile_info_query =
+                vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+            if use_rgb_input {
+                h265_profile_info_query.p_next = (&mut rgb_conv_profile_query
+                    as *mut vk::VideoEncodeProfileRgbConversionInfoVALVE)
+                    .cast();
+            }
+            let mut profile_info_query = vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                .chroma_subsampling(chroma_subsampling)
+                .luma_bit_depth(bit_depth_flags)
+                .chroma_bit_depth(bit_depth_flags);
+            profile_info_query.p_next =
+                (&mut h265_profile_info_query as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            let mut encode_feedback_create =
+                vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default().encode_feedback_flags(
+                    vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
+                        | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+                );
+            encode_feedback_create.p_next =
+                (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
+            let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1);
+            query_pool_create_info.p_next = (&mut encode_feedback_create
+                as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
+                .cast();
+            let query_pool = unsafe {
+                context
+                    .device()
+                    .create_query_pool(&query_pool_create_info, None)
+            }
+            .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+
+            slots.push(super::EncodeSlot {
+                input_image,
+                input_image_memory,
+                input_image_view,
+                input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+                bitstream_buffer,
+                bitstream_buffer_memory,
+                bitstream_buffer_ptr,
+                encode_command_buffer,
+                encode_fence,
+                query_pool,
+                in_flight: false,
+                pending_metadata: None,
+            });
         }
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
 
         // Create DPB and GOP structure
         let mut dpb = DecodedPictureBuffer::new();
@@ -459,25 +583,17 @@ impl H265Encoder {
             session_memory,
             input_frame_num: 0,
             encode_frame_num: 0,
-            input_image,
-            input_image_memory,
-            input_image_view,
-            input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            slots,
+            current_slot: 0,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count,
             use_layered_dpb,
-            bitstream_buffer,
-            bitstream_buffer_memory,
-            bitstream_buffer_ptr,
             command_pool,
             upload_command_pool,
             upload_command_buffer,
             upload_fence,
-            encode_command_buffer,
-            encode_fence,
-            query_pool,
             header_data: None,
             has_backward_reference: false,
             backward_reference_poc: 0,

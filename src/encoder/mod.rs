@@ -224,6 +224,16 @@ pub struct EncodeConfig {
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
+    /// When true, configure the encoder to take **RGB** input images directly
+    /// and have the hardware perform RGB→YUV conversion inline during encode.
+    /// Requires the device to advertise `VK_VALVE_video_encode_rgb_conversion`
+    /// (currently only AMD's RADV driver). Trying to enable this on a device
+    /// that doesn't support it returns an error from `Encoder::new`.
+    ///
+    /// When false (the default), the encoder takes its native YUV input
+    /// format (NV12 / P010 / 4:4:4 variants) and the caller is responsible
+    /// for converting RGB sources beforehand.
+    pub use_rgb_input: bool,
 }
 
 impl EncodeConfig {
@@ -249,6 +259,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            use_rgb_input: false,
         }
     }
 
@@ -274,6 +285,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            use_rgb_input: false,
         }
     }
 
@@ -299,6 +311,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            use_rgb_input: false,
         }
     }
 
@@ -381,6 +394,13 @@ impl EncodeConfig {
     /// Set the color description for VUI signaling.
     pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
         self.color_description = Some(desc);
+        self
+    }
+
+    /// Enable hardware-direct RGB input (`VK_VALVE_video_encode_rgb_conversion`).
+    /// See [`EncodeConfig::use_rgb_input`].
+    pub fn with_rgb_input(mut self, enable: bool) -> Self {
+        self.use_rgb_input = enable;
         self
     }
 }
@@ -466,7 +486,7 @@ impl Encoder {
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// input.upload_yuv420(&yuv_data)?;
     ///
-    /// // Encode the image
+    /// // Encode the image (no GPU wait semaphore needed when uploaded synchronously).
     /// let packets = encoder.encode(input.image())?;
     /// # Ok(())
     /// # }

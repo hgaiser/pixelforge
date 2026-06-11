@@ -2,7 +2,7 @@ use super::H264Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
 use crate::encoder::resources::{
-    prepare_encode_command_buffer, record_dpb_barriers, submit_encode_and_read_bitstream,
+    prepare_encode_command_buffer, record_dpb_barriers, submit_encode_only,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::error::{PixelForgeError, Result};
@@ -10,13 +10,18 @@ use ash::vk;
 use tracing::debug;
 
 impl H264Encoder {
+    /// Records and submits the encode commands for a single frame to the
+    /// current slot. Does NOT wait for completion or read the bitstream —
+    /// the caller drains the slot's prior in-flight encode before calling
+    /// this, and the slot is marked in_flight so a later call can drain the
+    /// submission made here.
     pub(super) fn encode_frame_internal(
         &mut self,
         gop_position: &GopPosition,
         frame_num: u32,
         pic_order_cnt: i32,
         is_idr: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
         let is_reference = gop_position.is_reference;
 
@@ -55,8 +60,8 @@ impl H264Encoder {
         unsafe {
             prepare_encode_command_buffer(
                 self.context.device(),
-                self.encode_command_buffer,
-                self.query_pool,
+                self.slots[self.current_slot].encode_command_buffer,
+                self.slots[self.current_slot].query_pool,
             )?;
         }
 
@@ -65,7 +70,7 @@ impl H264Encoder {
         unsafe {
             record_dpb_barriers(
                 self.context.device(),
-                self.encode_command_buffer,
+                self.slots[self.current_slot].encode_command_buffer,
                 &self.dpb_images,
                 self.use_layered_dpb,
                 self.current_dpb_slot,
@@ -263,7 +268,7 @@ impl H264Encoder {
                 height: self.aligned_height,
             })
             .base_array_layer(0)
-            .image_view_binding(self.input_image_view);
+            .image_view_binding(self.slots[self.current_slot].input_image_view);
 
         // Set up DPB slot for reconstructed picture (setup slot)
         let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
@@ -431,7 +436,7 @@ impl H264Encoder {
         }
 
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer(self.slots[self.current_slot].bitstream_buffer)
             .dst_buffer_offset(0)
             .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
             .src_picture_resource(src_picture_resource)
@@ -537,7 +542,7 @@ impl H264Encoder {
 
         unsafe {
             (self.video_queue_fn.fp().cmd_begin_video_coding_khr)(
-                self.encode_command_buffer,
+                self.slots[self.current_slot].encode_command_buffer,
                 &begin_info,
             );
         }
@@ -561,7 +566,7 @@ impl H264Encoder {
 
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    self.encode_command_buffer,
+                    self.slots[self.current_slot].encode_command_buffer,
                     &control_info,
                 );
             }
@@ -570,8 +575,8 @@ impl H264Encoder {
         // Begin query.
         unsafe {
             self.context.device().cmd_begin_query(
-                self.encode_command_buffer,
-                self.query_pool,
+                self.slots[self.current_slot].encode_command_buffer,
+                self.slots[self.current_slot].query_pool,
                 0,
                 vk::QueryControlFlags::empty(),
             );
@@ -580,23 +585,25 @@ impl H264Encoder {
         // Encode
         unsafe {
             (self.video_encode_fn.fp().cmd_encode_video_khr)(
-                self.encode_command_buffer,
+                self.slots[self.current_slot].encode_command_buffer,
                 &encode_info,
             );
         }
 
         // End query.
         unsafe {
-            self.context
-                .device()
-                .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
+            self.context.device().cmd_end_query(
+                self.slots[self.current_slot].encode_command_buffer,
+                self.slots[self.current_slot].query_pool,
+                0,
+            );
         }
 
         // End video coding.
         let end_info = vk::VideoEndCodingInfoKHR::default();
         unsafe {
             (self.video_queue_fn.fp().cmd_end_video_coding_khr)(
-                self.encode_command_buffer,
+                self.slots[self.current_slot].encode_command_buffer,
                 &end_info,
             );
         }
@@ -605,7 +612,7 @@ impl H264Encoder {
         unsafe {
             self.context
                 .device()
-                .end_command_buffer(self.encode_command_buffer)
+                .end_command_buffer(self.slots[self.current_slot].encode_command_buffer)
         }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
@@ -614,20 +621,23 @@ impl H264Encoder {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
 
-        let encoded_data = unsafe {
-            submit_encode_and_read_bitstream(
+        unsafe {
+            submit_encode_only(
                 self.context.device(),
-                self.encode_command_buffer,
-                self.encode_fence,
+                self.slots[self.current_slot].encode_command_buffer,
+                self.slots[self.current_slot].encode_fence,
                 encode_queue,
-                self.query_pool,
-                self.bitstream_buffer_ptr,
-            )?
-        };
+                None,
+            )?;
+        }
 
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
-        Ok(encoded_data)
+        // Mark slot as in-flight; bitstream is drained on the next encode()
+        // call that targets this slot.
+        self.slots[self.current_slot].in_flight = true;
+
+        Ok(())
     }
 }
