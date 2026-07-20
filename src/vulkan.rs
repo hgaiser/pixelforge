@@ -14,6 +14,7 @@ pub struct VideoContextBuilder {
     app_version: (u32, u32, u32),
     enable_validation: bool,
     required_encode_codecs: Vec<Codec>,
+    preferred_drm_render_node: Option<std::path::PathBuf>,
 }
 
 impl Default for VideoContextBuilder {
@@ -30,6 +31,7 @@ impl VideoContextBuilder {
             app_version: (1, 0, 0),
             enable_validation: false,
             required_encode_codecs: Vec::new(),
+            preferred_drm_render_node: None,
         }
     }
 
@@ -54,6 +56,21 @@ impl VideoContextBuilder {
     /// Require video encode support for a codec.
     pub fn require_encode(mut self, codec: Codec) -> Self {
         self.required_encode_codecs.push(codec);
+        self
+    }
+
+    /// Prefer the physical device backing the given DRM render node
+    /// (e.g. `/dev/dri/renderD128`).
+    ///
+    /// Device selection picks the encode-capable Vulkan device whose DRM
+    /// render major/minor (via `VK_EXT_physical_device_drm`) matches this node,
+    /// so the encoder runs on the same physical GPU as the compositor that
+    /// produced the DMA-BUFs. Without this, importing a buffer allocated on one
+    /// GPU into an encoder on another corrupts the image, and identical GPUs
+    /// can't be disambiguated by vendor:device id. Falls back to the first
+    /// suitable device when unset or unmatched. No-op on non-Linux.
+    pub fn drm_render_node(mut self, node: Option<std::path::PathBuf>) -> Self {
+        self.preferred_drm_render_node = node;
         self
     }
 
@@ -239,12 +256,44 @@ impl VideoContext {
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
 
-        let mut selected_device = None;
-        let mut video_encode_queue_family = None;
-        let mut transfer_queue_family = u32::MAX;
-        let mut compute_queue_family = u32::MAX;
-        let mut supported_encode_codecs = Vec::new();
-        let mut has_descriptor_buffer_ext = false;
+        // Resolve the preferred DRM render node to (major, minor). Used to pin
+        // the encoder to the same physical GPU as the compositor, since importing
+        // a DMA-BUF allocated on one GPU into an encoder on another corrupts the
+        // image and vendor:device filtering can't disambiguate identical GPUs.
+        let preferred_drm = builder.preferred_drm_render_node.as_deref().and_then(|path| {
+            match drm_render_major_minor(path) {
+                Some(mm) => {
+                    info!(
+                        "Encoder will prefer the GPU backing {} (drm {}:{})",
+                        path.display(),
+                        mm.0,
+                        mm.1
+                    );
+                    Some(mm)
+                },
+                None => {
+                    warn!(
+                        "Could not resolve DRM major/minor for {}; encoder will pick the first suitable GPU",
+                        path.display()
+                    );
+                    None
+                },
+            }
+        });
+
+        struct DeviceCandidate {
+            physical_device: vk::PhysicalDevice,
+            device_name: String,
+            video_encode_queue_family: Option<u32>,
+            transfer_queue_family: u32,
+            compute_queue_family: u32,
+            supported_encode_codecs: Vec<Codec>,
+            has_descriptor_buffer_ext: bool,
+            /// DRM render (major, minor) reported by `VK_EXT_physical_device_drm`, if available.
+            drm_render: Option<(i64, i64)>,
+        }
+
+        let mut candidates: Vec<DeviceCandidate> = Vec::new();
 
         for physical_device in physical_devices {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -252,6 +301,42 @@ impl VideoContext {
                 .to_string_lossy()
                 .to_string();
             debug!("Checking device: {}", device_name);
+
+            // Enumerate device extensions once (used for DRM, descriptor buffer, and codec checks).
+            let available_extensions =
+                match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+                    Ok(exts) => exts,
+                    Err(e) => {
+                        warn!(
+                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                            device_name, e
+                        );
+                        continue;
+                    },
+                };
+            let has_extension = |name: &std::ffi::CStr| -> bool {
+                available_extensions.iter().any(|ext| {
+                    let ext_name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                    ext_name == name
+                })
+            };
+
+            // Query the DRM render node (major, minor) backing this device so it
+            // can be matched against the compositor's render node.
+            let drm_render = if has_extension(c"VK_EXT_physical_device_drm") {
+                let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                {
+                    let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut drm_props);
+                    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+                }
+                if drm_props.has_render != 0 {
+                    Some((drm_props.render_major, drm_props.render_minor))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             let queue_families =
                 unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -261,25 +346,25 @@ impl VideoContext {
             let mut transfer_q = u32::MAX;
             let mut compute_q = u32::MAX;
 
-            for (idx, props) in queue_families.iter().enumerate() {
+            for (idx, qf) in queue_families.iter().enumerate() {
                 debug!(
                     "Queue family {}: flags={:?}, count={}",
-                    idx, props.queue_flags, props.queue_count
+                    idx, qf.queue_flags, qf.queue_count
                 );
 
                 // Check for video encode queue.
-                if props.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
+                if qf.queue_flags.contains(vk::QueueFlags::VIDEO_ENCODE_KHR) {
                     encode_queue = Some(idx as u32);
                     debug!("Found video encode queue at family {}", idx);
                 }
 
                 // Check for transfer queue.
-                if props.queue_flags.contains(vk::QueueFlags::TRANSFER) {
+                if qf.queue_flags.contains(vk::QueueFlags::TRANSFER) {
                     transfer_q = idx as u32;
                 }
 
                 // Check for compute queue (prefer dedicated compute, otherwise graphics+compute).
-                if props.queue_flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
+                if qf.queue_flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
                     compute_q = idx as u32;
                     debug!("Found compute queue at family {}", idx);
                 }
@@ -287,29 +372,8 @@ impl VideoContext {
 
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
+            let mut has_descriptor_buffer_ext = false;
             if let Some(eq) = encode_queue {
-                // Get list of available device extensions
-                let available_extensions = match unsafe {
-                    instance.enumerate_device_extension_properties(physical_device)
-                } {
-                    Ok(exts) => exts,
-                    Err(e) => {
-                        warn!(
-                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
-                            device_name, e
-                        );
-                        continue;
-                    }
-                };
-
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
                 // Check if descriptor buffer extension is available.
                 has_descriptor_buffer_ext = has_extension(ash::ext::descriptor_buffer::NAME);
 
@@ -345,17 +409,20 @@ impl VideoContext {
             let has_compute_support = compute_q != u32::MAX;
 
             if has_video_support && encode_supported && has_compute_support {
-                selected_device = Some(physical_device);
-                video_encode_queue_family = encode_queue;
-                transfer_queue_family = if transfer_q != u32::MAX {
-                    transfer_q
-                } else {
-                    encode_queue.unwrap_or(0)
-                };
-                compute_queue_family = compute_q;
-                supported_encode_codecs = encode_codecs;
-                info!("Selected device: {}", device_name);
-                break;
+                candidates.push(DeviceCandidate {
+                    physical_device,
+                    device_name,
+                    video_encode_queue_family: encode_queue,
+                    transfer_queue_family: if transfer_q != u32::MAX {
+                        transfer_q
+                    } else {
+                        encode_queue.unwrap_or(0)
+                    },
+                    compute_queue_family: compute_q,
+                    supported_encode_codecs: encode_codecs,
+                    has_descriptor_buffer_ext,
+                    drm_render,
+                });
             } else {
                 warn!(
                     "Device {} skipped: video_support={}, encode_supported={}, compute_support={}",
@@ -374,11 +441,45 @@ impl VideoContext {
             }
         }
 
-        let physical_device = selected_device.ok_or_else(|| {
+        // Pick the candidate whose DRM render node matches the requested one, so
+        // the encoder shares the compositor's GPU. Fall back to the first suitable
+        // device (previous behavior) when no node is requested or none matches.
+        let chosen_index = match preferred_drm {
+            Some(target) => candidates
+                .iter()
+                .position(|c| c.drm_render == Some(target))
+                .or_else(|| {
+                    if candidates.is_empty() {
+                        None
+                    } else {
+                        warn!(
+                            "No encode-capable Vulkan device matches DRM render node {}:{}; falling back to the first suitable device (cross-GPU corruption possible)",
+                            target.0, target.1
+                        );
+                        Some(0)
+                    }
+                }),
+            None => (!candidates.is_empty()).then_some(0),
+        };
+
+        let chosen = chosen_index.map(|i| candidates.swap_remove(i)).ok_or_else(|| {
             PixelForgeError::NoSuitableDevice(
                 "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
             )
         })?;
+
+        let physical_device = chosen.physical_device;
+        let video_encode_queue_family = chosen.video_encode_queue_family;
+        let transfer_queue_family = chosen.transfer_queue_family;
+        let compute_queue_family = chosen.compute_queue_family;
+        let supported_encode_codecs = chosen.supported_encode_codecs;
+        let has_descriptor_buffer_ext = chosen.has_descriptor_buffer_ext;
+        match chosen.drm_render {
+            Some((major, minor)) => {
+                info!("Selected device: {} (drm {}:{})", chosen.device_name, major, minor)
+            },
+            None => info!("Selected device: {} (drm render node unknown)", chosen.device_name),
+        }
 
         // Get device properties and memory properties.
         let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -787,4 +888,23 @@ impl VideoContext {
                     .contains(properties)
         })
     }
+}
+
+/// Resolve a device node path (e.g. `/dev/dri/renderD128`) to its DRM
+/// `(major, minor)`, matching `VkPhysicalDeviceDrmPropertiesEXT`'s
+/// `render_major`/`render_minor`.
+///
+/// Uses the glibc `dev_t` encoding (`gnu_dev_major`/`gnu_dev_minor`). Linux only.
+#[cfg(target_os = "linux")]
+fn drm_render_major_minor(path: &std::path::Path) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = std::fs::metadata(path).ok()?.rdev();
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    Some((major as i64, minor as i64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drm_render_major_minor(_path: &std::path::Path) -> Option<(i64, i64)> {
+    None
 }
