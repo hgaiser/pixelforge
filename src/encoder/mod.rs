@@ -159,13 +159,13 @@ pub struct ColorDescription {
 }
 
 impl ColorDescription {
-    /// BT.709 color description (standard SDR).
+    /// BT.709 color description (standard SDR, limited range).
     pub fn bt709() -> Self {
         Self {
             color_primaries: 1,
             transfer_characteristics: 1,
             matrix_coefficients: 1,
-            full_range: true,
+            full_range: false,
         }
     }
 
@@ -822,7 +822,7 @@ mod tests {
             assert_eq!(cd.color_primaries, 1);
             assert_eq!(cd.transfer_characteristics, 1);
             assert_eq!(cd.matrix_coefficients, 1);
-            assert!(cd.full_range);
+            assert!(!cd.full_range);
         }
 
         #[test]
