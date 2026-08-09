@@ -174,7 +174,8 @@ impl H264 {
                 .parameters_add_info(&h264_add_info);
 
         // Chain quality level info (required by AMD RADV; matches FFmpeg).
-        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(config.encode_quality_level);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)

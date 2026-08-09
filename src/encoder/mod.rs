@@ -329,6 +329,18 @@ pub struct EncodeConfig {
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
+    /// Maximum QP for I/IDR frames in rate-controlled modes.
+    /// `None` uses the codec default (42 for H.264, 51 for H.265).
+    /// Capping it below the default forces keyframes to spend enough bits
+    /// even before rate control has adapted to the content, at the cost of
+    /// larger keyframes. Values below the codec's minimum QP bound are
+    /// raised to it. Ignored by AV1 and by CQP/disabled rate control.
+    pub max_qp_i: Option<u32>,
+    /// Vulkan video encode quality level
+    /// (`VkVideoEncodeQualityLevelInfoKHR`). Higher levels trade encoding
+    /// speed for quality. Must be below the device's `maxQualityLevels`
+    /// for the video profile.
+    pub encode_quality_level: u32,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
@@ -362,6 +374,8 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            max_qp_i: None,
+            encode_quality_level: 0,
             color_description: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
@@ -390,6 +404,8 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            max_qp_i: None,
+            encode_quality_level: 0,
             color_description: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
@@ -418,6 +434,8 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
+            max_qp_i: None,
+            encode_quality_level: 0,
             color_description: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
@@ -498,6 +516,18 @@ impl EncodeConfig {
     /// Use 0 to tightly constrain IDR/I-frame sizes.
     pub fn with_initial_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
         self.initial_virtual_buffer_size_ms = ms;
+        self
+    }
+
+    /// Set the maximum QP for I/IDR frames in rate-controlled modes.
+    pub fn with_max_qp_i(mut self, qp: u32) -> Self {
+        self.max_qp_i = Some(qp);
+        self
+    }
+
+    /// Set the Vulkan video encode quality level.
+    pub fn with_encode_quality_level(mut self, level: u32) -> Self {
+        self.encode_quality_level = level;
         self
     }
 

@@ -406,13 +406,21 @@ impl H265 {
         // Rate control.
         let qp_min = if rc.is_disabled() { rc.qp as i32 } else { 26 };
         let qp_max = if rc.is_disabled() { rc.qp as i32 } else { 51 };
+        let qp_max_i = if rc.is_disabled() {
+            rc.qp as i32
+        } else {
+            common
+                .config
+                .max_qp_i
+                .map_or(qp_max, |qp| (qp as i32).max(qp_min))
+        };
         let min_qp = vk::VideoEncodeH265QpKHR {
             qp_i: qp_min,
             qp_p: qp_min,
             qp_b: qp_min,
         };
         let max_qp = vk::VideoEncodeH265QpKHR {
-            qp_i: qp_max,
+            qp_i: qp_max_i,
             qp_p: qp_max,
             qp_b: qp_max,
         };
@@ -466,8 +474,8 @@ impl H265 {
         }
 
         if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(common.config.encode_quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET
