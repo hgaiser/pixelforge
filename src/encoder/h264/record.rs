@@ -431,13 +431,21 @@ impl H264 {
         // Rate control.
         let qp_bounds = if rc.is_disabled() { rc.qp as i32 } else { 18 };
         let qp_bounds_max = if rc.is_disabled() { rc.qp as i32 } else { 42 };
+        let qp_bounds_max_i = if rc.is_disabled() {
+            rc.qp as i32
+        } else {
+            common
+                .config
+                .max_qp_i
+                .map_or(qp_bounds_max, |qp| (qp as i32).max(qp_bounds))
+        };
         let min_qp = vk::VideoEncodeH264QpKHR {
             qp_i: qp_bounds,
             qp_p: qp_bounds,
             qp_b: qp_bounds,
         };
         let max_qp = vk::VideoEncodeH264QpKHR {
-            qp_i: qp_bounds_max,
+            qp_i: qp_bounds_max_i,
             qp_p: qp_bounds_max,
             qp_b: qp_bounds_max,
         };
@@ -496,8 +504,8 @@ impl H264 {
         // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command on the first
         // frame (matches FFmpeg; required for AMD RADV).
         if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(common.config.encode_quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET

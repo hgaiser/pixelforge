@@ -333,7 +333,8 @@ impl H265 {
                 .max_std_pps_count(1)
                 .parameters_add_info(&h265_add_info);
 
-        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(common.config.encode_quality_level);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)
