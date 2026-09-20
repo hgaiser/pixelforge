@@ -4,7 +4,6 @@
 //! including the compute pipeline built from the precompiled SPIR-V shader.
 
 use super::{ColorConverter, ColorConverterConfig};
-use crate::encoder::resources::find_memory_type;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -96,7 +95,15 @@ pub fn create_converter(
         .module(shader_module)
         .name(&entry_point);
 
+    // The descriptor set layout above was created with DESCRIPTOR_BUFFER_EXT
+    // (see `layout_info` above), so the pipeline consuming it must also be
+    // created with this flag. Without it, binding a descriptor buffer at
+    // dispatch time is undefined behaviour (VUID-vkCmdDispatch-None-08117 /
+    // VUID-vkCmdDispatch-None-08600) -- the compute shader runs with
+    // effectively-unbound descriptor bindings, which is a GPU memory-safety
+    // hazard (arbitrary reads/writes each dispatch).
     let pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
         .stage(stage_info)
         .layout(pipeline_layout);
 
@@ -128,17 +135,21 @@ pub fn create_converter(
     // Create output buffer (device local for compute shader output, transfer
     // source for image copy). Needs SHADER_DEVICE_ADDRESS so we can query a
     // device address to feed `VkDescriptorAddressInfoEXT` when populating
-    // the storage-buffer descriptor at runtime.
-    let (output_buffer, output_memory) = create_buffer(
-        device,
-        context.memory_properties(),
-        output_size as vk::DeviceSize,
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    // the storage-buffer descriptor at runtime. Memory must be allocated with
+    // `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` for `get_buffer_device_address`
+    // to return a well-defined address, so use the device-address-aware
+    // allocator rather than the plain `create_buffer` helper.
+    let (output_buffer, output_memory) =
+        crate::encoder::resources::create_buffer_with_device_address(
+            device,
+            context.memory_properties(),
+            output_size as vk::DeviceSize,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
 
     // Resolve the output buffer's device address. This goes into the
     // `VkDescriptorAddressInfoEXT` we pass to `vkGetDescriptorEXT` when
@@ -283,47 +294,4 @@ pub fn create_converter(
         binding0_offset,
         binding1_offset,
     })
-}
-
-/// Create a buffer with associated memory.
-fn create_buffer(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    size: vk::DeviceSize,
-    usage: vk::BufferUsageFlags,
-    properties: vk::MemoryPropertyFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
-
-    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-    let memory_type_index = find_memory_type(
-        memory_properties,
-        mem_requirements.memory_type_bits,
-        properties,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation(format!(
-            "No suitable memory type for buffer with properties {:?}",
-            properties
-        ))
-    })?;
-
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-
-    let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-    Ok((buffer, memory))
 }
