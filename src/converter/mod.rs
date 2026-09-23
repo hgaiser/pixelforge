@@ -10,6 +10,8 @@ mod pipeline;
 
 use crate::encoder::ColorDescription;
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
+use crate::video::TimelineChain;
 use crate::vulkan::VideoContext;
 use ash::vk;
 use tracing::debug;
@@ -323,6 +325,37 @@ impl ColorConverterConfig {
         )
     }
 
+    /// The RGB input to give the encoder instead of running this conversion,
+    /// when the encoder can do it itself.
+    ///
+    /// `Some` when `context` has `VK_VALVE_video_encode_rgb_conversion` and
+    /// the conversion is nothing but the YUV matrix: source and target are the
+    /// same space, so no transfer function or gamut change is involved, the
+    /// output is 4:2:0, and the input is 8-bit for an 8-bit output or
+    /// `ABGR2101010` for a 10-bit one. Build the encoder with
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
+    /// and this format, and with [`Self::color_description`], then hand it the
+    /// RGB images directly and skip the converter.
+    ///
+    /// Whether the driver accepts the format for a particular codec and
+    /// profile is only known when the encoder is created, so if
+    /// [`Encoder::new`](crate::Encoder::new) refuses it, fall back to the
+    /// converter.
+    pub fn rgb_encode_input(&self, context: &VideoContext) -> Option<InputFormat> {
+        if !context.has_video_encode_rgb_conversion() || self.source != self.target {
+            return None;
+        }
+        let matches = match self.output_format {
+            OutputFormat::NV12 => matches!(
+                self.input_format,
+                InputFormat::BGRx | InputFormat::BGRA | InputFormat::RGBx | InputFormat::RGBA
+            ),
+            OutputFormat::P010 => self.input_format == InputFormat::ABGR2101010,
+            _ => false,
+        };
+        matches.then_some(self.input_format)
+    }
+
     /// Whether the shader can get from this source to this target.
     ///
     /// Anything that would need tone mapping or a forward gamma encode is not
@@ -369,37 +402,31 @@ pub struct ColorConverter {
     // Sampler for texelFetch on the source image.
     sampler: vk::Sampler,
 
-    // Cached ImageView for the source image (avoids per-frame recreation).
-    cached_src_view: Option<(vk::Image, vk::ImageView)>,
+    // The view the last conversion read its source through, destroyed once
+    // that conversion is done. A view is made per conversion rather than
+    // cached by image handle: a driver may give a new image a destroyed
+    // one's handle, and a cache would then read the new image through a view
+    // of the old one.
+    src_view: Option<vk::ImageView>,
 
     // Output buffer (compute shader writes here).
     output_buffer: vk::Buffer,
     output_memory: vk::DeviceMemory,
-    // Output buffer size and device address. The address is fed into
-    // `VkDescriptorAddressInfoEXT` when populating the binding-1 descriptor.
     output_buffer_size: usize,
-    output_buffer_address: vk::DeviceAddress,
 
-    // Descriptor buffer (mapped, descriptors are written here per-frame).
-    descriptor_buffer: vk::Buffer,
-    descriptor_buffer_memory: vk::DeviceMemory,
-    descriptor_buffer_address: vk::DeviceAddress,
-    descriptor_buffer_usage: vk::BufferUsageFlags,
-    descriptor_buffer_ptr: *mut u8,
-    // Descriptor sizes for each binding type, queried from
-    // `VkPhysicalDeviceDescriptorBufferPropertiesEXT`.
-    combined_image_sampler_descriptor_size: usize,
-    storage_buffer_descriptor_size: usize,
-    // Loaded descriptor-buffer extension device for `vkGetDescriptorEXT`.
-    ext_device: ash::ext::descriptor_buffer::Device,
-    // Per-binding offsets within the descriptor buffer.
-    binding0_offset: u64,
-    binding1_offset: u64,
+    // Binds both descriptors inside the command buffer each frame.
+    push_descriptor: ash::khr::push_descriptor::Device,
 
     // Command resources.
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Whether a conversion was submitted and `fence` not yet waited on. The
+    /// command buffer, output buffer and cached source view are all reused
+    /// by the next conversion, so it waits for this one first.
+    in_flight: bool,
+    /// Signalled by each conversion, for [`Self::convert_async`] to hand out.
+    timeline: TimelineChain,
 }
 
 impl ColorConverter {
@@ -773,10 +800,42 @@ impl ColorConverter {
         target_image: vk::Image,
     ) -> Result<()> {
         let start = std::time::Instant::now();
+        self.convert_async(src_image, src_layout, target_image, &[])?;
+        self.wait_idle()?;
+        debug!("ColorConverter::convert() took {:?}", start.elapsed());
+        Ok(())
+    }
 
-        // Get or create ImageView for the source image (must happen before
-        // borrowing device immutably, since this takes &mut self).
-        let src_view = self.get_or_create_src_view(src_image)?;
+    /// Convert like [`Self::convert`], but without waiting on the CPU.
+    ///
+    /// The conversion waits on the GPU for every point in `wait` before
+    /// reading `src_image`, and returns the point it signals when done. Pass
+    /// that to [`Encoder::encode_after`](crate::Encoder::encode_after) to
+    /// encode the result, and wait on it before writing `src_image` again.
+    ///
+    /// On a device shared with the caller, where the caller renders or copies
+    /// into `src_image` itself, this is the whole handover: the caller's
+    /// submission signals a [`TimelinePoint`], the conversion waits on it, the
+    /// encode waits on the conversion. If the caller's queue is in another
+    /// family than [`VideoContext::compute_queue_family`], create `src_image`
+    /// with `VK_SHARING_MODE_CONCURRENT` across both, and pass the layout it
+    /// is actually in as `src_layout`: `UNDEFINED` is taken to mean a
+    /// first-time external-memory import and acquires ownership from
+    /// `VK_QUEUE_FAMILY_EXTERNAL`, which an image that never left the device
+    /// does not have to give.
+    ///
+    /// The next call to either method waits for this conversion to finish
+    /// before recording, since both reuse the same command buffer.
+    pub fn convert_async(
+        &mut self,
+        src_image: vk::Image,
+        src_layout: vk::ImageLayout,
+        target_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<TimelinePoint> {
+        // Before anything is reused, and before the previous view goes.
+        self.wait_idle()?;
+        let src_view = self.create_src_view(src_image)?;
 
         let device = self.context.device();
 
@@ -877,78 +936,30 @@ impl ColorConverter {
                 self.pipeline,
             );
 
-            // --- Populate descriptors directly into the descriptor buffer ---
-            //
-            // Use `vkGetDescriptorEXT` for runtime descriptor population. (The
-            // previous implementation mistakenly used the
-            // `vkGet*OpaqueCaptureDescriptorDataEXT` family — those produce
-            // opaque payloads for capture/replay tooling and are NOT the
-            // descriptor data the GPU consumes at binding offsets, which made
-            // the compute shader read garbage and emit constant-Y output —
-            // visible as a green-screen stream.)
-            //
-            // The descriptor buffer is persistent-mapped HOST_COHERENT, so a
-            // plain memcpy via the slice handed to `get_descriptor` is enough.
-
-            // Binding 0: COMBINED_IMAGE_SAMPLER (sampler + image view).
-            let image_info = vk::DescriptorImageInfo::default()
+            let image_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)
                 .image_view(src_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            let combined_get_info = vk::DescriptorGetInfoEXT::default()
-                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .data(vk::DescriptorDataEXT {
-                    p_combined_image_sampler: &image_info,
-                });
-            let combined_dst = std::slice::from_raw_parts_mut(
-                self.descriptor_buffer_ptr
-                    .add(self.binding0_offset as usize),
-                self.combined_image_sampler_descriptor_size,
-            );
-            self.ext_device
-                .get_descriptor(&combined_get_info, combined_dst);
-
-            // Binding 1: STORAGE_BUFFER (output YUV).
-            let buffer_addr_info = vk::DescriptorAddressInfoEXT::default()
-                .address(self.output_buffer_address)
-                .range(self.output_buffer_size as u64)
-                .format(vk::Format::UNDEFINED);
-            let storage_get_info = vk::DescriptorGetInfoEXT::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .data(vk::DescriptorDataEXT {
-                    p_storage_buffer: &buffer_addr_info,
-                });
-            let storage_dst = std::slice::from_raw_parts_mut(
-                self.descriptor_buffer_ptr
-                    .add(self.binding1_offset as usize),
-                self.storage_buffer_descriptor_size,
-            );
-            self.ext_device
-                .get_descriptor(&storage_get_info, storage_dst);
-
-            // --- Bind descriptor buffers ---
-            let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
-                .address(self.descriptor_buffer_address)
-                .usage(self.descriptor_buffer_usage);
-
-            self.ext_device.cmd_bind_descriptor_buffers(
-                self.command_buffer,
-                std::slice::from_ref(&binding_info),
-            );
-
-            // Associate set 0 in the pipeline layout with the bound descriptor buffer.
-            // This is required because descriptor buffers use offset-based binding.
-            // The base offset is 0 since all payloads are placed at their binding offsets.
-            let buffer_indices = [0u32];
-            let offsets = [0 as vk::DeviceSize];
-
-            self.ext_device.cmd_set_descriptor_buffer_offsets(
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.output_buffer)
+                .offset(0)
+                .range(self.output_buffer_size as vk::DeviceSize)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffer_info),
+            ];
+            self.push_descriptor.cmd_push_descriptor_set(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
-                0, // first_set
-                &buffer_indices,
-                &offsets,
+                0,
+                &writes,
             );
 
             // Push constants: width, height, input_format, output_format,
@@ -1085,44 +1096,56 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        // Submit and wait.
+        let waits: Vec<vk::SemaphoreSubmitInfo> =
+            wait.iter().map(TimelinePoint::wait_info).collect();
+        let (semaphore, value) = self.timeline.pending_signal();
+        let signals = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .value(value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let command_buffers =
+            [vk::CommandBufferSubmitInfo::default().command_buffer(self.command_buffer)];
+        let submit_info = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
+            .command_buffer_infos(&command_buffers)
+            .signal_semaphore_infos(&signals);
+
         unsafe {
             device
                 .reset_fences(&[self.fence])
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-            let command_buffers = [self.command_buffer];
-            let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
-
-            device
-                .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-            device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+            self.context
+                .sync2()
+                .queue_submit2(self.context.compute_queue(), &[submit_info], self.fence)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
+        self.timeline.commit();
+        self.in_flight = true;
 
-        let elapsed = start.elapsed();
-        debug!("ColorConverter::convert() took {:?}", elapsed);
+        Ok(TimelinePoint::new(semaphore, value))
+    }
 
+    /// Wait on the CPU for the last conversion submitted, if it is still
+    /// running, and destroy the view it read its source through.
+    fn wait_idle(&mut self) -> Result<()> {
+        if self.in_flight {
+            unsafe {
+                self.context
+                    .device()
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+            }
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            self.in_flight = false;
+        }
+        if let Some(view) = self.src_view.take() {
+            unsafe { self.context.device().destroy_image_view(view, None) };
+        }
         Ok(())
     }
 
-    /// Get or create an ImageView for the source image.
-    fn get_or_create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
-        // Return cached view if it matches the current source image.
-        if let Some((cached_image, cached_view)) = self.cached_src_view {
-            if cached_image == src_image {
-                return Ok(cached_view);
-            }
-            // Different image — destroy the old view.
-            unsafe {
-                self.context.device().destroy_image_view(cached_view, None);
-            }
-        }
-
-        // Create a new ImageView for the source image.
+    /// Create the view this conversion reads `src_image` through. It lives
+    /// until the conversion is done, see [`Self::wait_idle`].
+    fn create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(src_image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -1138,20 +1161,18 @@ impl ColorConverter {
         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
 
-        self.cached_src_view = Some((src_image, view));
+        self.src_view = Some(view);
         Ok(view)
     }
 }
 
 impl Drop for ColorConverter {
     fn drop(&mut self) {
+        // Nothing below may be destroyed while a conversion still uses it.
+        let _ = self.wait_idle();
         unsafe {
             let device = self.context.device();
-
-            // Destroy cached source image view.
-            if let Some((_, view)) = self.cached_src_view.take() {
-                device.destroy_image_view(view, None);
-            }
+            self.timeline.destroy(device);
 
             // Destroy sampler.
             device.destroy_sampler(self.sampler, None);
@@ -1159,11 +1180,6 @@ impl Drop for ColorConverter {
             // Destroy output buffer and its memory.
             device.destroy_buffer(self.output_buffer, None);
             device.free_memory(self.output_memory, None);
-
-            // Destroy descriptor buffer and its memory.
-            device.unmap_memory(self.descriptor_buffer_memory);
-            device.destroy_buffer(self.descriptor_buffer, None);
-            device.free_memory(self.descriptor_buffer_memory, None);
 
             // Destroy pipeline resources.
             device.destroy_pipeline(self.pipeline, None);

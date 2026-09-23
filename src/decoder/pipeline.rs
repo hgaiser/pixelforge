@@ -236,6 +236,7 @@ impl DecodePipeline {
     pub(crate) fn submit_decode(
         &mut self,
         device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
         decode_queue: vk::Queue,
     ) -> Result<()> {
         let slot = &self.slots[self.current_slot];
@@ -280,7 +281,7 @@ impl DecodePipeline {
             .signal_semaphore_infos(&signals);
 
         unsafe {
-            device
+            sync2
                 .queue_submit2(decode_queue, &[submit], slot.decode_fence)
                 .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
         }
@@ -297,6 +298,7 @@ impl DecodePipeline {
     pub(crate) fn submit_copy(
         &mut self,
         device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
         transfer_queue: vk::Queue,
     ) -> Result<()> {
         let slot = &self.slots[self.current_slot];
@@ -335,7 +337,7 @@ impl DecodePipeline {
             .signal_semaphore_infos(&signals);
 
         unsafe {
-            device
+            sync2
                 .queue_submit2(transfer_queue, &[submit], slot.transfer_fence)
                 .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
         }

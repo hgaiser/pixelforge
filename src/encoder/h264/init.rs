@@ -1,7 +1,8 @@
 use super::{H264, MB_SIZE};
 
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, RgbConversionCaps, build_encoder_common, query_video_caps,
+    rgb_conversion_profile,
 };
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
@@ -53,13 +54,17 @@ impl H264 {
 
         let mut h264_profile_info =
             vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
-        let profile_info = vk::VideoProfileInfoKHR::default()
+        let mut rgb_profile = rgb_conversion_profile();
+        let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth)
             .push(&mut h264_profile_info)
             .push(&mut video_encode_usage_info);
+        if config.rgb_input.is_some() {
+            profile_info = profile_info.push(&mut rgb_profile);
+        }
 
         // The driver's preferred entropy mode is H.264-specific (some require
         // CAVLC for High 4:4:4 Predictive).
@@ -72,7 +77,12 @@ impl H264 {
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_caps)
             .push(&mut h264_caps);
+        let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
+        if config.rgb_input.is_some() {
+            capabilities = capabilities.push(&mut rgb_caps);
+        }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
+        let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
@@ -87,6 +97,7 @@ impl H264 {
             max_active_refs_cap: 32,
             bitstream_buffer_size,
             allow_layered_dpb: true,
+            rgb_caps,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;

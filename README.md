@@ -14,7 +14,11 @@ H.265 and AV1 encode, and H.264 decode.
 - **Asynchronous pipelines**: both directions submit without waiting.
   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
   [`DecodeSource`] as the GPU finishes with them.
-- **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
+- **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ),
+  or in the encoder itself where `VK_VALVE_video_encode_rgb_conversion` is available.
+- **Shared devices**: encode and decode on a Vulkan device your application
+  created, from Vulkan 1.1 up, on queues you choose, ordered against your own
+  work with timeline semaphores.
 - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
@@ -247,6 +251,43 @@ let mut encoder = Encoder::new(context, encode_config)?;
 // converter.convert(input_image, layout, encoder.input_image())?;
 ```
 
+Where the conversion is nothing but the YUV matrix, the encoder may be able
+to do it with no shader at all:
+[`ColorConverterConfig::rgb_encode_input`] says when, and
+[`EncodeConfig::with_rgb_input`] hands it the RGB frames.
+
+### Encoding on your own device
+
+An application that already renders with Vulkan can give pixelforge its own
+device instead of letting it create a second one. Frames then never leave
+the device: no external memory, no import, and no CPU wait between the
+application's work and pixelforge's.
+
+[`VideoContextBuilder::encode_device_requirements`] lists the queue
+families, extensions and features to create the device with, and
+[`VideoContextBuilder::build_from_existing_encode`] adopts it. A `VkQueue`
+may not be submitted to from two threads at once, so give pixelforge queues
+the application does not use, with
+[`VideoContextBuilder::with_encode_queue`] and friends.
+
+[`ColorConverter::convert_async`] and [`Encoder::encode_after`] then order
+each frame on the GPU: the application's submission signals a
+[`TimelinePoint`], the conversion waits for it and signals its own, and the
+encode waits for that.
+
+```rust
+// `rendered` reaches `frame_number` once the application has drawn `image`.
+let converted = converter.convert_async(
+    image,
+    vk::ImageLayout::GENERAL,
+    encoder.input_image(),
+    &[TimelinePoint::new(rendered, frame_number)],
+)?;
+let packet = encoder.encode_after(encoder.input_image(), &[converted])?;
+```
+
+`examples/encode_adopted.rs` builds such a device from scratch.
+
 ## Benchmarking
 
 Run the encode latency benchmark with:
@@ -268,6 +309,9 @@ cargo run --example decode -- input.264 output.yuv
 
 # Decode on a caller-created Vulkan device
 cargo run --example decode_adopted -- input.264 output.yuv
+
+# Encode on a caller-created Vulkan device
+cargo run --example encode_adopted -- input.yuv output.h264
 
 # Encode, choosing the codec (h264, h265 or av1)
 cargo run --example encode -- h265

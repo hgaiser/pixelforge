@@ -13,6 +13,7 @@
 //! scaffolding is here.
 
 use ash::vk;
+use ash::vk::TaggedStructure;
 
 use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
@@ -24,6 +25,7 @@ use crate::encoder::resources::{
 };
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 
 /// Per-encoder state shared by every codec.
@@ -72,6 +74,9 @@ pub(crate) struct EncoderCommon {
     pub upload_command_pool: vk::CommandPool,
     pub upload_command_buffer: vk::CommandBuffer,
     pub upload_fence: vk::Fence,
+    /// Caller work this frame's first submission must wait for. The upload
+    /// takes them when it copies, otherwise the encode submission does.
+    pub pending_waits: Vec<TimelinePoint>,
 }
 
 impl EncoderCommon {
@@ -100,6 +105,7 @@ impl EncoderCommon {
         if src_image == dst_image {
             return Ok(());
         }
+        let waits = std::mem::take(&mut self.pending_waits);
 
         let params = UploadParams {
             upload_command_buffer: self.upload_command_buffer,
@@ -110,7 +116,9 @@ impl EncoderCommon {
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
             input_image_layout,
+            rgb: self.config.rgb_input.is_some(),
             upload_queue: self.context.transfer_queue(),
+            waits: &waits,
         };
         upload_image_to_input(&self.context, &params)?;
         self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
@@ -128,9 +136,13 @@ impl EncoderCommon {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
-        let future = self
-            .pipeline
-            .submit_current(self.context.device(), encode_queue)?;
+        let waits = std::mem::take(&mut self.pending_waits);
+        let future = self.pipeline.submit_current(
+            self.context.device(),
+            self.context.sync2(),
+            encode_queue,
+            &waits,
+        )?;
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
         Ok(future)
     }
@@ -312,9 +324,16 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pipeline.input_image()
     }
 
-    /// Encode one frame, returning a future for its packet. See [`crate::Encoder::encode`].
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
+    /// Encode one frame once `wait` is reached, returning a future for its
+    /// packet. See [`crate::Encoder::encode_after`].
+    pub fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
         let plan = self.common.begin_frame();
+        self.common.pending_waits.clear();
+        self.common.pending_waits.extend_from_slice(wait);
         self.common.upload(src_image)?;
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
@@ -430,6 +449,92 @@ pub(crate) struct CommonInitRequest<'a> {
     /// Whether the codec can use a layered DPB image when the driver lacks
     /// `SEPARATE_REFERENCE_IMAGES` (H.264/H.265 yes; AV1 no).
     pub allow_layered_dpb: bool,
+    /// What the hardware RGB conversion supports for this profile, queried
+    /// alongside the codec capabilities when [`EncodeConfig::rgb_input`] is
+    /// set.
+    pub rgb_caps: Option<RgbConversionCaps>,
+}
+
+/// The profile struct that turns on RGB input. When
+/// [`EncodeConfig::rgb_input`] is set it goes on the one profile the codec
+/// builds, which every capability query, image, query pool and the session
+/// then share: they must all name the same profile.
+pub(crate) fn rgb_conversion_profile() -> vk::VideoEncodeProfileRgbConversionInfoVALVE<'static> {
+    vk::VideoEncodeProfileRgbConversionInfoVALVE::default().perform_encode_rgb_conversion(true)
+}
+
+/// `VkVideoEncodeRgbConversionCapabilitiesVALVE`, without its `pNext`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RgbConversionCaps {
+    models: vk::VideoEncodeRgbModelConversionFlagsVALVE,
+    ranges: vk::VideoEncodeRgbRangeCompressionFlagsVALVE,
+    x_chroma_offsets: vk::VideoEncodeRgbChromaOffsetFlagsVALVE,
+    y_chroma_offsets: vk::VideoEncodeRgbChromaOffsetFlagsVALVE,
+}
+
+impl From<&vk::VideoEncodeRgbConversionCapabilitiesVALVE<'_>> for RgbConversionCaps {
+    fn from(caps: &vk::VideoEncodeRgbConversionCapabilitiesVALVE<'_>) -> Self {
+        Self {
+            models: caps.rgb_models,
+            ranges: caps.rgb_ranges,
+            x_chroma_offsets: caps.x_chroma_offsets,
+            y_chroma_offsets: caps.y_chroma_offsets,
+        }
+    }
+}
+
+impl RgbConversionCaps {
+    /// The session settings that make the hardware produce what `desc`
+    /// describes, or why it cannot.
+    fn session_info(
+        &self,
+        desc: &ColorDescription,
+    ) -> Result<vk::VideoEncodeSessionRgbConversionCreateInfoVALVE<'static>> {
+        use vk::VideoEncodeRgbChromaOffsetFlagsVALVE as Offset;
+        use vk::VideoEncodeRgbModelConversionFlagsVALVE as Model;
+        use vk::VideoEncodeRgbRangeCompressionFlagsVALVE as Range;
+
+        // H.273 matrix coefficients.
+        let model = match desc.matrix_coefficients {
+            1 => Model::YCBCR_709,
+            5 | 6 => Model::YCBCR_601,
+            9 => Model::YCBCR_2020,
+            other => {
+                return Err(PixelForgeError::InvalidInput(format!(
+                    "RGB input: no hardware conversion for matrix coefficients {other}"
+                )));
+            }
+        };
+        let range = if desc.full_range {
+            Range::FULL_RANGE
+        } else {
+            Range::NARROW_RANGE
+        };
+        if !self.models.contains(model) || !self.ranges.contains(range) {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "RGB input: the driver converts {:?} in {:?}, not {:?} in {:?}",
+                self.models, self.ranges, model, range
+            )));
+        }
+        // Chroma sited midway between luma samples on both axes, which is what
+        // the colour converter's 2x2 average produces, so a stream looks the
+        // same whichever path made it. Where the driver cannot, it gets
+        // whichever siting it can do.
+        let pick = |supported: Offset| {
+            if supported.contains(Offset::MIDPOINT) {
+                Offset::MIDPOINT
+            } else {
+                Offset::COSITED_EVEN
+            }
+        };
+        Ok(
+            vk::VideoEncodeSessionRgbConversionCreateInfoVALVE::default()
+                .rgb_model(model)
+                .rgb_range(range)
+                .x_chroma_offset(pick(self.x_chroma_offsets))
+                .y_chroma_offset(pick(self.y_chroma_offsets)),
+        )
+    }
 }
 
 /// Result of [`build_encoder_common`]: the assembled common state plus the
@@ -548,6 +653,33 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         capabilities.max_coded_extent.height
     );
 
+    // With RGB input the encoder converts, so the session needs its settings
+    // and the input image is RGB; the DPB stays YUV either way.
+    let rgb_session = match config.rgb_input {
+        Some(_) if !context.has_video_encode_rgb_conversion() => {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "RGB input needs VK_VALVE_video_encode_rgb_conversion, which this device \
+                 does not have enabled"
+                    .to_string(),
+            ));
+        }
+        Some(_) => {
+            let caps = req.rgb_caps.ok_or_else(|| {
+                PixelForgeError::NoSuitableDevice(
+                    "RGB input: the driver reported no conversion capabilities".to_string(),
+                )
+            })?;
+            Some(
+                caps.session_info(
+                    &config
+                        .color_description
+                        .unwrap_or_else(ColorDescription::bt709),
+                )?,
+            )
+        }
+        None => None,
+    };
+
     // Pick input (SRC) and reference (DPB) formats.
     let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
     let supported_src_formats = query_supported_video_formats(
@@ -570,20 +702,22 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
             "No supported Vulkan Video DPB formats for this profile".to_string(),
         ));
     }
+    let picture_format = config
+        .rgb_input
+        .map_or(preferred_src_format, |format| format.vk_format());
     if !supported_src_formats
         .iter()
-        .any(|f| f.format == preferred_src_format)
+        .any(|f| f.format == picture_format)
     {
         return Err(PixelForgeError::NoSuitableDevice(format!(
-            "Preferred input format {:?} is not supported for VIDEO_ENCODE_SRC_KHR. Supported: {:?}",
-            preferred_src_format, supported_src_formats
+            "Input format {:?} is not supported for VIDEO_ENCODE_SRC_KHR. Supported: {:?}",
+            picture_format, supported_src_formats
         )));
     }
-    let picture_format = preferred_src_format;
     let reference_picture_format = supported_dpb_formats
         .iter()
         .map(|f| f.format)
-        .find(|f| *f == picture_format)
+        .find(|f| *f == preferred_src_format)
         .unwrap_or(supported_dpb_formats[0].format);
 
     // Negotiate DPB slots and active references.
@@ -614,7 +748,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
 
     // Use the driver-reported std header version for this profile.
     let std_header_version = capabilities.std_header_version;
-    let session_create_info = vk::VideoSessionCreateInfoKHR::default()
+    let mut rgb_session_info = rgb_session.unwrap_or_default();
+    let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
         .queue_family_index(encode_queue_family)
         .flags(vk::VideoSessionCreateFlagsKHR::empty())
         .video_profile(req.profile_info)
@@ -627,6 +762,9 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         .max_dpb_slots(dpb_slot_count as u32)
         .max_active_reference_pictures(max_active_reference_pictures as u32)
         .std_header_version(&std_header_version);
+    if rgb_session.is_some() {
+        session_create_info = session_create_info.push(&mut rgb_session_info);
+    }
 
     let mut session = vk::VideoSessionKHR::null();
     let result = unsafe {
@@ -673,6 +811,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         aligned_width,
         aligned_height,
         picture_format,
+        rgb_input: config.rgb_input.is_some(),
         pixel_format: config.pixel_format,
         bit_depth: config.bit_depth,
         bitstream_buffer_size: req.bitstream_buffer_size,
@@ -713,6 +852,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         upload_command_pool: cmd.upload_command_pool,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
+        pending_waits: Vec::new(),
     };
 
     Ok(CommonInit {

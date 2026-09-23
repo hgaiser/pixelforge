@@ -581,7 +581,7 @@ impl DecoderCommon {
     /// (if distinct), into the layouts `vkCmdDecodeVideo` requires.
     pub fn record_barriers(&self, slot: u8) {
         let session = self.session.as_ref().expect("active session");
-        let device = self.context.device();
+        let sync2 = self.context.sync2();
         let mut barriers: Vec<vk::ImageMemoryBarrier2> = Vec::new();
 
         let subresource = |layer: u32| vk::ImageSubresourceRange {
@@ -633,7 +633,7 @@ impl DecoderCommon {
         }
 
         let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        unsafe { device.cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency) };
+        unsafe { sync2.cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency) };
     }
 
     /// The decode command buffer of the picture currently being recorded.
@@ -674,7 +674,8 @@ impl DecoderCommon {
     pub fn submit_decode(&mut self) -> Result<()> {
         let device = self.context.device().clone();
         let queue = self.decode_queue;
-        self.pipeline.submit_decode(&device, queue)
+        self.pipeline
+            .submit_decode(&device, self.context.sync2(), queue)
     }
 
     /// Close off the current picture and hand `frames` to the completion thread.

@@ -1,7 +1,8 @@
 use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, RgbConversionCaps, build_encoder_common, query_video_caps,
+    rgb_conversion_profile,
 };
 use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -47,13 +48,17 @@ impl Av1 {
             .tuning_mode(encoder_tuning_mode);
 
         let mut av1_profile_info = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
-        let profile_info = vk::VideoProfileInfoKHR::default()
+        let mut rgb_profile = rgb_conversion_profile();
+        let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth)
             .push(&mut av1_profile_info)
             .push(&mut video_encode_usage_info);
+        if config.rgb_input.is_some() {
+            profile_info = profile_info.push(&mut rgb_profile);
+        }
 
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
             .max(config.dimensions.width as usize * config.dimensions.height as usize);
@@ -65,7 +70,12 @@ impl Av1 {
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_caps)
             .push(&mut av1_caps);
+        let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
+        if config.rgb_input.is_some() {
+            capabilities = capabilities.push(&mut rgb_caps);
+        }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
+        let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         let init = build_encoder_common(&CommonInitRequest {
             context: &context,
@@ -84,6 +94,7 @@ impl Av1 {
             // when the driver does not support separate reference images
             // (required for AMD RADV).
             allow_layered_dpb: true,
+            rgb_caps,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;

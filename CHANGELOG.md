@@ -102,11 +102,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validation layer messages are now routed into `tracing` through a
   `VK_EXT_debug_utils` messenger. Previously the layer was loaded with nowhere to
   report, so enabling validation verified nothing.
+- Encoding on a caller-created device: `encode_device_requirements` and
+  `build_from_existing_encode`, the counterparts of the decode pair. An
+  application that renders on its own device can encode its images there
+  directly, with no external memory and no second device.
+- `DeviceRequirements::features` names the device features pixelforge needs as
+  booleans, so a caller can set them in whichever feature structs it already
+  chains.
+- `VideoContextBuilder::with_encode_queue`, `with_decode_queue`,
+  `with_transfer_queue` and `with_compute_queue` choose exactly which queue an
+  adopted context submits to, so the caller can keep its own queues to itself.
+  `DeviceRequirements::queues` says which family serves which role, and
+  `DeviceRequirements::internally_synchronized_queues` whether the device can
+  share a queue safely instead.
+- `ColorConverter::convert_async` and `Encoder::encode_after` wait for, and in
+  the converter's case signal, a `TimelinePoint`, so a frame can go from the
+  caller's rendering through conversion to encode ordered on the GPU, with no
+  CPU wait in between.
+- `EncodeConfig::with_rgb_input` hands RGB frames to the encoder and lets it
+  apply the YUV matrix itself, through `VK_VALVE_video_encode_rgb_conversion`.
+  `ColorConverterConfig::rgb_encode_input` says when a conversion can be done
+  that way instead of by the shader. Based on the approach in #14.
 
 ### Changed
 
+- The colour converter binds its descriptors with push descriptors instead of
+  `VK_EXT_descriptor_buffer`, which is deprecated. It now needs only
+  `VK_KHR_push_descriptor`, and no longer buffer device addresses or
+  descriptor buffer capture-replay. `VideoContext::has_descriptor_buffer` is
+  replaced by `VideoContext::has_push_descriptor`.
+- Adopted devices may come from an instance asking for any Vulkan version from
+  1.1 up. Pixelforge reaches synchronization2 through its extension rather than
+  core 1.3, and the requirements list `VK_KHR_timeline_semaphore`.
+
 - Adopting a caller-created device for decode (`build_from_existing_decode`) now
   requires the `timelineSemaphore` feature in addition to `synchronization2`.
+
+### Fixed
+
+- `samplerYcbcrConversion` and the 2-plane 4:4:4 formats feature were only
+  enabled on devices that also had descriptor buffers.
+- The colour converter reused its source image view whenever the next source
+  had the same handle. Drivers reuse the handles of destroyed images, so a
+  caller creating a new source per frame got every frame after the first
+  converted from a freed image.
 
 ## [0.9.1] - 01-09-2026
 

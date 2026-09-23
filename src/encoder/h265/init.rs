@@ -1,7 +1,8 @@
 use super::{CTB_SIZE, H265};
 
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, RgbConversionCaps, build_encoder_common, query_video_caps,
+    rgb_conversion_profile,
 };
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
@@ -62,13 +63,17 @@ impl H265 {
 
         let mut h265_profile_info =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
-        let profile_info = vk::VideoProfileInfoKHR::default()
+        let mut rgb_profile = rgb_conversion_profile();
+        let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth)
             .push(&mut h265_profile_info)
             .push(&mut video_encode_usage_info);
+        if config.rgb_input.is_some() {
+            profile_info = profile_info.push(&mut rgb_profile);
+        }
 
         // Query device capabilities with the H.265-specific capability struct
         // chained in (required by the driver).
@@ -77,7 +82,12 @@ impl H265 {
         let mut capabilities = vk::VideoCapabilitiesKHR::default()
             .push(&mut encode_caps)
             .push(&mut h265_caps);
+        let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
+        if config.rgb_input.is_some() {
+            capabilities = capabilities.push(&mut rgb_caps);
+        }
         let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
+        let rgb_caps = config.rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
@@ -92,6 +102,7 @@ impl H265 {
             max_active_refs_cap: 15,
             bitstream_buffer_size,
             allow_layered_dpb: true,
+            rgb_caps,
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;

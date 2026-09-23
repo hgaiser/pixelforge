@@ -36,6 +36,7 @@ impl DecoderCommon {
         let command_buffer = self.pipeline.current().transfer_command_buffer;
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();
+        let sync2 = self.context.sync2();
         let aspects = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
         let range = |image: vk::Image, layer: u32| vk::ImageMemoryBarrier2 {
             image,
@@ -85,7 +86,7 @@ impl DecoderCommon {
             },
         ];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_transfer);
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dep) };
+        unsafe { sync2.cmd_pipeline_barrier2(command_buffer, &dep) };
 
         let plane = |aspect: vk::ImageAspectFlags| vk::ImageSubresourceLayers {
             aspect_mask: aspect,
@@ -95,7 +96,7 @@ impl DecoderCommon {
         };
         let (cdiv_hor, cdiv_vert) = frame.pixel_format.chroma_div();
         let regions = [
-            vk::ImageCopy2::default()
+            vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {
                     base_array_layer: base_layer,
                     ..plane(vk::ImageAspectFlags::PLANE_0)
@@ -106,7 +107,7 @@ impl DecoderCommon {
                     height: frame.coded_height,
                     depth: 1,
                 }),
-            vk::ImageCopy2::default()
+            vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {
                     base_array_layer: base_layer,
                     ..plane(vk::ImageAspectFlags::PLANE_1)
@@ -118,13 +119,19 @@ impl DecoderCommon {
                     depth: 1,
                 }),
         ];
-        let copy = vk::CopyImageInfo2::default()
-            .src_image(frame.image)
-            .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .dst_image(dst_image)
-            .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .regions(&regions);
-        unsafe { device.cmd_copy_image2(command_buffer, &copy) };
+        // `vkCmdCopyImage` rather than its `2` form: the copy needs nothing the
+        // newer entry point adds, and this one exists on every device, where
+        // `vkCmdCopyImage2` needs Vulkan 1.3 or `VK_KHR_copy_commands2`.
+        unsafe {
+            device.cmd_copy_image(
+                command_buffer,
+                frame.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            )
+        };
 
         // Restore the source layout so a DPB image stays a valid reference.
         let restore = [vk::ImageMemoryBarrier2 {
@@ -137,7 +144,7 @@ impl DecoderCommon {
             ..range(frame.image, base_layer)
         }];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&restore);
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dep) };
+        unsafe { sync2.cmd_pipeline_barrier2(command_buffer, &dep) };
 
         Ok(())
     }
@@ -146,6 +153,7 @@ impl DecoderCommon {
     pub fn submit_copy(&mut self) -> Result<()> {
         let device = self.context.device().clone();
         let queue = self.transfer_queue;
-        self.pipeline.submit_copy(&device, queue)
+        self.pipeline
+            .submit_copy(&device, self.context.sync2(), queue)
     }
 }

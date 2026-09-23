@@ -20,7 +20,7 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
-use pixelforge::vulkan::VideoContextBuilder;
+use pixelforge::vulkan::{DeviceQueue, VideoContextBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -67,18 +67,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reqs.extensions.len()
     );
 
-    // The app merges pixelforge's requirements with its own. Here there is
-    // nothing else, so we use them directly.
-    let priorities = [1.0f32];
+    // The app merges pixelforge's requirements with its own. A real app keeps
+    // queue 0 of each family for itself, so where a family has a second queue
+    // this one creates it and hands that to pixelforge instead: a `VkQueue`
+    // may not be submitted to from two threads at once, and this is how the
+    // app keeps its own queue to itself.
+    let family_props =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let priorities = [1.0f32; 2];
     let queue_infos: Vec<vk::DeviceQueueCreateInfo> = reqs
         .queue_families
         .iter()
         .map(|&f| {
+            let count = family_props[f as usize].queue_count.min(2) as usize;
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(f)
-                .queue_priorities(&priorities)
+                .queue_priorities(&priorities[..count])
         })
         .collect();
+    let spare = |family: u32| {
+        let index = family_props[family as usize].queue_count.min(2) - 1;
+        DeviceQueue::new(family, index)
+    };
     let ext_ptrs: Vec<*const std::os::raw::c_char> =
         reqs.extensions.iter().map(|e| e.as_ptr()).collect();
 
@@ -106,6 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = unsafe { instance.create_device(physical_device, &device_info, None)? };
 
     // --- Hand the app's device to pixelforge ---
+    let (transfer, compute) = (spare(reqs.queues.transfer), spare(reqs.queues.compute));
+    println!("pixelforge gets transfer queue {transfer:?} and compute queue {compute:?}");
+    let builder = builder
+        .with_transfer_queue(transfer)
+        .with_compute_queue(compute);
     let builder = if reqs.unified_image_layouts {
         builder.declare_unified_image_layouts()
     } else {

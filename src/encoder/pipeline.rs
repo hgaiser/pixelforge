@@ -40,13 +40,14 @@ use ash::vk::{self, Handle};
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
-    ClearImageParams, allocate_command_buffers, clear_input_image, create_bitstream_buffer,
-    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_fence,
-    create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
+    ClearImageParams, allocate_command_buffers, clear_input_image, clear_rgb_input_image,
+    create_bitstream_buffer, create_encode_feedback_query_pool, create_encode_timestamp_query_pool,
+    create_fence, create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::video::{SlotSync, TimelineChain};
 use crate::vulkan::VideoContext;
 
@@ -164,6 +165,8 @@ pub(crate) struct PipelineConfig<'a> {
     pub aligned_width: u32,
     pub aligned_height: u32,
     pub picture_format: vk::Format,
+    /// Whether the input image is RGB, for the encoder to convert.
+    pub rgb_input: bool,
     pub pixel_format: PixelFormat,
     pub bit_depth: BitDepth,
     pub bitstream_buffer_size: usize,
@@ -244,19 +247,21 @@ impl EncodePipeline {
 
             // Zero the padding between the user dimensions and the aligned coded
             // extent so the first frame has no undefined samples.
-            clear_input_image(
-                context,
-                &ClearImageParams {
-                    command_buffer: config.upload_command_buffer,
-                    fence: config.upload_fence,
-                    queue: context.transfer_queue(),
-                    image: input_image,
-                    width: config.aligned_width,
-                    height: config.aligned_height,
-                    pixel_format: config.pixel_format,
-                    bit_depth: config.bit_depth,
-                },
-            )?;
+            let clear = ClearImageParams {
+                command_buffer: config.upload_command_buffer,
+                fence: config.upload_fence,
+                queue: context.transfer_queue(),
+                image: input_image,
+                width: config.aligned_width,
+                height: config.aligned_height,
+                pixel_format: config.pixel_format,
+                bit_depth: config.bit_depth,
+            };
+            if config.rgb_input {
+                clear_rgb_input_image(context, &clear)?;
+            } else {
+                clear_input_image(context, &clear)?;
+            }
 
             // Created signaled so it is safe to wait on before the first encode;
             // `submit_encode_only` resets it before each submit.
@@ -357,7 +362,9 @@ impl EncodePipeline {
     pub(crate) fn submit_current(
         &mut self,
         device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
+        external_waits: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
         let wait = self.timeline.wait();
         let signal = self.timeline.pending_signal();
@@ -393,13 +400,26 @@ impl EncodePipeline {
             )
         };
 
+        // The previous encode, which shares the DPB, then whatever the caller
+        // asked this frame to wait for.
+        let waits: Vec<vk::SemaphoreSubmitInfo> = wait
+            .into_iter()
+            .map(|(semaphore, value)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            })
+            .chain(external_waits.iter().map(TimelinePoint::wait_info))
+            .collect();
         unsafe {
             submit_encode_only(
                 device,
+                sync2,
                 command_buffer,
                 fence,
                 encode_queue,
-                wait,
+                &waits,
                 Some(signal),
             )?;
         }
