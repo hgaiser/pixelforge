@@ -259,10 +259,26 @@ impl DecodeQueueFamilies {
 /// Select the decode / transfer / compute queue families on `physical_device`,
 /// failing if it cannot decode the required codecs.
 ///
+/// The queue family for the colour conversion's compute work, if there is one.
+///
+/// A family that does not also do graphics is preferred. A driver may back
+/// each family with its own hardware queue (RADV does), and an application
+/// that renders keeps the graphics one busy: a conversion submitted there
+/// waits behind the frames the application has already queued.
+fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Option<u32> {
+    queue_families
+        .iter()
+        .enumerate()
+        .filter(|(_, props)| props.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        // `false` sorts first, and `min_by_key` keeps the first of equals.
+        .min_by_key(|(_, props)| props.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        .map(|(idx, _)| idx as u32)
+}
+
 /// Mirrors the selection [`VideoContext::new`] does inline, but scoped to the
 /// decode path: a video-decode family, a transfer family (preferring a
-/// dedicated engine over one that also does video — see the scoring), and any
-/// compute family.
+/// dedicated engine over one that also does video — see the scoring), and a
+/// compute family (see [`find_compute_queue_family`]).
 fn find_decode_queue_families(
     entry: &ash::Entry,
     instance: &ash::Instance,
@@ -275,7 +291,6 @@ fn find_decode_queue_families(
     let mut decode = None;
     let mut transfer = u32::MAX;
     let mut transfer_score = -1i32;
-    let mut compute = u32::MAX;
 
     for (idx, props) in queue_families.iter().enumerate() {
         let idx = idx as u32;
@@ -301,9 +316,6 @@ fn find_decode_queue_families(
                 transfer = idx;
             }
         }
-        if flags.contains(vk::QueueFlags::COMPUTE) && compute == u32::MAX {
-            compute = idx;
-        }
     }
 
     let decode = decode.ok_or_else(|| {
@@ -316,11 +328,9 @@ fn find_decode_queue_families(
             "Physical device has no transfer queue family".to_string(),
         ));
     }
-    if compute == u32::MAX {
-        return Err(PixelForgeError::NoSuitableDevice(
-            "Physical device has no compute queue family".to_string(),
-        ));
-    }
+    let compute = find_compute_queue_family(&queue_families).ok_or_else(|| {
+        PixelForgeError::NoSuitableDevice("Physical device has no compute queue family".to_string())
+    })?;
 
     // Confirm the device actually decodes the codecs asked for.
     let available = query_decode_codecs(entry, instance, physical_device);
@@ -688,7 +698,7 @@ impl VideoContext {
             let mut decode_queue = None;
             let mut transfer_q = u32::MAX;
             let mut transfer_score = -1i32;
-            let mut compute_q = u32::MAX;
+            let compute_q = find_compute_queue_family(&queue_families).unwrap_or(u32::MAX);
 
             for (idx, props) in queue_families.iter().enumerate() {
                 debug!(
@@ -737,12 +747,9 @@ impl VideoContext {
                         transfer_q = idx as u32;
                     }
                 }
-
-                // Check for compute queue (prefer dedicated compute, otherwise graphics+compute).
-                if flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
-                    compute_q = idx as u32;
-                    debug!("Found compute queue at family {}", idx);
-                }
+            }
+            if compute_q != u32::MAX {
+                debug!("Found compute queue at family {}", compute_q);
             }
 
             // Get list of available device extensions
@@ -1499,5 +1506,37 @@ impl VideoContext {
                     .property_flags
                     .contains(properties)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_family_is_one_without_graphics_when_the_device_has_one() {
+        let graphics =
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+        let compute = vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+        let transfer = vk::QueueFlags::TRANSFER;
+        let encode = vk::QueueFlags::VIDEO_ENCODE_KHR;
+
+        // The queue family layouts of the three drivers, and the family each should get.
+        let layouts: [(&str, &[vk::QueueFlags], u32); 3] = [
+            ("RADV", &[graphics, compute, encode], 1),
+            ("NVIDIA", &[graphics, transfer, compute, encode], 2),
+            ("ANV", &[graphics, encode], 0),
+        ];
+        for (driver, flags, expected) in layouts {
+            let families: Vec<_> = flags
+                .iter()
+                .map(|&flags| vk::QueueFamilyProperties::default().queue_flags(flags))
+                .collect();
+            assert_eq!(
+                find_compute_queue_family(&families),
+                Some(expected),
+                "{driver}"
+            );
+        }
     }
 }
