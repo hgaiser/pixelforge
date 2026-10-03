@@ -67,3 +67,38 @@ fn context_creation_reaches_device_enumeration() {
         Err(other) => panic!("expected to reach device selection, failed earlier with: {other}"),
     }
 }
+
+#[test]
+fn compute_family_avoids_graphics_when_the_device_allows() {
+    use ash::vk::QueueFlags;
+
+    let context = match build_decode_context() {
+        Ok(context) => context,
+        Err(error) if no_vulkan_driver(&error) => {
+            return skip_without_driver(
+                "compute_family_avoids_graphics_when_the_device_allows",
+                &error,
+            );
+        }
+        Err(PixelForgeError::NoSuitableDevice(_)) => return,
+        Err(other) => panic!("expected to reach device selection, failed earlier with: {other}"),
+    };
+    let families = unsafe {
+        context
+            .instance()
+            .get_physical_device_queue_family_properties(context.physical_device())
+    };
+    let computes = |flags: QueueFlags| flags.contains(QueueFlags::COMPUTE);
+    let graphics = |flags: QueueFlags| flags.contains(QueueFlags::GRAPHICS);
+
+    let chosen = families[context.compute_queue_family() as usize].queue_flags;
+    let has_compute_only = families
+        .iter()
+        .any(|family| computes(family.queue_flags) && !graphics(family.queue_flags));
+    assert!(computes(chosen));
+    assert_eq!(
+        graphics(chosen),
+        !has_compute_only,
+        "the conversion must not share the graphics family when another one computes"
+    );
+}
