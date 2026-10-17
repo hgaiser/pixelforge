@@ -421,7 +421,7 @@ struct VideoContextInner {
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
     supported_decode_codecs: Vec<Codec>,
-    has_descriptor_buffer: bool,
+    has_push_descriptor: bool,
     has_unified_image_layouts: bool,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device via
@@ -530,9 +530,10 @@ impl VideoContext {
         &self.inner.device_properties
     }
 
-    /// Returns true if `VK_EXT_descriptor_buffer` is available and enabled.
-    pub fn has_descriptor_buffer(&self) -> bool {
-        self.inner.has_descriptor_buffer
+    /// Whether `VK_KHR_push_descriptor` is enabled, which the colour converter
+    /// needs.
+    pub fn has_push_descriptor(&self) -> bool {
+        self.inner.has_push_descriptor
     }
 
     /// Whether `VK_KHR_unified_image_layouts` is enabled, with its video bit.
@@ -672,7 +673,6 @@ impl VideoContext {
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
         let mut supported_decode_codecs = Vec::new();
-        let mut has_descriptor_buffer_ext = false;
 
         let has_extension =
             |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
@@ -769,10 +769,6 @@ impl VideoContext {
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
-                // Check if descriptor buffer extension is available.
-                has_descriptor_buffer_ext =
-                    has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
-
                 // Only check codec support if the extension exists
                 if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
                     && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
@@ -956,11 +952,14 @@ impl VideoContext {
             }
         }
 
-        // Enable VK_EXT_descriptor_buffer extension (required for descriptor buffer API).
-        if has_descriptor_buffer_ext {
-            push_ext(ash::ext::descriptor_buffer::NAME.as_ptr());
+        // The colour converter binds its two descriptors with push descriptors.
+        let has_push_descriptor = selected_device_exts
+            .as_ref()
+            .is_some_and(|exts| has_extension(exts, ash::khr::push_descriptor::NAME));
+        if has_push_descriptor {
+            push_ext(ash::khr::push_descriptor::NAME.as_ptr());
         } else {
-            warn!("VK_EXT_descriptor_buffer not available on this device");
+            warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
         }
 
         // Enable synchronization2 feature.
@@ -1025,6 +1024,12 @@ impl VideoContext {
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
 
         // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
+        let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let mut ycbcr_query = vk::PhysicalDeviceFeatures2::default().push(&mut supported_ycbcr);
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut ycbcr_query);
+        }
+        let has_ycbcr_conversion = supported_ycbcr.sampler_ycbcr_conversion != 0;
         let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
 
@@ -1049,41 +1054,6 @@ impl VideoContext {
         let mut av1_encode_features =
             vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
 
-        // Query descriptor buffer and buffer device address feature support.
-        let mut desc_buf_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
-        let mut buffer_device_address_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
-
-        if has_descriptor_buffer_ext {
-            let mut feat2 = vk::PhysicalDeviceFeatures2::default().push(&mut desc_buf_features);
-            unsafe {
-                instance.get_physical_device_features2(physical_device, &mut feat2);
-            }
-            let desc_buf_supported = desc_buf_features.descriptor_buffer != 0
-                && desc_buf_features.descriptor_buffer_capture_replay != 0;
-
-            // Query buffer device address support.
-            let mut feat2_bda =
-                vk::PhysicalDeviceFeatures2::default().push(&mut buffer_device_address_features);
-            unsafe {
-                instance.get_physical_device_features2(physical_device, &mut feat2_bda);
-            }
-
-            if desc_buf_supported && buffer_device_address_features.buffer_device_address != 0 {
-                desc_buf_features.descriptor_buffer = 1;
-                desc_buf_features.descriptor_buffer_capture_replay = 1;
-            } else if desc_buf_supported {
-                warn!(
-                    "VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled"
-                );
-            }
-        }
-
-        // Store whether descriptor buffer is available for use by callers.
-        let has_descriptor_buffer = has_descriptor_buffer_ext
-            && desc_buf_features.descriptor_buffer != 0
-            && desc_buf_features.descriptor_buffer_capture_replay != 0;
-
         // Log all extensions being enabled
         debug!("Enabling {} device extensions:", extension_names.len());
         for ext_name_ptr in &extension_names {
@@ -1105,20 +1075,15 @@ impl VideoContext {
             device_create_info = device_create_info.push(&mut av1_encode_features);
         }
 
-        // Attach the chain to device_create_info.
-        // When descriptor buffer is available, the chain is:
-        //   desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
-        // When descriptor buffer is not available, only sync2_features is chained.
-        if has_descriptor_buffer_ext {
-            device_create_info = device_create_info
-                .push(&mut desc_buf_features)
-                .push(&mut buffer_device_address_features)
-                .push(&mut ycbcr_features);
-
-            // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
-            if has_ycbcr_2plane_444_ext {
-                device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
-            }
+        if has_ycbcr_conversion {
+            device_create_info = device_create_info.push(&mut ycbcr_features);
+        }
+        // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
+        // Its extension is enabled above whenever present, so the feature has
+        // to follow it unconditionally: an extension without its feature bit
+        // leaves the 4:4:4 formats unusable.
+        if has_ycbcr_2plane_444_ext {
+            device_create_info = device_create_info.push(&mut ycbcr_2plane_444_features);
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
@@ -1161,7 +1126,7 @@ impl VideoContext {
                 device_properties,
                 supported_encode_codecs,
                 supported_decode_codecs,
-                has_descriptor_buffer,
+                has_push_descriptor,
                 has_unified_image_layouts: has_unified_layouts,
                 owns_device: true,
                 debug_messenger,
@@ -1238,7 +1203,7 @@ impl VideoContext {
                 device_properties,
                 supported_encode_codecs: Vec::new(),
                 supported_decode_codecs,
-                has_descriptor_buffer: false,
+                has_push_descriptor: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
                 owns_device: false,
                 // The caller owns the instance; reporting is theirs to set up.

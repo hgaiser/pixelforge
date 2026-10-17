@@ -369,32 +369,19 @@ pub struct ColorConverter {
     // Sampler for texelFetch on the source image.
     sampler: vk::Sampler,
 
-    // Cached ImageView for the source image (avoids per-frame recreation).
-    cached_src_view: Option<(vk::Image, vk::ImageView)>,
+    // The view the current conversion reads its source through. A view is
+    // made per conversion rather than cached by image handle: a driver may
+    // give a new image a destroyed one's handle, and a cache would then read
+    // the new image through a view of the old one.
+    src_view: Option<vk::ImageView>,
 
     // Output buffer (compute shader writes here).
     output_buffer: vk::Buffer,
     output_memory: vk::DeviceMemory,
-    // Output buffer size and device address. The address is fed into
-    // `VkDescriptorAddressInfoEXT` when populating the binding-1 descriptor.
     output_buffer_size: usize,
-    output_buffer_address: vk::DeviceAddress,
 
-    // Descriptor buffer (mapped, descriptors are written here per-frame).
-    descriptor_buffer: vk::Buffer,
-    descriptor_buffer_memory: vk::DeviceMemory,
-    descriptor_buffer_address: vk::DeviceAddress,
-    descriptor_buffer_usage: vk::BufferUsageFlags,
-    descriptor_buffer_ptr: *mut u8,
-    // Descriptor sizes for each binding type, queried from
-    // `VkPhysicalDeviceDescriptorBufferPropertiesEXT`.
-    combined_image_sampler_descriptor_size: usize,
-    storage_buffer_descriptor_size: usize,
-    // Loaded descriptor-buffer extension device for `vkGetDescriptorEXT`.
-    ext_device: ash::ext::descriptor_buffer::Device,
-    // Per-binding offsets within the descriptor buffer.
-    binding0_offset: u64,
-    binding1_offset: u64,
+    // Binds both descriptors inside the command buffer each frame.
+    push_descriptor: ash::khr::push_descriptor::Device,
 
     // Command resources.
     command_pool: vk::CommandPool,
@@ -774,9 +761,9 @@ impl ColorConverter {
     ) -> Result<()> {
         let start = std::time::Instant::now();
 
-        // Get or create ImageView for the source image (must happen before
-        // borrowing device immutably, since this takes &mut self).
-        let src_view = self.get_or_create_src_view(src_image)?;
+        // A conversion that failed part way may have left its view behind.
+        self.destroy_src_view();
+        let src_view = self.create_src_view(src_image)?;
 
         let device = self.context.device();
 
@@ -877,78 +864,30 @@ impl ColorConverter {
                 self.pipeline,
             );
 
-            // --- Populate descriptors directly into the descriptor buffer ---
-            //
-            // Use `vkGetDescriptorEXT` for runtime descriptor population. (The
-            // previous implementation mistakenly used the
-            // `vkGet*OpaqueCaptureDescriptorDataEXT` family — those produce
-            // opaque payloads for capture/replay tooling and are NOT the
-            // descriptor data the GPU consumes at binding offsets, which made
-            // the compute shader read garbage and emit constant-Y output —
-            // visible as a green-screen stream.)
-            //
-            // The descriptor buffer is persistent-mapped HOST_COHERENT, so a
-            // plain memcpy via the slice handed to `get_descriptor` is enough.
-
-            // Binding 0: COMBINED_IMAGE_SAMPLER (sampler + image view).
-            let image_info = vk::DescriptorImageInfo::default()
+            let image_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)
                 .image_view(src_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            let combined_get_info = vk::DescriptorGetInfoEXT::default()
-                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .data(vk::DescriptorDataEXT {
-                    p_combined_image_sampler: &image_info,
-                });
-            let combined_dst = std::slice::from_raw_parts_mut(
-                self.descriptor_buffer_ptr
-                    .add(self.binding0_offset as usize),
-                self.combined_image_sampler_descriptor_size,
-            );
-            self.ext_device
-                .get_descriptor(&combined_get_info, combined_dst);
-
-            // Binding 1: STORAGE_BUFFER (output YUV).
-            let buffer_addr_info = vk::DescriptorAddressInfoEXT::default()
-                .address(self.output_buffer_address)
-                .range(self.output_buffer_size as u64)
-                .format(vk::Format::UNDEFINED);
-            let storage_get_info = vk::DescriptorGetInfoEXT::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .data(vk::DescriptorDataEXT {
-                    p_storage_buffer: &buffer_addr_info,
-                });
-            let storage_dst = std::slice::from_raw_parts_mut(
-                self.descriptor_buffer_ptr
-                    .add(self.binding1_offset as usize),
-                self.storage_buffer_descriptor_size,
-            );
-            self.ext_device
-                .get_descriptor(&storage_get_info, storage_dst);
-
-            // --- Bind descriptor buffers ---
-            let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
-                .address(self.descriptor_buffer_address)
-                .usage(self.descriptor_buffer_usage);
-
-            self.ext_device.cmd_bind_descriptor_buffers(
-                self.command_buffer,
-                std::slice::from_ref(&binding_info),
-            );
-
-            // Associate set 0 in the pipeline layout with the bound descriptor buffer.
-            // This is required because descriptor buffers use offset-based binding.
-            // The base offset is 0 since all payloads are placed at their binding offsets.
-            let buffer_indices = [0u32];
-            let offsets = [0 as vk::DeviceSize];
-
-            self.ext_device.cmd_set_descriptor_buffer_offsets(
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.output_buffer)
+                .offset(0)
+                .range(self.output_buffer_size as vk::DeviceSize)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&image_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffer_info),
+            ];
+            self.push_descriptor.cmd_push_descriptor_set(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
-                0, // first_set
-                &buffer_indices,
-                &offsets,
+                0,
+                &writes,
             );
 
             // Push constants: width, height, input_format, output_format,
@@ -1102,6 +1041,7 @@ impl ColorConverter {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
+        self.destroy_src_view();
 
         let elapsed = start.elapsed();
         debug!("ColorConverter::convert() took {:?}", elapsed);
@@ -1109,20 +1049,9 @@ impl ColorConverter {
         Ok(())
     }
 
-    /// Get or create an ImageView for the source image.
-    fn get_or_create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
-        // Return cached view if it matches the current source image.
-        if let Some((cached_image, cached_view)) = self.cached_src_view {
-            if cached_image == src_image {
-                return Ok(cached_view);
-            }
-            // Different image — destroy the old view.
-            unsafe {
-                self.context.device().destroy_image_view(cached_view, None);
-            }
-        }
-
-        // Create a new ImageView for the source image.
+    /// Create the view this conversion reads `src_image` through. It lives
+    /// until the conversion is done, see [`Self::destroy_src_view`].
+    fn create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(src_image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -1138,20 +1067,23 @@ impl ColorConverter {
         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
 
-        self.cached_src_view = Some((src_image, view));
+        self.src_view = Some(view);
         Ok(view)
+    }
+
+    /// Destroy the source view, once nothing on the GPU reads through it.
+    fn destroy_src_view(&mut self) {
+        if let Some(view) = self.src_view.take() {
+            unsafe { self.context.device().destroy_image_view(view, None) };
+        }
     }
 }
 
 impl Drop for ColorConverter {
     fn drop(&mut self) {
+        self.destroy_src_view();
         unsafe {
             let device = self.context.device();
-
-            // Destroy cached source image view.
-            if let Some((_, view)) = self.cached_src_view.take() {
-                device.destroy_image_view(view, None);
-            }
 
             // Destroy sampler.
             device.destroy_sampler(self.sampler, None);
@@ -1159,11 +1091,6 @@ impl Drop for ColorConverter {
             // Destroy output buffer and its memory.
             device.destroy_buffer(self.output_buffer, None);
             device.free_memory(self.output_memory, None);
-
-            // Destroy descriptor buffer and its memory.
-            device.unmap_memory(self.descriptor_buffer_memory);
-            device.destroy_buffer(self.descriptor_buffer, None);
-            device.free_memory(self.descriptor_buffer_memory, None);
 
             // Destroy pipeline resources.
             device.destroy_pipeline(self.pipeline, None);

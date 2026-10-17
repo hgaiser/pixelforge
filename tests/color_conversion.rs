@@ -23,6 +23,7 @@
 
 #[allow(dead_code)]
 mod common;
+use common::source::{SrcImage, create_src_image, host_buffer, one_shot};
 
 use ash::vk;
 use pixelforge::{
@@ -132,202 +133,6 @@ fn expected_code(
     }
 }
 
-/// The synthetic frame, on the GPU, cleaned up when the test drops it.
-struct SrcImage {
-    /// Keeps the device alive until after the image is destroyed.
-    context: VideoContext,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-}
-
-impl Drop for SrcImage {
-    fn drop(&mut self) {
-        let device = self.context.device();
-        unsafe {
-            device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
-        }
-    }
-}
-
-unsafe fn one_shot<F: FnOnce(vk::CommandBuffer)>(
-    context: &VideoContext,
-    record: F,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let device = context.device();
-    let pool_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(context.transfer_queue_family())
-        .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-    let pool = unsafe { device.create_command_pool(&pool_info, None) }?;
-    let cb_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-    let cb = unsafe { device.allocate_command_buffers(&cb_info) }?[0];
-    unsafe {
-        device.begin_command_buffer(
-            cb,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        record(cb);
-        device.end_command_buffer(cb)?;
-        let cbs = [cb];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        device.queue_submit(context.transfer_queue(), &[submit], vk::Fence::null())?;
-        device.queue_wait_idle(context.transfer_queue())?;
-        device.destroy_command_pool(pool, None);
-    }
-    Ok(())
-}
-
-unsafe fn host_buffer(
-    context: &VideoContext,
-    size: u64,
-    usage: vk::BufferUsageFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
-    let device = context.device();
-    let info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = unsafe { device.create_buffer(&info, None) }?;
-    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let mem_type = context
-        .find_memory_type(
-            reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host visible memory")?;
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(reqs.size)
-        .memory_type_index(mem_type);
-    let memory = unsafe { device.allocate_memory(&alloc, None) }?;
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
-    Ok((buffer, memory))
-}
-
-unsafe fn create_src_image(context: &VideoContext) -> Result<SrcImage, Box<dyn std::error::Error>> {
-    let device = context.device();
-    let info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::B8G8R8A8_UNORM)
-        .extent(vk::Extent3D {
-            width: WIDTH,
-            height: HEIGHT,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-    let image = unsafe { device.create_image(&info, None) }?;
-    let reqs = unsafe { device.get_image_memory_requirements(image) };
-    let mem_type = context
-        .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        .ok_or("no device local memory")?;
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(reqs.size)
-        .memory_type_index(mem_type);
-    let memory = unsafe { device.allocate_memory(&alloc, None) }?;
-    unsafe { device.bind_image_memory(image, memory, 0) }?;
-
-    let pixels = make_frame_bgra();
-    let (staging, staging_mem) = unsafe {
-        host_buffer(
-            context,
-            pixels.len() as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?
-    };
-    unsafe {
-        let ptr = device.map_memory(
-            staging_mem,
-            0,
-            pixels.len() as u64,
-            vk::MemoryMapFlags::empty(),
-        )?;
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
-        device.unmap_memory(staging_mem);
-    }
-
-    let range = vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
-    unsafe {
-        one_shot(context, |cb| {
-            let to_dst = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_dst],
-            );
-            let copy = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: WIDTH,
-                    height: HEIGHT,
-                    depth: 1,
-                });
-            device.cmd_copy_buffer_to_image(
-                cb,
-                staging,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
-            );
-            let to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_read],
-            );
-        })?;
-        device.destroy_buffer(staging, None);
-        device.free_memory(staging_mem, None);
-    }
-    Ok(SrcImage {
-        context: context.clone(),
-        image,
-        memory,
-    })
-}
-
 /// Read the converter's luma plane back as code values.
 fn read_luma(
     context: &VideoContext,
@@ -395,6 +200,7 @@ fn encoders(
 }
 
 fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
+    common::init_logging();
     Ok(VideoContextBuilder::new()
         .app_name("pixelforge-color-conversion")
         .require_encode(Codec::H264)
@@ -423,11 +229,7 @@ fn convert(
     );
     let mut converter = ColorConverter::new(context.clone(), config)?;
     let description = converter.color_description();
-    converter.convert(
-        src.image,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        encoder.input_image(),
-    )?;
+    converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
     Ok((read_luma(context, &converter, output_format)?, description))
 }
 
@@ -435,7 +237,7 @@ fn convert(
 #[ignore = "requires a Vulkan Video device"]
 fn quantizers_round_rather_than_truncate() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
-    let src = unsafe { create_src_image(&context)? };
+    let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, &make_frame_bgra())? };
     let (eight, ten) = encoders(&context)?;
 
     for (output_format, encoder) in [
@@ -505,7 +307,7 @@ fn quantizers_round_rather_than_truncate() -> Result<(), Box<dyn std::error::Err
 #[ignore = "requires a Vulkan Video device"]
 fn every_conversion_matches_the_model() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
-    let src = unsafe { create_src_image(&context)? };
+    let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, &make_frame_bgra())? };
     let (eight, ten) = encoders(&context)?;
 
     let supported = [
@@ -607,5 +409,56 @@ fn unsupported_conversions_are_refused() -> Result<(), Box<dyn std::error::Error
             .unwrap_or_else(|| panic!("{source:?} -> {target:?} was accepted"));
         println!("{source:?} -> {target:?}: {error}");
     }
+    Ok(())
+}
+
+/// A source image destroyed and replaced by a new one must be read as the new
+/// one, even when the driver hands the new image the old one's handle.
+///
+/// Drivers do reuse handles, so a converter that remembered anything by image
+/// handle would read the second frame through a view of the first, destroyed
+/// image. The validation layer gives every object a unique handle, which hides
+/// exactly this, so the test means most with validation off.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
+    let (encoder, _) = encoders(&context)?;
+    let first = make_frame_bgra();
+    let second: Vec<u8> = first
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[b, g, r, a]| [255 - b, 255 - g, 255 - r, a])
+        .collect();
+
+    let config = ColorConverterConfig::new(
+        WIDTH,
+        HEIGHT,
+        InputFormat::BGRA,
+        OutputFormat::NV12,
+        ColorSpec::Srgb,
+        ColorSpec::Srgb,
+        ColorRange::Limited,
+    );
+    let convert_with = |converter: &mut ColorConverter, pixels: &[u8]| {
+        let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, pixels)? };
+        converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
+        let luma = read_luma(&context, converter, OutputFormat::NV12)?;
+        drop(src);
+        Ok::<_, Box<dyn std::error::Error>>(luma)
+    };
+
+    let expected = convert_with(
+        &mut ColorConverter::new(context.clone(), config.clone())?,
+        &second,
+    )?;
+    let mut converter = ColorConverter::new(context.clone(), config)?;
+    convert_with(&mut converter, &first)?;
+    let actual = convert_with(&mut converter, &second)?;
+    assert!(
+        actual == expected,
+        "the second frame came out as something other than the second frame"
+    );
     Ok(())
 }

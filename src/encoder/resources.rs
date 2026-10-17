@@ -11,9 +11,9 @@ use std::ptr;
 pub(crate) use crate::video::gcd;
 pub(crate) use crate::video::{
     VideoImageParams, align_up, allocate_command_buffers, allocate_session_memory,
-    create_bitstream_buffer, create_buffer_with_device_address, create_command_pool,
-    create_dpb_images as create_dpb_images_shared, create_fence, create_video_image,
-    find_memory_type, get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats,
+    create_bitstream_buffer, create_command_pool, create_dpb_images as create_dpb_images_shared,
+    create_fence, create_video_image, find_memory_type, get_video_format, lcm,
+    map_bitstream_buffer, query_supported_video_formats,
 };
 
 /// Create the encoder's DPB images.
@@ -618,8 +618,9 @@ pub(crate) fn upload_image_to_input(
 
 /// Record DPB image barriers for encode.
 ///
-/// Transitions the setup DPB slot from UNDEFINED to VIDEO_ENCODE_DPB and
-/// adds execution barriers for reference slot images.
+/// Brings the setup slot into VIDEO_ENCODE_DPB_KHR, from UNDEFINED on its
+/// first use, and orders every slot this encode touches after the encodes
+/// that wrote it before.
 ///
 /// # Safety
 ///
@@ -653,7 +654,19 @@ pub(crate) unsafe fn record_dpb_barriers(
         vk::ImageLayout::UNDEFINED
     };
 
-    let dpb_barrier = vk::ImageMemoryBarrier::default()
+    // Only encodes touch a DPB slot, so both sides of every barrier are the
+    // encode stage. The setup slot is about to be written: the transition and
+    // the write of the reconstructed picture both have to come after any
+    // earlier encode's write to the same slot, and the write has to come after
+    // the transition. A reference slot is only read, after the write that put
+    // the picture there.
+    let dpb_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        .dst_access_mask(
+            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
+        )
         .old_layout(setup_old_layout)
         .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -665,9 +678,7 @@ pub(crate) unsafe fn record_dpb_barriers(
             level_count: 1,
             base_array_layer: dpb_base_array_layer,
             layer_count: 1,
-        })
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::empty());
+        });
 
     let mut all_barriers = vec![dpb_barrier];
 
@@ -678,7 +689,11 @@ pub(crate) unsafe fn record_dpb_barriers(
             (dpb_images[ref_slot as usize], 0u32)
         };
         all_barriers.push(
-            vk::ImageMemoryBarrier::default()
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
                 .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
                 .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -690,23 +705,12 @@ pub(crate) unsafe fn record_dpb_barriers(
                     level_count: 1,
                     base_array_layer: ref_layer,
                     layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ),
+                }),
         );
     }
 
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &all_barriers,
-        );
-    }
+    let dependency = vk::DependencyInfo::default().image_memory_barriers(&all_barriers);
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
 /// Prepare an encode command buffer for recording.

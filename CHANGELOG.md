@@ -105,8 +105,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The colour converter binds its descriptors with push descriptors instead of
+  `VK_EXT_descriptor_buffer`, which is deprecated. It now needs only
+  `VK_KHR_push_descriptor`, and no longer buffer device addresses or
+  descriptor buffer capture-replay. `VideoContext::has_descriptor_buffer` is
+  replaced by `VideoContext::has_push_descriptor`.
 - Adopting a caller-created device for decode (`build_from_existing_decode`) now
   requires the `timelineSemaphore` feature in addition to `synchronization2`.
+
+### Fixed
+
+- `samplerYcbcrConversion` and the 2-plane 4:4:4 formats feature were only
+  enabled on devices that also had descriptor buffers.
+- The colour converter reused its source image view whenever the next source
+  had the same handle. Drivers reuse the handles of destroyed images, so a
+  caller creating a new source per frame got every frame after the first
+  converted from a freed image.
+- The barrier moving a DPB slot into its encode layout did not order the
+  transition before the encode's write of the reconstructed picture.
 
 ## [0.9.1] - 01-09-2026
 

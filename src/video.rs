@@ -314,66 +314,6 @@ pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -
     }
 }
 
-/// Create a buffer that requires device addresses (SHADER_DEVICE_ADDRESS usage).
-///
-/// This allocates memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` so that
-/// `get_buffer_device_address` returns a valid address.
-pub(crate) fn create_buffer_with_device_address(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    size: vk::DeviceSize,
-    usage: vk::BufferUsageFlags,
-    properties: vk::MemoryPropertyFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
-
-    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-    let memory_type_index = find_memory_type(
-        memory_properties,
-        mem_requirements.memory_type_bits,
-        properties,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation(format!(
-            "No suitable memory type for buffer with properties {:?}",
-            properties
-        ))
-    })?;
-
-    let mut alloc_flags_info =
-        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index)
-        .push(&mut alloc_flags_info);
-
-    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            unsafe { device.destroy_buffer(buffer, None) };
-            return Err(PixelForgeError::MemoryAllocation(e.to_string()));
-        }
-    };
-
-    match unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-        Ok(()) => Ok((buffer, memory)),
-        Err(e) => {
-            unsafe {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            }
-            Err(PixelForgeError::MemoryAllocation(e.to_string()))
-        }
-    }
-}
-
 pub(crate) fn find_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,

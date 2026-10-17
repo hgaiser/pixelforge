@@ -17,12 +17,34 @@
 //!   once is undefined, so these examples drive the decoder and the readback
 //!   from the same thread.
 
+pub mod source;
+
 use ash::vk;
 use pixelforge::decoder::{DecodedFrame, Decoder, FramePoll};
 use pixelforge::encoder::BitDepth;
 use pixelforge::vulkan::VideoContext;
 use std::fs::File;
 use std::io::Write;
+
+/// Show pixelforge's log, validation messages included, on the test's output.
+///
+/// pixelforge sends the validation layer's findings to `tracing`, and without
+/// a subscriber they go nowhere: a test that enabled validation and printed
+/// nothing proved nothing. Call before building a context. The level comes
+/// from `RUST_LOG`, `warn` when unset, so validation errors always show.
+/// Output is captured like any other test output: run with `--nocapture` to
+/// see a passing test's.
+pub fn init_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 /// Bytes handed to the decoder per call, standing in for a network read.
 pub const CHUNK_SIZE: usize = 64 * 1024;
