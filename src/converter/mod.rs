@@ -8,7 +8,7 @@
 
 mod pipeline;
 
-use crate::encoder::ColorDescription;
+use crate::encoder::{Codec, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::TimelineChain;
@@ -323,6 +323,38 @@ impl ColorConverterConfig {
                 .color_description()?
                 .with_full_range(self.range.is_full()),
         )
+    }
+
+    /// The RGB input to give a `codec` encoder instead of running this
+    /// conversion, when the encoder can do it itself.
+    ///
+    /// The hardware applies only the YUV matrix, so this is `Some` only for a
+    /// conversion that is nothing more: source and target are the same space,
+    /// so no transfer function or gamut change is involved, and the output is
+    /// 4:2:0 at the input's bit depth, NV12 from 8-bit RGB or P010 from
+    /// `ABGR2101010`. The device is then asked, with
+    /// [`VideoContext::supports_rgb_encode_input`], whether it does that
+    /// matrix and range for `codec` and takes this format.
+    ///
+    /// When `Some`, build the encoder with
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
+    /// and this format, and with [`Self::color_description`], then hand it the
+    /// RGB images directly and skip the converter.
+    pub fn rgb_encode_input(&self, context: &VideoContext, codec: Codec) -> Option<InputFormat> {
+        if self.source != self.target {
+            return None;
+        }
+        let shape_matches = match self.output_format {
+            OutputFormat::NV12 => matches!(
+                self.input_format,
+                InputFormat::BGRx | InputFormat::BGRA | InputFormat::RGBx | InputFormat::RGBA
+            ),
+            OutputFormat::P010 => self.input_format == InputFormat::ABGR2101010,
+            _ => false,
+        };
+        let desc = self.color_description()?;
+        (shape_matches && context.supports_rgb_encode_input(codec, self.input_format, &desc))
+            .then_some(self.input_format)
     }
 
     /// Whether the shader can get from this source to this target.

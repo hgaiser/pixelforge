@@ -8,7 +8,8 @@
 //! - **Asynchronous pipelines**: both directions submit without waiting.
 //!   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
 //!   [`DecodeSource`] as the GPU finishes with them.
-//! - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ).
+//! - **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ, scRGB-linear→BT.2020+PQ),
+//!   or in the encoder itself where `VK_VALVE_video_encode_rgb_conversion` is available.
 //! - **Shared devices**: encode and decode on a Vulkan device your application
 //!   created, from Vulkan 1.1 up, on queues you choose, ordered against your own
 //!   work with timeline semaphores.
@@ -243,6 +244,30 @@
 //!
 //! let mut encoder = Encoder::new(context, encode_config)?;
 //! // converter.convert(input_image, layout, encoder.input_image())?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Where the conversion is nothing but the YUV matrix, as for ordinary SDR
+//! content, some encoders can do it themselves and the shader need not run at
+//! all. [`ColorConverterConfig::rgb_encode_input`] says whether that works for
+//! a given conversion and codec on this device. When it does, build the
+//! encoder with [`EncodeConfig::with_rgb_input`] and hand it the RGB frames.
+//!
+//! ```rust,no_run
+//! # use pixelforge::{Codec, ColorConverterConfig, EncodeConfig, Encoder, VideoContext};
+//! # fn pick(
+//! #     context: VideoContext,
+//! #     config: ColorConverterConfig,
+//! # ) -> Result<(), pixelforge::PixelForgeError> {
+//! let encode_config = EncodeConfig::h264(1920, 1080)
+//!     .with_color_description(config.color_description().expect("SDR is encodable"));
+//! let encoder = match config.rgb_encode_input(&context, Codec::H264) {
+//!     // The encoder converts: give it the RGB images as they are.
+//!     Some(format) => Encoder::new(context, encode_config.with_rgb_input(format))?,
+//!     // The shader converts into the encoder's input image, as above.
+//!     None => Encoder::new(context, encode_config)?,
+//! };
 //! # Ok(())
 //! # }
 //! ```

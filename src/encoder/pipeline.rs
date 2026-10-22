@@ -165,6 +165,8 @@ pub(crate) struct PipelineConfig<'a> {
     pub aligned_width: u32,
     pub aligned_height: u32,
     pub picture_format: vk::Format,
+    /// Whether the input image is RGB, for the encoder to convert.
+    pub rgb_input: bool,
     pub pixel_format: PixelFormat,
     pub bit_depth: BitDepth,
     pub bitstream_buffer_size: usize,
@@ -256,6 +258,7 @@ impl EncodePipeline {
                     height: config.aligned_height,
                     pixel_format: config.pixel_format,
                     bit_depth: config.bit_depth,
+                    rgb: config.rgb_input,
                 },
             )?;
 
