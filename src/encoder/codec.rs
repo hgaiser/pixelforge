@@ -405,14 +405,20 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
             // Wait on just the queues this encoder used, not the whole device.
             let transfer = device.queue_wait_idle(common.context.transfer_queue());
             if !gpu_work_completed(&transfer) {
-                tracing::error!(?transfer, "Cannot prove encoder transfer completion; retaining Vulkan resources");
+                tracing::error!(
+                    ?transfer,
+                    "Cannot prove encoder transfer completion; retaining Vulkan resources"
+                );
                 std::mem::forget(common.context.clone());
                 return;
             }
             if let Some(q) = common.context.video_encode_queue() {
                 let encode = device.queue_wait_idle(q);
                 if !gpu_work_completed(&encode) {
-                    tracing::error!(?encode, "Cannot prove video encode completion; retaining Vulkan resources");
+                    tracing::error!(
+                        ?encode,
+                        "Cannot prove video encode completion; retaining Vulkan resources"
+                    );
                     std::mem::forget(common.context.clone());
                     return;
                 }
