@@ -322,7 +322,7 @@ fn encode_all(
                 if n + 1 == ENCODE_FRAMES {
                     waits.push(TimelinePoint::new(rendered, after_drop));
                 }
-                encoder.encode_after(target, &waits)?
+                encoder.encode_after(target, vk::ImageLayout::GENERAL, &waits)?
             }
         };
         sources.push(src);

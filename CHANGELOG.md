@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add RGB input converted by the encoder itself through
+  `VK_VALVE_video_encode_rgb_conversion`: `EncodeConfig::with_rgb_input`.
+- Add `VideoContext::supports_rgb_encode_input` and
+  `ColorConverterConfig::rgb_encode_input`, which say when a conversion can be
+  left to the encoder.
+- Add `VideoContext::has_video_encode_rgb_conversion` and
+  `DeviceFeatures::video_encode_rgb_conversion`.
+
+### Changed
+
+- `Encoder::encode_after` takes the source image's layout, as
+  `ColorConverter::convert_async` does: for `UNDEFINED`, a first-time
+  external-memory import, the copy into the input image acquires it from
+  `VK_QUEUE_FAMILY_EXTERNAL`.
+
 ## [0.10.0] - 19-10-2026
 
 ### Added

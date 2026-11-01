@@ -356,6 +356,9 @@ pub struct DeviceFeatures {
     pub ycbcr_2plane_444_formats: bool,
     /// `videoEncodeAV1`, from `VkPhysicalDeviceVideoEncodeAV1FeaturesKHR`.
     pub video_encode_av1: bool,
+    /// `videoEncodeRgbConversion`, from
+    /// `VkPhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE`.
+    pub video_encode_rgb_conversion: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -555,6 +558,15 @@ fn supports_internally_synchronized_queues(
     features.internally_synchronized_queues != 0
 }
 
+/// Whether `physical_device` has the `videoEncodeRgbConversion` feature. The
+/// caller checks for the extension first.
+fn supports_rgb_conversion(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let mut features = vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default();
+    let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+    features.video_encode_rgb_conversion != 0
+}
+
 /// Device extensions required to decode the given codecs.
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
     // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
@@ -614,6 +626,7 @@ struct VideoContextInner {
     supported_encode_codecs: Vec<Codec>,
     supported_decode_codecs: Vec<Codec>,
     has_push_descriptor: bool,
+    has_video_encode_rgb_conversion: bool,
     has_unified_image_layouts: bool,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
@@ -759,6 +772,14 @@ impl VideoContext {
     /// needs.
     pub fn has_push_descriptor(&self) -> bool {
         self.inner.has_push_descriptor
+    }
+
+    /// Whether `VK_VALVE_video_encode_rgb_conversion` is enabled, extension
+    /// and feature both: encoders can then take RGB input and convert it
+    /// themselves, see
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
+    pub fn has_video_encode_rgb_conversion(&self) -> bool {
+        self.inner.has_video_encode_rgb_conversion
     }
 
     /// Whether `VK_KHR_unified_image_layouts` is enabled, with its video bit.
@@ -1187,6 +1208,23 @@ impl VideoContext {
             warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
         }
 
+        // Lets an encoder take RGB input and convert it to YUV itself, so a
+        // plain matrix conversion needs no shader at all. Extension and feature
+        // both, or the profile struct is parsed and ignored.
+        let has_rgb_conversion_ext = video_encode_queue_family.is_some()
+            && selected_device_exts.as_ref().is_some_and(|exts| {
+                has_extension(exts, ash::valve::video_encode_rgb_conversion::NAME)
+            });
+        let has_rgb_conversion =
+            has_rgb_conversion_ext && supports_rgb_conversion(&instance, physical_device);
+        let mut rgb_conversion_features =
+            vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default()
+                .video_encode_rgb_conversion(true);
+        if has_rgb_conversion {
+            push_ext(ash::valve::video_encode_rgb_conversion::NAME.as_ptr());
+            debug!("Video encode RGB conversion available");
+        }
+
         // Enable synchronization2 feature.
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
@@ -1303,6 +1341,9 @@ impl VideoContext {
         if has_ycbcr_conversion {
             device_create_info = device_create_info.push(&mut ycbcr_features);
         }
+        if has_rgb_conversion {
+            device_create_info = device_create_info.push(&mut rgb_conversion_features);
+        }
         // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
         // Its extension is enabled above whenever present, so the feature has
         // to follow it unconditionally: an extension without its feature bit
@@ -1353,6 +1394,7 @@ impl VideoContext {
                 supported_encode_codecs,
                 supported_decode_codecs,
                 has_push_descriptor,
+                has_video_encode_rgb_conversion: has_rgb_conversion,
                 has_unified_image_layouts: has_unified_layouts,
                 owns_device: true,
                 retired_semaphores: Default::default(),
@@ -1457,6 +1499,7 @@ impl VideoContext {
                 supported_encode_codecs: Vec::new(),
                 supported_decode_codecs,
                 has_push_descriptor: false,
+                has_video_encode_rgb_conversion: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
                 owns_device: false,
                 retired_semaphores: Default::default(),

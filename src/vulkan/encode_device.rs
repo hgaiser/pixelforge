@@ -41,6 +41,7 @@ struct EncodePlan {
     ycbcr_2plane_444: bool,
     sampler_ycbcr_conversion: bool,
     internally_synchronized_queues: bool,
+    rgb_conversion: bool,
 }
 
 impl EncodePlan {
@@ -80,7 +81,7 @@ impl EncodePlan {
         let extensions = DeviceExtensions::of(instance, physical_device);
         let has = |name: &std::ffi::CStr| extensions.has(name);
 
-        // The feature bits behind two of the extensions. A driver may offer an
+        // The feature bits behind three of the extensions. A driver may offer an
         // extension and still report its feature off, and a caller told to
         // enable a feature the device lacks gets VK_ERROR_FEATURE_NOT_PRESENT
         // from vkCreateDevice. A struct is chained only when its extension is
@@ -88,12 +89,16 @@ impl EncodePlan {
         let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
         let mut ycbcr_444 = vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT::default();
         let mut av1 = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default();
+        let mut rgb = vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default();
         let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut ycbcr);
         if has(ash::ext::ycbcr_2plane_444_formats::NAME) {
             query = query.push(&mut ycbcr_444);
         }
         if has(ash::khr::video_encode_av1::NAME) {
             query = query.push(&mut av1);
+        }
+        if has(ash::valve::video_encode_rgb_conversion::NAME) {
+            query = query.push(&mut rgb);
         }
         unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
 
@@ -151,6 +156,8 @@ impl EncodePlan {
                 physical_device,
                 &extensions,
             ),
+            rgb_conversion: has(ash::valve::video_encode_rgb_conversion::NAME)
+                && rgb.video_encode_rgb_conversion != 0,
         })
     }
 
@@ -177,6 +184,9 @@ impl EncodePlan {
         if self.ycbcr_2plane_444 {
             names.push(ash::ext::ycbcr_2plane_444_formats::NAME);
         }
+        if self.rgb_conversion {
+            names.push(ash::valve::video_encode_rgb_conversion::NAME);
+        }
         names
     }
 
@@ -187,6 +197,7 @@ impl EncodePlan {
             sampler_ycbcr_conversion: self.sampler_ycbcr_conversion,
             ycbcr_2plane_444_formats: self.ycbcr_2plane_444,
             video_encode_av1: self.codecs.contains(&Codec::AV1),
+            video_encode_rgb_conversion: self.rgb_conversion,
         }
     }
 
@@ -213,6 +224,8 @@ impl VideoContextBuilder {
     /// The colour converter needs `VK_KHR_push_descriptor`, which is included
     /// whenever the device has it. On a device without it, encoding from YUV
     /// input still works and only the converter is unavailable.
+    /// `VK_VALVE_video_encode_rgb_conversion` is included the same way, for
+    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
     pub fn encode_device_requirements(
         &self,
         entry: &ash::Entry,
@@ -340,6 +353,7 @@ impl VideoContext {
                 supported_encode_codecs: plan.codecs.clone(),
                 supported_decode_codecs: Vec::new(),
                 has_push_descriptor: plan.push_descriptor,
+                has_video_encode_rgb_conversion: plan.rgb_conversion,
                 has_unified_image_layouts: false,
                 owns_device: false,
                 retired_semaphores: Default::default(),

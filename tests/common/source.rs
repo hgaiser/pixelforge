@@ -92,8 +92,9 @@ pub unsafe fn host_buffer(
 ///
 /// `GENERAL` because that is where the colour converter leaves its source after
 /// every conversion, so it is the layout the image is in for every conversion
-/// after the first. Starting it anywhere else means a second conversion told
-/// the wrong layout.
+/// after the first, and the one an encoder taking RGB input expects to copy
+/// from. Starting it anywhere else means a second conversion told the wrong
+/// layout.
 pub unsafe fn create_src_image(
     context: &VideoContext,
     width: u32,
@@ -113,7 +114,13 @@ pub unsafe fn create_src_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        // Sampled by the converter, and copied from by an encoder taking RGB
+        // input, which reads its source with a transfer.
+        .usage(
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { device.create_image(&info, None) }?;
@@ -198,7 +205,7 @@ pub unsafe fn create_src_image(
                 .image(image)
                 .subresource_range(range)
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(
                 cb,
                 vk::PipelineStageFlags::TRANSFER,

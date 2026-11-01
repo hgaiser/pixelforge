@@ -16,6 +16,7 @@ pub(crate) mod pipeline;
 pub(crate) mod profile;
 pub mod reorder;
 pub mod resources;
+pub(crate) mod rgb;
 pub(crate) mod support;
 
 use ash::vk;
@@ -342,8 +343,11 @@ pub struct EncodeConfig {
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
     /// Color description for VUI signaling.
-    /// Defaults to BT.709 (full-range) when `None`.
+    /// Defaults to BT.709, limited range, when `None`.
     pub color_description: Option<ColorDescription>,
+    /// Take RGB input and let the encoder convert it to YUV itself, through
+    /// `VK_VALVE_video_encode_rgb_conversion`. See [`Self::with_rgb_input`].
+    pub rgb_input: Option<crate::converter::InputFormat>,
     /// Usage hint for encoding.
     pub encode_usage_hint: EncodeUsageHint,
     /// Content hint for encoding.
@@ -375,6 +379,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -403,6 +408,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -431,6 +437,7 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
+            rgb_input: None,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -519,6 +526,27 @@ impl EncodeConfig {
         self
     }
 
+    /// Take `format` RGB images as input and convert them to YUV in the
+    /// encoder itself, with no colour conversion shader.
+    ///
+    /// Needs `VK_VALVE_video_encode_rgb_conversion` (see
+    /// [`VideoContext::has_video_encode_rgb_conversion`]), and a driver that
+    /// accepts `format` as encode input for this codec, profile and bit depth;
+    /// [`Encoder::new`] fails otherwise. The YUV matrix and range come from
+    /// [`Self::color_description`], so set that to what the stream should
+    /// carry. The hardware applies only the matrix: a source that needs a
+    /// transfer function or gamut change still has to go through
+    /// [`ColorConverter`](crate::ColorConverter), which
+    /// [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
+    /// decides for you.
+    ///
+    /// With this set, [`Encoder::input_image`] is an RGB image, and
+    /// [`Encoder::encode`] copies an RGB source into it.
+    pub fn with_rgb_input(mut self, format: crate::converter::InputFormat) -> Self {
+        self.rgb_input = Some(format);
+        self
+    }
+
     /// Set the usage hint for encoding.
     pub fn with_encode_usage_hint(mut self, hint: EncodeUsageHint) -> Self {
         self.encode_usage_hint = hint;
@@ -577,6 +605,7 @@ trait EncoderApi: Send {
     fn encode_after(
         &mut self,
         src_image: vk::Image,
+        src_layout: vk::ImageLayout,
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
@@ -592,9 +621,10 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     fn encode_after(
         &mut self,
         src_image: vk::Image,
+        src_layout: vk::ImageLayout,
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
-        codec::CodecEncoder::encode_after(self, src_image, wait)
+        codec::CodecEncoder::encode_after(self, src_image, src_layout, wait)
     }
     fn flush(&mut self) -> Result<()> {
         codec::CodecEncoder::flush(self)
@@ -620,6 +650,9 @@ pub struct Encoder(Box<dyn EncoderApi>);
 impl Encoder {
     /// Create a new encoder for the codec named in `config`.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
+        if let Some(format) = config.rgb_input {
+            rgb::check_rgb_input(&context, &config, format)?;
+        }
         let inner: Box<dyn EncoderApi> = match config.codec {
             Codec::H264 => Box::new(self::h264::H264::create(context, config)?),
             Codec::H265 => Box::new(self::h265::H265::create(context, config)?),
@@ -674,7 +707,7 @@ impl Encoder {
     /// # }
     /// ```
     pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        self.0.encode_after(src_image, &[])
+        self.encode_after(src_image, vk::ImageLayout::GENERAL, &[])
     }
 
     /// Encode a frame once GPU work the caller submitted has finished.
@@ -691,12 +724,21 @@ impl Encoder {
     /// this call then blocks until the points in `wait` are reached and the
     /// copy is done. Render or convert into [`Self::input_image`] to keep the
     /// whole handover on the GPU.
+    ///
+    /// `src_layout` is the layout `src_image` is in, as for
+    /// [`ColorConverter::convert_async`](crate::ColorConverter::convert_async):
+    /// `UNDEFINED` is a first-time external-memory import, which the copy
+    /// acquires from `VK_QUEUE_FAMILY_EXTERNAL`. The copy leaves the image in
+    /// `GENERAL`, owned by
+    /// [`VideoContext::transfer_queue_family`](crate::VideoContext::transfer_queue_family).
+    /// It is ignored for [`Self::input_image`].
     pub fn encode_after(
         &mut self,
         src_image: vk::Image,
+        src_layout: vk::ImageLayout,
         wait: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
-        self.0.encode_after(src_image, wait)
+        self.0.encode_after(src_image, src_layout, wait)
     }
 
     /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).

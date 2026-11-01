@@ -117,6 +117,17 @@ checks the output against a context pixelforge created itself. It needs no
 ffmpeg. Anything that reaches a core 1.2 or 1.3 entry point panics there, so
 run it after touching submission or barrier code.
 
+The RGB input path (`EncodeConfig::with_rgb_input`) needs
+`VK_VALVE_video_encode_rgb_conversion`, which today only RADV has.
+`tests/rgb_encode.rs` compares it against the colour converter, checks that
+`supports_rgb_encode_input` agrees with encoder creation, and skips what the
+device cannot do, so a green run elsewhere says little about it. Under
+validation it draws two messages that are the layer's, not pixelforge's: the
+layer does not model that extension, so it rejects the RGB profile struct in a
+query pool's profile chain (the spec requires that chain to match the
+session's) and checks the RGB input view against the plain format features
+rather than the video profile's.
+
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
 `tracing`, so pair it with `RUST_LOG=warn` (or `debug` for the layer's own

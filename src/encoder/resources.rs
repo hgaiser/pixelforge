@@ -205,9 +205,17 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         // YUV 4:4:4 (e.g., NV24): UV plane is full width, full height, 2 components per pixel.
         PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
     };
-    let total_size = (plane0_size + plane1_size) as vk::DeviceSize;
+    // Every RGB input format is 4 bytes a pixel in one plane.
+    let rgb_size = params.width * params.height * 4;
+    let total_size = if params.rgb {
+        rgb_size
+    } else {
+        plane0_size + plane1_size
+    } as vk::DeviceSize;
 
-    // Create a staging buffer filled with zeros.
+    // Create a staging buffer filled with zeros. A copy rather than a clear
+    // command, since this runs on the transfer queue and a clear needs a
+    // graphics or compute one.
     let buffer_create_info = vk::BufferCreateInfo::default()
         .size(total_size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -327,13 +335,25 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         },
     ];
 
+    let rgb_region = vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            ..copy_regions[0].image_subresource
+        },
+        ..copy_regions[0]
+    };
+    let regions: &[vk::BufferImageCopy] = if params.rgb {
+        std::slice::from_ref(&rgb_region)
+    } else {
+        &copy_regions
+    };
     unsafe {
         device.cmd_copy_buffer_to_image(
             params.command_buffer,
             staging_buffer,
             params.image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy_regions,
+            regions,
         );
     }
 
@@ -398,6 +418,10 @@ pub(crate) struct UploadParams<'a> {
     pub upload_fence: vk::Fence,
     /// The source image to copy from.
     pub src_image: vk::Image,
+    /// The layout the source image is in. `UNDEFINED` means a first-time
+    /// external-memory import, which the copy acquires from
+    /// `VK_QUEUE_FAMILY_EXTERNAL` for the transfer queue family.
+    pub src_layout: vk::ImageLayout,
     /// The destination image to copy to.
     pub dst_image: vk::Image,
     /// The width of the image.
@@ -408,6 +432,8 @@ pub(crate) struct UploadParams<'a> {
     pub pixel_format: PixelFormat,
     /// The current layout of the input image.
     pub input_image_layout: vk::ImageLayout,
+    /// Whether both images are single-plane RGB rather than YUV.
+    pub rgb: bool,
     /// The queue to submit transfer operations to.
     pub upload_queue: vk::Queue,
     /// Caller work the copy must wait for.
@@ -418,7 +444,8 @@ pub(crate) struct UploadParams<'a> {
 ///
 /// This function handles:
 /// - Resetting and beginning the command buffer
-/// - Transitioning source image from GENERAL to TRANSFER_SRC
+/// - Transitioning source image from `src_layout` to TRANSFER_SRC, acquiring
+///   a first-time external-memory import
 /// - Transitioning destination image from `input_image_layout` to TRANSFER_DST
 /// - Copying Y and UV planes (NV12 format)
 /// - Transitioning destination image to VIDEO_ENCODE_SRC
@@ -445,12 +472,23 @@ pub(crate) fn upload_image_to_input(
     unsafe { device.begin_command_buffer(params.upload_command_buffer, &begin_info) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-    // Transition source image from GENERAL to TRANSFER_SRC.
+    // Transition source image to TRANSFER_SRC. A first-time external-memory
+    // import (UNDEFINED) is still owned by VK_QUEUE_FAMILY_EXTERNAL: acquire it
+    // for the transfer queue family.
+    let needs_acquire = params.src_layout == vk::ImageLayout::UNDEFINED;
     let src_barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::GENERAL)
+        .old_layout(params.src_layout)
         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .src_queue_family_index(if needs_acquire {
+            vk::QUEUE_FAMILY_EXTERNAL
+        } else {
+            vk::QUEUE_FAMILY_IGNORED
+        })
+        .dst_queue_family_index(if needs_acquire {
+            context.transfer_queue_family()
+        } else {
+            vk::QUEUE_FAMILY_IGNORED
+        })
         .image(params.src_image)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -459,7 +497,11 @@ pub(crate) fn upload_image_to_input(
             base_array_layer: 0,
             layer_count: 1,
         })
-        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .src_access_mask(if needs_acquire {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        })
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
 
     // Transition destination image to TRANSFER_DST.
@@ -544,6 +586,28 @@ pub(crate) fn upload_image_to_input(
         },
     };
 
+    // An RGB input image has one colour plane, copied whole.
+    let rgb_copy_region = vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        ..y_copy_region
+    };
+    let regions: &[vk::ImageCopy] = if params.rgb {
+        &[rgb_copy_region]
+    } else {
+        &[y_copy_region, uv_copy_region]
+    };
+
     unsafe {
         device.cmd_copy_image(
             params.upload_command_buffer,
@@ -551,7 +615,7 @@ pub(crate) fn upload_image_to_input(
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             params.dst_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[y_copy_region, uv_copy_region],
+            regions,
         );
     }
 
@@ -1141,6 +1205,9 @@ pub(crate) struct ClearImageParams {
     pub height: u32,
     pub pixel_format: PixelFormat,
     pub bit_depth: BitDepth,
+    /// Whether the image is a single-plane, 4-bytes-per-pixel RGB input
+    /// image rather than a YUV one.
+    pub rgb: bool,
 }
 
 #[cfg(test)]
