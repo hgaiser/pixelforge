@@ -402,7 +402,18 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
         unsafe {
             let common = &mut self.common;
             let device = common.context.device();
-            // Wait on just the queues this encoder used, not the whole device.
+            // The converter may still be writing this encoder's input image on
+            // the compute queue, even if no encode submission followed it.
+            // Wait for compute as well as the encoder's transfer and video queues.
+            let compute = device.queue_wait_idle(common.context.compute_queue());
+            if !gpu_work_completed(&compute) {
+                tracing::error!(
+                    ?compute,
+                    "Cannot prove encoder input conversion completed; retaining Vulkan resources"
+                );
+                std::mem::forget(common.context.clone());
+                return;
+            }
             let transfer = device.queue_wait_idle(common.context.transfer_queue());
             if !gpu_work_completed(&transfer) {
                 tracing::error!(
