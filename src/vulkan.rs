@@ -657,7 +657,10 @@ impl VideoContextInner {
         if self.owns_device {
             return unsafe { self.device.device_wait_idle() };
         }
-        let mut queues = vec![self.compute_queue, self.transfer_queue];
+        let mut queues = vec![self.compute_queue];
+        if !queues.contains(&self.transfer_queue) {
+            queues.push(self.transfer_queue);
+        }
         if let Some(queue) = self.video_encode_queue {
             if !queues.contains(&queue) {
                 queues.push(queue);
@@ -679,7 +682,10 @@ impl Drop for VideoContextInner {
     fn drop(&mut self) {
         let completion = self.wait_before_teardown();
         if !gpu_work_completed(&completion) {
-            tracing::error!(?completion, "Cannot prove GPU completion; retaining Vulkan device and retired semaphores");
+            tracing::error!(
+                ?completion,
+                "Cannot prove GPU completion; retaining Vulkan device and retired semaphores"
+            );
             // ash handles have no automatic destructor. Retain rather than
             // destroy resources with unresolved GPU references.
             return;
