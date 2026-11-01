@@ -12,7 +12,7 @@ use crate::encoder::ColorDescription;
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::TimelineChain;
-use crate::vulkan::VideoContext;
+use crate::vulkan::{VideoContext, gpu_work_completed};
 use ash::vk;
 use tracing::debug;
 
@@ -1143,7 +1143,23 @@ impl ColorConverter {
 impl Drop for ColorConverter {
     fn drop(&mut self) {
         // Nothing below may be destroyed while a conversion still uses it.
-        let _ = self.wait_idle();
+        if let Err(error) = self.wait_idle() {
+            tracing::error!(?error, "Converter fence wait failed during teardown");
+            // A failed fence wait leaves completion unknown. Synchronize
+            // against the queue that submitted this conversion before cleanup.
+            let completion = unsafe {
+                self.context.device().queue_wait_idle(self.context.compute_queue())
+            };
+            if !gpu_work_completed(&completion) {
+                tracing::error!(?completion, "Cannot prove converter GPU completion; retaining Vulkan resources");
+                // Keep the device alive if this is the last converter using it.
+                // Raw Vulkan handles are deliberately leaked on this path.
+                std::mem::forget(self.context.clone());
+                return;
+            }
+            self.in_flight = false;
+            self.destroy_src_view();
+        }
         unsafe {
             let device = self.context.device();
             // Not destroyed here: an encode may still be waiting on a point
