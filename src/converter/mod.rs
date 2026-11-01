@@ -1148,10 +1148,15 @@ impl Drop for ColorConverter {
             // A failed fence wait leaves completion unknown. Synchronize
             // against the queue that submitted this conversion before cleanup.
             let completion = unsafe {
-                self.context.device().queue_wait_idle(self.context.compute_queue())
+                self.context
+                    .device()
+                    .queue_wait_idle(self.context.compute_queue())
             };
             if !gpu_work_completed(&completion) {
-                tracing::error!(?completion, "Cannot prove converter GPU completion; retaining Vulkan resources");
+                tracing::error!(
+                    ?completion,
+                    "Cannot prove converter GPU completion; retaining Vulkan resources"
+                );
                 // Keep the device alive if this is the last converter using it.
                 // Raw Vulkan handles are deliberately leaked on this path.
                 std::mem::forget(self.context.clone());
