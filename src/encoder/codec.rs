@@ -25,7 +25,7 @@ use crate::encoder::resources::{
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
-use crate::vulkan::VideoContext;
+use crate::vulkan::{VideoContext, gpu_work_completed};
 
 /// Per-encoder state shared by every codec.
 ///
@@ -403,9 +403,19 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
             let common = &mut self.common;
             let device = common.context.device();
             // Wait on just the queues this encoder used, not the whole device.
-            let _ = device.queue_wait_idle(common.context.transfer_queue());
+            let transfer = device.queue_wait_idle(common.context.transfer_queue());
+            if !gpu_work_completed(&transfer) {
+                tracing::error!(?transfer, "Cannot prove encoder transfer completion; retaining Vulkan resources");
+                std::mem::forget(common.context.clone());
+                return;
+            }
             if let Some(q) = common.context.video_encode_queue() {
-                let _ = device.queue_wait_idle(q);
+                let encode = device.queue_wait_idle(q);
+                if !gpu_work_completed(&encode) {
+                    tracing::error!(?encode, "Cannot prove video encode completion; retaining Vulkan resources");
+                    std::mem::forget(common.context.clone());
+                    return;
+                }
             }
 
             common.pipeline.destroy(device);
