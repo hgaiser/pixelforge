@@ -504,6 +504,11 @@ impl EncodePipeline {
         })
     }
 
+    /// The slot at `index`.
+    pub(crate) fn slot(&self, index: usize) -> &EncodeSlot {
+        &self.slots[index]
+    }
+
     /// Index of the slot the next frame will be encoded into.
     pub(crate) fn current_index(&self) -> usize {
         self.current_slot

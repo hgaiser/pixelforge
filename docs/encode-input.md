@@ -117,6 +117,17 @@ The handle keeps the release point of each frame that read the image.
 them on the CPU, and the drop waits for them too. `InputImage` holds one, so
 its uploads wait for the previous frames by themselves.
 
+### Repeating the last frame
+
+`Encoder::repeat()` encodes the last frame again, for a key frame while no new
+frame arrives. The frame is still in an input image (copied or converted
+there), so the caller's source does not have to stay alive. The encoder keeps
+which slot holds it. When that is the current slot, the encode reads it in
+place. Otherwise it reads the other slot's image directly, and waits on the
+CPU until it is done, because the next frame can be written into that image.
+A frame that the encode read straight from a DMA-BUF is in no input image, so
+it cannot be repeated.
+
 ### No CPU waits
 
 The copy from a caller image into the input image signals a timeline

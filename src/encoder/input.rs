@@ -118,7 +118,6 @@ pub(crate) enum FrameInput {
         ownership: SourceOwnership,
     },
     /// Encode straight from `view`, an image made with the session's profile.
-    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     Direct {
         image: vk::Image,
         view: vk::ImageView,

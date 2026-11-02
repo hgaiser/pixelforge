@@ -74,6 +74,8 @@ pub struct Encoder {
     /// Counts submissions, so an [`InputSlot`] is submitted only before the
     /// next one.
     ticket: u64,
+    /// The slot whose input image holds the last frame, for [`Self::repeat`].
+    last_frame_slot: Option<usize>,
     /// Counts the times the codec encoder was made again with a different
     /// conversion. An [`ExternalImage`](super::external::ExternalImage) made
     /// for one cannot be read by another.
@@ -115,6 +117,7 @@ impl Encoder {
             pts_offset: 0,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ticket: 0,
+            last_frame_slot: None,
             generation: 0,
             #[cfg(feature = "dmabuf")]
             sync_files: None,
@@ -200,6 +203,12 @@ impl Encoder {
             ));
         }
         self.ticket += 1;
+        let fills_input_image = match &frame.source {
+            #[cfg(feature = "dmabuf")]
+            FrameSource::External(external) => external.fills_input_image(),
+            _ => true,
+        };
+        let frame_slot = self.inner.common().pipeline.current_index();
 
         #[cfg_attr(not(feature = "dmabuf"), allow(unused_mut))]
         let mut sync = FrameSync {
@@ -234,6 +243,7 @@ impl Encoder {
             FrameSource::External(external) => self.submit_external(external, sync)?,
         };
         future.pts_offset = self.pts_offset;
+        self.last_frame_slot = fills_input_image.then_some(frame_slot);
 
         #[cfg(feature = "dmabuf")]
         if frame.signal_sync_file
@@ -299,6 +309,58 @@ impl Encoder {
             },
         )?;
         future.set_released(converted);
+        Ok(future)
+    }
+
+    /// Encode the last frame again: an IDR if one was requested, for a client
+    /// that needs a key frame while no new frame arrives.
+    ///
+    /// The encoder still holds the last frame in an input image, so the
+    /// caller's source does not have to stay alive or unchanged. When that
+    /// image is another slot's, this waits on the CPU until the encode is
+    /// done, because the next frame can be written into it.
+    ///
+    /// An error if there is no last frame to repeat: nothing was submitted
+    /// since the encoder was made or reconfigured into a new encoder, or the
+    /// last frame was read straight from a DMA-BUF.
+    pub fn repeat(&mut self) -> Result<EncodeFuture> {
+        let Some(last) = self.last_frame_slot else {
+            return Err(PixelForgeError::InvalidInput(
+                "no frame to repeat: none was submitted since the encoder was made, \
+                 or the last one was read straight from a DMA-BUF"
+                    .to_string(),
+            ));
+        };
+        self.ticket += 1;
+        let common = self.inner.common();
+        // The encode writes nothing into its own slot's image, so the frame
+        // stays where it is for the next repeat.
+        let other_slot = last != common.pipeline.current_index();
+        let input = if other_slot {
+            let slot = common.pipeline.slot(last);
+            FrameInput::Direct {
+                image: slot.input_image,
+                view: slot.input_image_view,
+                extent: vk::Extent2D {
+                    width: common.aligned_width,
+                    height: common.aligned_height,
+                },
+                ownership: SourceOwnership {
+                    old_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+                    acquire_from: None,
+                    release_to: None,
+                    final_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+                },
+            }
+        } else {
+            FrameInput::InPlace
+        };
+        let mut future = self.inner.encode_frame(input, FrameSync::default())?;
+        future.pts_offset = self.pts_offset;
+        if other_slot {
+            // The next frame may be written into that slot's image.
+            self.context.wait_point(future.source_released())?;
+        }
         Ok(future)
     }
 

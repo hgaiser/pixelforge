@@ -160,8 +160,8 @@ of errors means nothing if the layer is missing.
 
 On NVIDIA (615.78.08) a decode submit under validation crashes inside the
 driver (`vkQueueSubmit2` from `DecodePipeline::submit_decode`), so every test
-that decodes (`roundtrip`, `adopted`, and the `rgb_encode` tests that compare
-decoded frames) segfaults there with `PIXELFORGE_VALIDATION=1`. Run those
+that decodes (`roundtrip`, `adopted`, `submit`'s repeat test, and the
+`rgb_encode` tests that compare decoded frames) segfaults there with `PIXELFORGE_VALIDATION=1`. Run those
 without validation on that driver, and check their encode half under
 validation separately.
 

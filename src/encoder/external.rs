@@ -210,6 +210,12 @@ impl ExternalImage {
         self.access != Access::Copy
     }
 
+    /// Whether a frame from this image ends up in the encoder's input image,
+    /// copied or converted, rather than read where it is.
+    pub(crate) fn fills_input_image(&self) -> bool {
+        self.access != Access::Encode
+    }
+
     /// The points after which every frame submitted so far is done with the
     /// buffer, so its producer can write it again. Empty before the first
     /// frame. For a producer that takes a sync_file instead, see

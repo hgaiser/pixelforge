@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `Encoder::input_slot` and `InputSlot`: the encoder's own input image,
   to write a frame in place and submit with `Frame::input`.
 - Add `InputImage::source`.
+- Add `Encoder::repeat`: encode the last frame again from the encoder's own
+  input image, for a key frame while no new frame arrives. The caller's
+  source does not have to stay alive for it.
 - Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
   `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
   `Frame::external`. The encoder reads a buffer directly where the device
