@@ -171,13 +171,20 @@ fn encoder_conversion(
     rgb: &RgbSource,
     target: ColorSpec,
 ) -> Result<()> {
+    // What no device can do is the configuration's fault; what this one
+    // cannot is the device's.
     let no = |reason: String| {
         Err(PixelForgeError::InvalidInput(format!(
             "RGB input: {reason}"
         )))
     };
+    let not_here = |reason: String| {
+        Err(PixelForgeError::NoSuitableDevice(format!(
+            "RGB input: {reason}"
+        )))
+    };
     if !context.has_video_encode_rgb_conversion() {
-        return no("the device has no VK_VALVE_video_encode_rgb_conversion".to_string());
+        return not_here("the device has no VK_VALVE_video_encode_rgb_conversion".to_string());
     }
     if rgb.color != target {
         return no(format!(
@@ -196,7 +203,7 @@ fn encoder_conversion(
         None => return no(format!("{:?} needs tone mapping first", rgb.format)),
     }
     if !context.supports_rgb_encode_input(config.codec, rgb.format, config.color) {
-        return no(format!(
+        return not_here(format!(
             "the driver does not convert {:?} to {:?} for {:?}",
             rgb.format, config.color, config.codec
         ));

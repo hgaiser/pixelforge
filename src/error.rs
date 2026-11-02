@@ -9,9 +9,18 @@ pub enum PixelForgeError {
     #[error("Failed to create Vulkan instance: {0}")]
     InstanceCreation(String),
 
-    /// Vulkan physical device selection failed.
+    /// The device cannot do what was asked: it lacks a queue, an extension,
+    /// a feature, a format or a profile. The same request can work on another
+    /// device, or with another configuration on this one; nothing is wrong
+    /// with the device itself.
     #[error("No suitable Vulkan physical device found: {0}")]
     NoSuitableDevice(String),
+
+    /// The device was lost: a driver reset, a GPU hang, or the GPU going
+    /// away. Nothing made from this context works any more. Drop the
+    /// encoders, decoders and the context, and make a new context.
+    #[error("The Vulkan device was lost")]
+    DeviceLost,
 
     /// Vulkan logical device creation failed.
     #[error("Failed to create Vulkan device: {0}")]
@@ -69,9 +78,49 @@ pub enum PixelForgeError {
 
 impl From<ash::vk::Result> for PixelForgeError {
     fn from(result: ash::vk::Result) -> Self {
-        PixelForgeError::Vulkan(result)
+        Self::vk(result, |_| PixelForgeError::Vulkan(result))
+    }
+}
+
+impl PixelForgeError {
+    /// `wrap` the description of a failed Vulkan call, except a lost device,
+    /// which is always [`Self::DeviceLost`].
+    pub(crate) fn vk(result: ash::vk::Result, wrap: impl FnOnce(String) -> Self) -> Self {
+        if result == ash::vk::Result::ERROR_DEVICE_LOST {
+            Self::DeviceLost
+        } else {
+            wrap(result.to_string())
+        }
     }
 }
 
 /// Result type for PixelForge operations.
 pub type Result<T> = std::result::Result<T, PixelForgeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ash::vk;
+
+    #[test]
+    fn a_lost_device_is_always_device_lost() {
+        assert!(matches!(
+            PixelForgeError::vk(
+                vk::Result::ERROR_DEVICE_LOST,
+                PixelForgeError::CommandBuffer
+            ),
+            PixelForgeError::DeviceLost
+        ));
+        assert!(matches!(
+            PixelForgeError::from(vk::Result::ERROR_DEVICE_LOST),
+            PixelForgeError::DeviceLost
+        ));
+        assert!(matches!(
+            PixelForgeError::vk(
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+                PixelForgeError::CommandBuffer
+            ),
+            PixelForgeError::CommandBuffer(_)
+        ));
+    }
+}

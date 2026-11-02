@@ -920,7 +920,7 @@ impl ColorConverter {
             self.context
                 .sync2()
                 .queue_submit2(self.context.compute_queue(), &[submit_info], self.fence)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
         }
         self.timeline.commit();
         self.in_flight = true;
@@ -938,7 +938,7 @@ impl ColorConverter {
                     .device()
                     .wait_for_fences(&[self.fence], true, u64::MAX)
             }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
             self.in_flight = false;
         }
         self.destroy_src_view();

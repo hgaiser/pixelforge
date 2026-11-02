@@ -769,7 +769,7 @@ impl VideoContext {
             .semaphores(&semaphores)
             .values(&values);
         unsafe { self.inner.timeline.wait_semaphores(&info, u64::MAX) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))
     }
 
     /// Hand over a semaphore to be destroyed with the context rather than now.

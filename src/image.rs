@@ -842,10 +842,14 @@ impl InputImage {
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("Queue submit failed: {}", e)))?;
+            .map_err(|e| {
+            PixelForgeError::vk(e, |e| {
+                PixelForgeError::CommandBuffer(format!("Queue submit failed: {e}"))
+            })
+        })?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
 
         unsafe { device.reset_fences(&[self.fence]) }
             .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;

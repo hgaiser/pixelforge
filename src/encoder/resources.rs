@@ -394,10 +394,16 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
     unsafe { device.reset_fences(&[params.fence]) }
         .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
-    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
-        .map_err(|e| PixelForgeError::CommandBuffer(format!("submit clear: {}", e)))?;
-    unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
-        .map_err(|e| PixelForgeError::CommandBuffer(format!("wait clear: {}", e)))?;
+    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }.map_err(|e| {
+        PixelForgeError::vk(e, |e| {
+            PixelForgeError::CommandBuffer(format!("submit clear: {e}"))
+        })
+    })?;
+    unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }.map_err(|e| {
+        PixelForgeError::vk(e, |e| {
+            PixelForgeError::CommandBuffer(format!("wait clear: {e}"))
+        })
+    })?;
     unsafe { device.reset_fences(&[params.fence]) }
         .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
 
@@ -623,7 +629,7 @@ pub(crate) fn upload_image_to_input(
             .sync2()
             .queue_submit2(params.upload_queue, &[submit_info], vk::Fence::null())
     }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
 
     Ok(())
 }
@@ -846,7 +852,7 @@ pub(crate) unsafe fn submit_encode_only(
     unsafe {
         sync2
             .queue_submit2(encode_queue, &[submit_info], fence)
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
     }
 
     Ok(())
@@ -876,7 +882,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
     unsafe {
         device
             .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
     }
 
     // Read query results (offset + bytes_written).
@@ -899,7 +905,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
                 &mut query_results,
                 vk::QueryResultFlags::WAIT,
             )
-            .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::QueryPool))?;
     }
 
     let offset = query_results[0].offset as usize;

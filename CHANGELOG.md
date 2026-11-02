@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can, and copies it otherwise.
 - Add sync_file fences (feature `dmabuf`): `Frame::wait_sync_file`,
   `Frame::signal_sync_file` and `EncodeFuture::take_release_sync_file`.
+- Add `PixelForgeError::DeviceLost`: a submit or wait that finds the device
+  lost reports it as such, so a caller knows to make a new context.
 - Add `VideoContext::supports_rgb_encode_input`,
   `VideoContext::has_video_encode_rgb_conversion` and
   `DeviceFeatures::video_encode_rgb_conversion`.
@@ -52,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a peak below the target. `RateControlMode::Disabled` was the same as
   `Cqp` and is gone. `DEFAULT_TARGET_BITRATE` and `DEFAULT_MAX_BITRATE` are
   removed; `DEFAULT_AV1_Q_INDEX` is added.
+- An RGB conversion the device cannot do is `PixelForgeError::NoSuitableDevice`,
+  as other missing device support is, rather than `InvalidInput`.
 - **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
   field are removed. No codec encodes B-frames yet, and every encoder refused
   a count above 0 at runtime.
