@@ -294,6 +294,8 @@ impl Encoder {
         ownership: SourceOwnership,
         sync: FrameSync,
     ) -> Result<EncodeFuture> {
+        // This waits until the slot is free, so the conversion never writes
+        // into an image that an earlier encode still reads.
         let target = self.inner.input_image();
         let converter = self
             .converter

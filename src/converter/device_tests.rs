@@ -526,10 +526,12 @@ fn encode_config(codec: Codec) -> EncodeConfig {
 }
 
 /// The streams of 8 moving frames, converted by hand and by an encoder with
-/// an RGB source and the shader conversion.
+/// an RGB source and the shader conversion. `pipelined` submits the encoder's
+/// frames without waiting for each packet, so up to every slot is in flight.
 fn by_hand_and_by_encoder(
     context: &VideoContext,
     codec: Codec,
+    pipelined: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     let mut by_hand = Encoder::new(context.clone(), encode_config(codec))?;
     let mut converter = ColorConverter::new(
@@ -553,14 +555,12 @@ fn by_hand_and_by_encoder(
             )))
             .with_conversion(ConversionPreference::Shader),
     )?;
-    let (mut a, mut b) = (Vec::new(), Vec::new());
+    // All sources first, so that nothing else runs between the encoder's
+    // submits. Each `SourceImage` drops (and waits) before the image it reads.
+    let mut sources: Vec<(SourceImage, SrcImage)> = Vec::new();
     for n in 0..8 {
         let src =
             unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
-        let slot = by_hand.input_slot()?;
-        convert_into(&mut converter, src.image, slot.image())?;
-        a.extend(pollster::block_on(by_hand.submit(Frame::input(slot))?)?.data);
-
         let image = SourceImage::new(
             context,
             src.image,
@@ -568,8 +568,30 @@ fn by_hand_and_by_encoder(
                 layout: vk::ImageLayout::GENERAL,
             },
         )?;
-        b.extend(pollster::block_on(by_encoder.submit(Frame::image(&image))?)?.data);
+        sources.push((image, src));
     }
+
+    let mut a = Vec::new();
+    for (_, src) in &sources {
+        let slot = by_hand.input_slot()?;
+        convert_into(&mut converter, src.image, slot.image())?;
+        a.extend(pollster::block_on(by_hand.submit(Frame::input(slot))?)?.data);
+    }
+
+    let mut b = Vec::new();
+    let mut pending = Vec::new();
+    for (image, _) in &sources {
+        let packet = by_encoder.submit(Frame::image(image))?;
+        if pipelined {
+            pending.push(packet);
+        } else {
+            b.extend(pollster::block_on(packet)?.data);
+        }
+    }
+    for packet in pending {
+        b.extend(pollster::block_on(packet)?.data);
+    }
+    drop(sources);
     Ok((a, b))
 }
 
@@ -588,9 +610,35 @@ fn shader_source_matches_converting_by_hand() -> Result<(), Box<dyn std::error::
             eprintln!("{codec:?}: no encoder on this device");
             continue;
         };
-        let (by_hand, by_encoder) = by_hand_and_by_encoder(&context, codec)?;
+        let (by_hand, by_encoder) = by_hand_and_by_encoder(&context, codec, false)?;
         assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
         assert!(by_hand == by_encoder, "{codec:?}: the streams differ");
+    }
+    Ok(())
+}
+
+/// With every slot in flight, the shader still converts each frame into an
+/// input image only once the encode that last read it is done. This is how a
+/// streaming caller submits: without waiting for each packet.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn pipelined_shader_frames_do_not_overwrite_each_other() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = VideoContextBuilder::new()
+            .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+            .require_encode(codec)
+            .build()
+        else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let (by_hand, by_encoder) = by_hand_and_by_encoder(&context, codec, true)?;
+        assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
+        assert!(
+            by_hand == by_encoder,
+            "{codec:?}: a pipelined frame was overwritten"
+        );
     }
     Ok(())
 }
