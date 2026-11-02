@@ -638,7 +638,8 @@ pub struct EncodedPacketStats {
     pub gpu_time_ns: Option<u64>,
     /// CPU wall time in nanoseconds (submission + fence wait + readback)
     pub frame_latency_ns: u64,
-    /// Wall latency in nanoseconds (time between submit and bitstream ready)
+    /// Wall latency in nanoseconds, from the start of the encode submit until
+    /// the bitstream is read back.
     pub wall_latency_ns: u64,
 }
 

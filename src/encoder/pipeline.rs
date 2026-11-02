@@ -463,6 +463,9 @@ impl EncodePipeline {
         )
         .chain(extra_signals.iter().copied())
         .collect();
+        // Before the submit, not after: the driver can block in the submit
+        // while the GPU already runs the work.
+        let submit_time = std::time::Instant::now();
         unsafe {
             submit_encode_only(
                 device,
@@ -474,7 +477,6 @@ impl EncodePipeline {
                 &signals,
             )?;
         }
-        let submit_time = std::time::Instant::now();
 
         self.timeline.commit();
 
