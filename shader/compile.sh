@@ -11,7 +11,7 @@ if ! command -v glslc &>/dev/null; then
 fi
 
 echo "Compiling color_convert.comp → color_convert.spv"
-glslc -x glsl --target-env=vulkan1.3 -O \
+glslc -x glsl --target-env=vulkan1.1 -O \
     "$SCRIPT_DIR/color_convert.comp" \
     -o "$SPV_PATH"
 
@@ -23,7 +23,7 @@ for name in sample_frame sample_planes; do
     EXAMPLE_SRC="$PROJECT_ROOT/examples/shader/$name.comp"
     EXAMPLE_SPV="$PROJECT_ROOT/examples/shader/$name.spv"
     echo "Compiling $name.comp → $name.spv"
-    glslc -x glsl --target-env=vulkan1.3 -O "$EXAMPLE_SRC" -o "$EXAMPLE_SPV"
+    glslc -x glsl --target-env=vulkan1.1 -O "$EXAMPLE_SRC" -o "$EXAMPLE_SPV"
     FILE_SIZE=$(stat -c%s "$EXAMPLE_SPV" 2>/dev/null || stat -f%z "$EXAMPLE_SPV" 2>/dev/null)
     echo "Written $FILE_SIZE bytes to $EXAMPLE_SPV"
 done

@@ -87,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the image, rather than starting at `TOP_OF_PIPE`.
 - The GPU encode time is correct when the timestamp counter wraps between
   the two timestamps.
+- The shaders are SPIR-V 1.3, which a Vulkan 1.1 device must accept. They
+  were SPIR-V 1.6, which only a Vulkan 1.3 device must accept.
 - `wall_latency_ns` starts before the encode submit. It started after it, so
   a submit that blocked in the driver made it shorter than the GPU time.
 
