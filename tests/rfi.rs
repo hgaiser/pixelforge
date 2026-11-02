@@ -20,7 +20,7 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
 };
 use std::collections::VecDeque;
@@ -155,9 +155,9 @@ fn run_codec(
             encoder.invalidate_reference_frames(first_lost);
         }
 
-        let encoder_image = encoder.input_image();
-        input_image.upload_yuv420_to(encoder_image, &yuv_data[start..end])?;
-        pending.push_back(encoder.encode(encoder_image)?);
+        let slot = encoder.input_slot()?;
+        input_image.upload_yuv420_to(&slot, &yuv_data[start..end])?;
+        pending.push_back(encoder.submit(Frame::input(slot))?);
         while pending.len() > 2 {
             drain_one(&mut pending, &mut output_file, &mut recovery_is_key)?;
         }

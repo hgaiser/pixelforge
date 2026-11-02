@@ -4,9 +4,10 @@
 use ash::vk;
 
 use super::codec::{CodecEncoder, EncoderCommon, VideoCodec};
-use super::frame::{Frame, FrameSource};
+use super::frame::{Frame, FrameSource, InputSlot};
 use super::input::{FrameInput, FrameSync, SourceOwnership};
 use super::source::{Conversion, ConversionPreference, plan, target_space};
+use super::source_image::SourceImage;
 use super::{Codec, ColorDescription, EncodeConfig, EncodeFuture};
 use crate::converter::{ColorConverter, ColorRange};
 use crate::error::{PixelForgeError, Result};
@@ -70,6 +71,9 @@ pub struct Encoder {
     pts_offset: u64,
     /// Tells encoders apart, so an image made for one is not read by another.
     id: u64,
+    /// Counts submissions, so an [`InputSlot`] is submitted only before the
+    /// next one.
+    ticket: u64,
     /// Counts the times the codec encoder was made again with a different
     /// conversion. An [`ExternalImage`](super::external::ExternalImage) made
     /// for one cannot be read by another.
@@ -109,6 +113,7 @@ impl Encoder {
             converter,
             pts_offset: 0,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ticket: 0,
             generation: 0,
             #[cfg(feature = "dmabuf")]
             sync_files: None,
@@ -125,36 +130,23 @@ impl Encoder {
         &self.config
     }
 
-    /// Get the current slot's input image.
+    /// The encoder's input image for the next frame, to write it in place.
     ///
-    /// For a YUV source, rendering or uploading into this image and passing it
-    /// to [`Frame::image`] encodes it in place, with no copy. It is in
-    /// `VIDEO_ENCODE_SRC_KHR` layout, and must be left there. This call waits
-    /// until the slot's previous encode has finished with it.
+    /// Write the frame into [`InputSlot::image`] and submit it with
+    /// [`Frame::input`]: the encode reads it with no copy. This waits until
+    /// the slot's previous encode is done with the image.
     ///
-    /// For an RGB source the input image belongs to the conversion: hand the
-    /// RGB frames to [`Self::submit`] instead.
-    pub fn input_image(&self) -> vk::Image {
-        self.inner.input_image()
-    }
-
-    /// Encode a frame from a GPU image in `GENERAL` layout, and return once
-    /// the image can be written again.
-    ///
-    /// Like `submit(Frame::image(src_image, vk::ImageLayout::GENERAL))`, but
-    /// for an image other than [`Self::input_image`] it also waits on the CPU
-    /// for [`EncodeFuture::source_released`]: the copy or conversion out of
-    /// it. That keeps the simple loop of writing one image and encoding it
-    /// correct. [`Self::submit`] does not wait, for callers that order their
-    /// writes on the GPU instead.
+    /// The input image holds what the encode reads: YUV, or RGB where the
+    /// encoder converts ([`Conversion::Encoder`]). With
+    /// [`Conversion::Shader`] it belongs to the colour converter, and this is
+    /// an error: submit the RGB frames from a [`SourceImage`] instead.
     ///
     /// ```no_run
-    /// use pixelforge::{InputImage, Encoder, EncodeConfig, EncodeBitDepth, PixelFormat, VideoContext, Codec};
+    /// use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, VideoContext};
     ///
     /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = EncodeConfig::h264(1920, 1080);
-    /// let mut encoder = Encoder::new(context.clone(), config)?;
-    /// let mut input = InputImage::new(
+    /// let mut encoder = Encoder::new(context.clone(), EncodeConfig::h264(1920, 1080))?;
+    /// let mut upload = InputImage::new(
     ///     context,
     ///     Codec::H264,
     ///     1920,
@@ -162,41 +154,26 @@ impl Encoder {
     ///     EncodeBitDepth::Eight,
     ///     PixelFormat::Yuv420,
     /// )?;
-    ///
-    /// // Upload YUV420 data to the input image
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
-    /// input.upload_yuv420(&yuv_data)?;
-    ///
-    /// // Submit the frame and await its packet.
-    /// let future = encoder.encode(input.image())?;
-    /// let packet = pollster::block_on(future)?;
-    /// // ... use packet.data ...
+    /// let slot = encoder.input_slot()?;
+    /// upload.upload_yuv420_to(&slot, &yuv_data)?;
+    /// let packet = pollster::block_on(encoder.submit(Frame::input(slot))?)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        // Read before submitting, since submitting moves to the next slot.
-        let in_place =
-            self.conversion != Conversion::Shader && src_image == self.inner.input_image();
-        let future = self.submit(Frame::image(src_image, vk::ImageLayout::GENERAL))?;
-        if !in_place {
-            self.context.wait_point(future.source_released())?;
+    pub fn input_slot(&self) -> Result<InputSlot> {
+        if self.conversion == Conversion::Shader {
+            return Err(PixelForgeError::InvalidInput(
+                "the input image holds the colour converter's YUV; submit the RGB frame \
+                 from a SourceImage instead"
+                    .to_string(),
+            ));
         }
-        Ok(future)
-    }
-
-    /// Encode a frame once GPU work the caller submitted has finished.
-    ///
-    /// Short for `submit(Frame::image(src_image, src_layout).wait(wait))`. It
-    /// does not wait for the source to be read: write it again only after
-    /// [`EncodeFuture::source_released`].
-    pub fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
-        self.submit(Frame::image(src_image, src_layout).wait(wait))
+        Ok(InputSlot {
+            image: self.inner.input_image(),
+            encoder: self.id,
+            ticket: self.ticket,
+        })
     }
 
     /// Encode one frame.
@@ -208,9 +185,21 @@ impl Encoder {
     /// the encoder's input image, by the colour converter, or by the encode
     /// itself, depending on the [`Conversion`] and the source.
     ///
-    /// Because the call returns before the source is read, write the source
-    /// again only after [`EncodeFuture::source_released`].
+    /// The call returns before the source is read. A [`SourceImage`] or an
+    /// `ExternalImage` keeps track of that itself, see
+    /// [`SourceImage::released`].
     pub fn submit(&mut self, frame: Frame<'_>) -> Result<EncodeFuture> {
+        if let FrameSource::Input(slot) = &frame.source
+            && (slot.encoder, slot.ticket) != (self.id, self.ticket)
+        {
+            return Err(PixelForgeError::InvalidInput(
+                "this input slot is from before the encoder's last submission; \
+                 take a new one with input_slot()"
+                    .to_string(),
+            ));
+        }
+        self.ticket += 1;
+
         #[cfg_attr(not(feature = "dmabuf"), allow(unused_mut))]
         let mut sync = FrameSync {
             waits: frame.waits.iter().map(TimelinePoint::wait_info).collect(),
@@ -238,13 +227,10 @@ impl Encoder {
         };
 
         let mut future = match frame.source {
-            FrameSource::Image { image, layout } => {
-                self.submit_image(image, SourceOwnership::caller_image(layout), sync)?
-            }
+            FrameSource::Input(_) => self.inner.encode_frame(FrameInput::InPlace, sync)?,
+            FrameSource::Image(source) => self.submit_source(source, sync)?,
             #[cfg(feature = "dmabuf")]
             FrameSource::External(external) => self.submit_external(external, sync)?,
-            #[cfg(not(feature = "dmabuf"))]
-            FrameSource::Never(_) => unreachable!(),
         };
         future.pts_offset = self.pts_offset;
 
@@ -254,6 +240,24 @@ impl Encoder {
         {
             future.release_sync_file = files.export_release(slot)?;
         }
+        Ok(future)
+    }
+
+    /// Encode from a caller's [`SourceImage`].
+    fn submit_source(&mut self, source: &SourceImage, mut sync: FrameSync) -> Result<EncodeFuture> {
+        if source.image() == self.inner.input_image() {
+            return Err(PixelForgeError::InvalidInput(
+                "the encoder's input image is submitted with Frame::input".to_string(),
+            ));
+        }
+        sync.waits.extend(
+            source
+                .pending_release()
+                .iter()
+                .map(TimelinePoint::wait_info),
+        );
+        let future = self.submit_image(source.image(), source.ownership(), sync)?;
+        source.mark_used(future.source_released());
         Ok(future)
     }
 
@@ -280,12 +284,6 @@ impl Encoder {
         sync: FrameSync,
     ) -> Result<EncodeFuture> {
         let target = self.inner.input_image();
-        if image == target {
-            return Err(PixelForgeError::InvalidInput(
-                "the encoder's input image holds converted YUV; hand it the RGB frame instead"
-                    .to_string(),
-            ));
-        }
         let converter = self
             .converter
             .as_mut()
@@ -431,6 +429,8 @@ impl Encoder {
         let mut next = Self::new(self.context.clone(), config)?;
         next.pts_offset = self.pts_offset + encoded;
         next.id = self.id;
+        // A slot taken before is not a slot of the new encoder.
+        next.ticket = self.ticket + 1;
         next.generation = if next.conversion == self.conversion {
             self.generation
         } else {

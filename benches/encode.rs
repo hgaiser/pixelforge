@@ -9,8 +9,8 @@
 //!   cargo bench --bench encode
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, InputImage, PixelFormat,
-    RateControlMode, VideoContextBuilder,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, Frame, InputImage,
+    PixelFormat, RateControlMode, VideoContextBuilder,
 };
 use std::fs::File;
 use std::io::Read;
@@ -176,7 +176,7 @@ fn run_encode_test(
         // Upload YUV420 data to the input image
         input_image.upload_yuv420(frame)?;
 
-        pending.push_back(encoder.encode(input_image.image())?);
+        pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         // drain before submitting when at capacity
         while pending.len() >= 2 {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;

@@ -23,6 +23,7 @@ pub mod reorder;
 pub mod resources;
 pub(crate) mod rgb;
 mod source;
+mod source_image;
 pub(crate) mod support;
 
 use ash::vk;
@@ -572,9 +573,10 @@ impl EncodeConfig {
 }
 
 pub use api::Encoder;
-pub use frame::Frame;
+pub use frame::{Frame, InputSlot};
 pub use pipeline::EncodeFuture;
 pub use source::{Conversion, ConversionPreference, RgbSource, Source};
+pub use source_image::{Handoff, SourceImage};
 
 /// Statistic about the encoded video packet.
 #[derive(Debug, Clone)]

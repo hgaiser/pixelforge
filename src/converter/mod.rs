@@ -779,7 +779,7 @@ impl ColorConverter {
     ///
     /// The conversion waits on the GPU for every point in `wait` before
     /// reading `src_image`, and returns the point it signals when done. Pass
-    /// that to [`Encoder::encode_after`](crate::Encoder::encode_after) to
+    /// that to [`Frame::wait`](crate::Frame::wait) to
     /// encode the result, and wait on it before writing `src_image` again.
     ///
     /// On a device shared with the caller, where the caller renders or copies
@@ -806,7 +806,13 @@ impl ColorConverter {
             wait.iter().map(TimelinePoint::wait_info).collect();
         self.convert_with(
             src_image,
-            SourceOwnership::caller_image(src_layout),
+            SourceOwnership {
+                old_layout: src_layout,
+                acquire_from: (src_layout == vk::ImageLayout::UNDEFINED)
+                    .then_some(vk::QUEUE_FAMILY_EXTERNAL),
+                release_to: None,
+                final_layout: vk::ImageLayout::GENERAL,
+            },
             target_image,
             &waits,
             &[],

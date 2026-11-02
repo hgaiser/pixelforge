@@ -2,33 +2,58 @@
 
 use ash::vk;
 
+use super::source_image::SourceImage;
 use crate::sync::TimelinePoint;
 
 /// Where a frame's pixels are.
 pub(crate) enum FrameSource<'a> {
-    /// A `vk::Image` the caller owns, in the given layout.
-    Image {
-        image: vk::Image,
-        layout: vk::ImageLayout,
-    },
+    /// The encoder's own input image for the current slot.
+    Input(InputSlot),
+    /// A `vk::Image` of the caller's.
+    Image(&'a SourceImage),
     /// A DMA-BUF pixelforge imported or allocated.
     #[cfg(feature = "dmabuf")]
     External(&'a crate::encoder::external::ExternalImage),
-    #[cfg(not(feature = "dmabuf"))]
-    #[allow(dead_code)]
-    Never(std::marker::PhantomData<&'a ()>),
+}
+
+/// The encoder's input image for the next frame, from
+/// [`Encoder::input_slot`](crate::Encoder::input_slot).
+///
+/// Write the frame into [`Self::image`], then submit the slot with
+/// [`Frame::input`]: the encoder reads it in place, with no copy. The slot is
+/// valid until the encoder's next submission; submitting it later is an
+/// error.
+#[derive(Debug)]
+#[must_use]
+pub struct InputSlot {
+    pub(crate) image: vk::Image,
+    pub(crate) encoder: u64,
+    pub(crate) ticket: u64,
+}
+
+impl InputSlot {
+    /// The image to write the frame into. It is in `VIDEO_ENCODE_SRC_KHR`
+    /// layout, and must be in that layout when the slot is submitted.
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
 }
 
 /// One frame to encode: its source, and what has to happen on the GPU before
 /// it can be read.
 ///
 /// ```no_run
-/// # use pixelforge::{Encoder, Frame, TimelinePoint};
+/// # use pixelforge::{Encoder, Frame, Handoff, SourceImage, TimelinePoint, VideoContext};
 /// # use ash::vk;
-/// # fn f(encoder: &mut Encoder, image: vk::Image, rendered: TimelinePoint) -> Result<(), pixelforge::PixelForgeError> {
-/// let packet = encoder.submit(Frame::image(image, vk::ImageLayout::GENERAL).wait(&[rendered]))?;
-/// // Write `image` again only after this point.
-/// let reusable = packet.source_released();
+/// # fn f(context: &VideoContext, encoder: &mut Encoder, image: vk::Image, rendered: TimelinePoint) -> Result<(), pixelforge::PixelForgeError> {
+/// let source = SourceImage::new(
+///     context,
+///     image,
+///     Handoff::Device { layout: vk::ImageLayout::GENERAL },
+/// )?;
+/// let packet = encoder.submit(Frame::image(&source).wait(&[rendered]))?;
+/// // Render the next frame into `image` only after these points.
+/// let reusable = source.released();
 /// # Ok(())
 /// # }
 /// ```
@@ -43,27 +68,19 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    /// A frame in `image`, a `vk::Image` the caller owns, currently in
-    /// `layout`.
+    /// A frame in the encoder's own input image, written in place.
+    pub fn input(slot: InputSlot) -> Self {
+        Self::new(FrameSource::Input(slot))
+    }
+
+    /// A frame in `source`, an image of the caller's.
     ///
-    /// The image must be in the format the encoder's
-    /// [`Source`](crate::encoder::Source) says and have the encoder's
-    /// dimensions. Pixelforge reads it with a transfer, or with the colour
-    /// converter's shader, so it needs `TRANSFER_SRC` or `SAMPLED` usage to
-    /// match.
-    ///
-    /// `UNDEFINED` means a first-time external-memory import, which is
-    /// acquired from `VK_QUEUE_FAMILY_EXTERNAL`. The image is left in
-    /// `GENERAL`, owned by the queue family that read it.
-    ///
-    /// [`Encoder::input_image`](crate::Encoder::input_image) is read in place,
-    /// with no copy, for a YUV source.
-    ///
-    /// The image is read after [`Encoder::submit`](crate::Encoder::submit)
-    /// returns: keep it alive, and do not write it, until
-    /// [`EncodeFuture::source_released`](crate::EncodeFuture::source_released).
-    pub fn image(image: vk::Image, layout: vk::ImageLayout) -> Self {
-        Self::new(FrameSource::Image { image, layout })
+    /// Pixelforge copies it into the encoder's input image, or converts it
+    /// there for an RGB source. That happens after
+    /// [`Encoder::submit`](crate::Encoder::submit) returns, so write the image
+    /// again only after [`SourceImage::released`].
+    pub fn image(source: &'a SourceImage) -> Self {
+        Self::new(FrameSource::Image(source))
     }
 
     /// A frame in a DMA-BUF that the encoder imported or allocated, see

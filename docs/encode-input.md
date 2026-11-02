@@ -8,7 +8,7 @@ method for each.
 ## Goals
 
 1. The caller describes the source one time. Pixelforge selects the path.
-2. One encode entry point for all paths.
+2. One encode entry point for all paths, and no second, older way.
 3. No CPU wait in the hot path. The GPU orders all work.
 4. The caller knows when it can reuse a source image.
 5. A DMA-BUF source goes to the encoder with no pixelforge copy, when the
@@ -61,22 +61,46 @@ not.
 
 ## Submitting a frame
 
+`Encoder::submit(Frame)` is the one way to encode a frame:
+
 ```rust
-let future = encoder.submit(Frame::image(image, layout).wait(&points))?;
+let slot = encoder.input_slot()?;
+// ... write the frame into slot.image() ...
+let future = encoder.submit(Frame::input(slot).wait(&points))?;
+
+let future = encoder.submit(Frame::image(&source_image).wait(&points))?;
 let future = encoder.submit(Frame::external(&imported).wait_sync_file(fence))?;
 ```
 
-`Encoder::encode(image)` and `Encoder::encode_after(image, layout, waits)`
-stay, as short forms of `submit`.
-
 A `Frame` names its source:
 
-- `Frame::image(image, layout)`: a `vk::Image` the caller owns. If it is
-  `Encoder::input_image()`, the encoder reads it in place. Otherwise
-  pixelforge copies it (`None`, `Encoder`) or converts it (`Shader`) into the
-  input image.
+- `Frame::input(InputSlot)`: the encoder's own input image for the current
+  slot, written in place. `Encoder::input_slot()` waits for the slot and
+  returns the slot. A slot is valid only until the encoder's next submission:
+  a later submit of it is an error. With `Shader` there is no slot, because
+  the input image belongs to the converter.
+- `Frame::image(&SourceImage)`: a `vk::Image` the caller owns. Pixelforge
+  copies it (`None`, `Encoder`) or converts it (`Shader`) into the input
+  image.
 - `Frame::external(&ExternalImage)`: a DMA-BUF that pixelforge imported or
   allocated. See below.
+
+### Source images
+
+A `SourceImage` wraps a caller's `vk::Image` with a `Handoff`, which says how
+each frame gets the image and gives it back:
+
+- `Handoff::Device { layout }`: the caller writes it on this device and hands
+  it over in `layout`. Pixelforge leaves it in `layout`. `UNDEFINED` and
+  `PREINITIALIZED` are refused, because they keep no pixels.
+- `Handoff::External`: imported memory, written outside this device. Each
+  frame acquires it from the foreign queue family, and releases it back in
+  `GENERAL`. The first acquire uses `UNDEFINED`.
+
+The handle keeps the release point of each frame that read the image.
+`SourceImage::released()` gives those points. `wait_released()` waits for
+them on the CPU, and the drop waits for them too. `InputImage` holds one, so
+its uploads wait for the previous frames by themselves.
 
 ### No CPU waits
 
@@ -91,20 +115,19 @@ flight, `submit` waits for the oldest one.
 
 ### Release point
 
-`EncodeFuture::source_released()` returns the `TimelinePoint` after which the
-source can be written again, or given back to its producer:
+The image, not the future, holds the point after which the source can be
+written again, or given back to its producer:
 
 | Source | Released by |
 |---|---|
-| `Encoder::input_image()` | the encode |
-| caller image, `None` / `Encoder` | the copy |
-| caller image, `Shader` | the conversion |
+| `InputSlot` | the encode |
+| `SourceImage`, `None` / `Encoder` | the copy |
+| `SourceImage`, `Shader` | the conversion |
 | `ExternalImage`, read directly | the encode |
 | `ExternalImage`, copied | the copy |
 
-Before this change, `encode()` returned only after the copy was done. Now it
-returns at once, so a caller that writes the source again must wait on this
-point first.
+`SourceImage::released()` and `ExternalImage::released()` give it. A slot
+needs none: the next `input_slot()` waits for the slot.
 
 The semaphores behind these points are retired to the context when the
 encoder is dropped, as the converter already does. A wait on a point that the

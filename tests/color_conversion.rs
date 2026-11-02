@@ -229,7 +229,11 @@ fn convert(
     );
     let mut converter = ColorConverter::new(context.clone(), config)?;
     let description = converter.color_description();
-    converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
+    converter.convert(
+        src.image,
+        vk::ImageLayout::GENERAL,
+        encoder.input_slot()?.image(),
+    )?;
     Ok((read_luma(context, &converter, output_format)?, description))
 }
 
@@ -443,7 +447,11 @@ fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Er
     );
     let convert_with = |converter: &mut ColorConverter, pixels: &[u8]| {
         let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, pixels)? };
-        converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
+        converter.convert(
+            src.image,
+            vk::ImageLayout::GENERAL,
+            encoder.input_slot()?.image(),
+        )?;
         let luma = read_luma(&context, converter, OutputFormat::NV12)?;
         drop(src);
         Ok::<_, Box<dyn std::error::Error>>(luma)

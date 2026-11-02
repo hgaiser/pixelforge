@@ -19,7 +19,7 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, Encoder,
+    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, Encoder, Frame,
     InputFormat, OutputFormat, RateControlMode, TimelinePoint,
 };
 
@@ -292,11 +292,12 @@ fn encode_all(
     for n in 0..ENCODE_FRAMES {
         let src =
             unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
-        let target = encoder.input_image();
+        let slot = encoder.input_slot()?;
+        let target = slot.image();
         let future = match handoff {
             Handoff::Cpu => {
                 converter.convert(src.image, vk::ImageLayout::GENERAL, target)?;
-                encoder.encode(target)?
+                encoder.submit(Frame::input(slot))?
             }
             Handoff::Gpu => {
                 let ready = TimelinePoint::new(rendered, u64::from(n) + 1);
@@ -322,7 +323,7 @@ fn encode_all(
                 if n + 1 == ENCODE_FRAMES {
                     waits.push(TimelinePoint::new(rendered, after_drop));
                 }
-                encoder.encode_after(target, vk::ImageLayout::GENERAL, &waits)?
+                encoder.submit(Frame::input(slot).wait(&waits))?
             }
         };
         sources.push(src);

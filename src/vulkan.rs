@@ -776,7 +776,7 @@ impl VideoContext {
     ///
     /// For a semaphore whose owner is being dropped while a submission from
     /// elsewhere may still wait on it: the colour converter's timeline, which
-    /// an encode submitted with [`crate::Encoder::encode_after`] can still be
+    /// an encode that waits on it with [`crate::Frame::wait`] can still be
     /// waiting on when the converter goes. Every encoder holds the context and
     /// waits for its queues when dropped, so by the time the context goes,
     /// nothing of pixelforge's waits on these any more.

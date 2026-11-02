@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For each frame: upload YUV data and encode.
     // let yuv_data: &[u8] = ...;  // YUV420 frame data
     // input_image.upload_yuv420(yuv_data)?;
-    // let packets = encoder.encode(input_image.image())?;
+    // let packet = encoder.submit(Frame::image(input_image.source()))?;
 
     Ok(())
 }
@@ -259,13 +259,19 @@ encoding.
 
 ### Submitting frames
 
-[`Encoder::submit`] takes a [`Frame`]: where the pixels are, and what has
-to happen on the GPU before they can be read. It does not wait on the CPU,
-except when every pipeline slot is in flight. The source is read by a copy,
-the shader, or the encode itself, after the call returns, so write it again
-only after [`EncodeFuture::source_released`]. [`Encoder::encode`] is the
-short form that also waits for that point, which keeps the simple loop of
-writing one image and encoding it correct.
+[`Encoder::submit`] is the one way to encode a frame. It takes a [`Frame`]:
+where the pixels are, and what has to happen on the GPU before they can be
+read. It does not wait on the CPU, except when every pipeline slot is in
+flight. The pixels are in one of:
+
+- an [`InputSlot`], the encoder's own input image, from
+  [`Encoder::input_slot`]. The encode reads it in place, with no copy.
+- a [`SourceImage`], an image of the caller's. Pixelforge copies or
+  converts it into the input image after the call returns, and the
+  `SourceImage` keeps track of that: write the image again only after
+  [`SourceImage::released`]. [`InputImage`], for frames uploaded from the
+  CPU, waits for that itself.
+- an `ExternalImage`, a DMA-BUF (see below).
 
 ### Encoding on your own device
 
@@ -283,15 +289,16 @@ the application does not use, with
 
 Each frame is then ordered on the GPU: the application's submission signals
 a [`TimelinePoint`], the encoder's first submission for the frame waits for
-it, and the application waits for [`EncodeFuture::source_released`] before
-it draws into the image again.
+it, and the application waits for [`SourceImage::released`] before it draws
+into the image again.
 
 ```rust
-// `rendered` reaches `frame_number` once the application has drawn `image`.
+// `rendered` reaches `frame_number` once the application has drawn
+// `source.image()`.
 let ready = [TimelinePoint::new(rendered, frame_number)];
-let packet = encoder.submit(Frame::image(image, vk::ImageLayout::GENERAL).wait(&ready))?;
-// Wait on this before drawing into `image` again.
-let reusable = packet.source_released();
+let packet = encoder.submit(Frame::image(source).wait(&ready))?;
+// Wait on these before drawing into the image again.
+let reusable = source.released();
 ```
 
 ### DMA-BUF input

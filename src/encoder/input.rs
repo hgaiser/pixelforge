@@ -6,7 +6,14 @@
 //! reads directly. The submission that reads a source also does its queue
 //! family ownership transfers, which [`SourceOwnership`] describes.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ash::vk;
+
+use crate::error::Result;
+use crate::sync::TimelinePoint;
+use crate::vulkan::VideoContext;
 
 /// The layout a source is in, and the queue family transfers around the one
 /// submission that reads it.
@@ -20,21 +27,11 @@ pub(crate) struct SourceOwnership {
     pub acquire_from: Option<u32>,
     /// Queue family to release the source to once it has been read.
     pub release_to: Option<u32>,
+    /// Layout the source is left in once it has been read.
+    pub final_layout: vk::ImageLayout,
 }
 
 impl SourceOwnership {
-    /// A caller's image in `layout`. `UNDEFINED` means a first-time
-    /// external-memory import, which is acquired from `EXTERNAL` and then
-    /// stays with the queue that read it.
-    pub(crate) fn caller_image(layout: vk::ImageLayout) -> Self {
-        Self {
-            old_layout: layout,
-            acquire_from: (layout == vk::ImageLayout::UNDEFINED)
-                .then_some(vk::QUEUE_FAMILY_EXTERNAL),
-            release_to: None,
-        }
-    }
-
     /// The barrier that brings the source into `new_layout` for `family`,
     /// acquiring it first when another family owns it.
     pub(crate) fn acquire_barrier(
@@ -72,8 +69,8 @@ impl SourceOwnership {
             .subresource_range(color_range())
     }
 
-    /// The barrier that leaves the source in `GENERAL` after it was read in
-    /// `layout`, releasing it when another family takes it back.
+    /// The barrier that leaves the source in its final layout after it was
+    /// read in `layout`, releasing it when another family takes it back.
     pub(crate) fn release_barrier(
         &self,
         image: vk::Image,
@@ -102,7 +99,7 @@ impl SourceOwnership {
             .dst_stage_mask(dst_stage)
             .dst_access_mask(dst_access)
             .old_layout(layout)
-            .new_layout(vk::ImageLayout::GENERAL)
+            .new_layout(self.final_layout)
             .src_queue_family_index(src_family)
             .dst_queue_family_index(dst_family)
             .image(image)
@@ -115,7 +112,7 @@ impl SourceOwnership {
 pub(crate) enum FrameInput {
     /// The current slot's input image, already written.
     InPlace,
-    /// Copy `image` into the slot's input image first.
+    /// Copy `image`, which is not the slot's input image, into it first.
     Copy {
         image: vk::Image,
         ownership: SourceOwnership,
@@ -148,5 +145,60 @@ fn color_range() -> vk::ImageSubresourceRange {
         level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
+    }
+}
+
+/// When the frames that read a source are done with it.
+///
+/// One point per timeline semaphore, so a source read by two encoders keeps
+/// the last read of each.
+#[derive(Debug)]
+pub(crate) struct Uses {
+    read: AtomicBool,
+    points: Mutex<Vec<TimelinePoint>>,
+}
+
+impl Default for Uses {
+    fn default() -> Self {
+        Self {
+            read: AtomicBool::new(false),
+            points: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Uses {
+    /// Whether a frame has read the source yet.
+    pub(crate) fn was_read(&self) -> bool {
+        self.read.load(Ordering::Acquire)
+    }
+
+    /// Note a frame that is done with the source at `released`.
+    pub(crate) fn record(&self, released: TimelinePoint) {
+        self.read.store(true, Ordering::Release);
+        let mut points = self.points.lock().unwrap_or_else(|p| p.into_inner());
+        match points
+            .iter_mut()
+            .find(|p| p.semaphore == released.semaphore)
+        {
+            Some(point) => point.value = point.value.max(released.value),
+            None => points.push(released),
+        }
+    }
+
+    /// The points after which every frame so far is done with the source.
+    pub(crate) fn points(&self) -> Vec<TimelinePoint> {
+        self.points
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Wait on the CPU until every frame so far is done with the source.
+    pub(crate) fn wait(&self, context: &VideoContext) -> Result<()> {
+        for point in self.points() {
+            context.wait_point(point)?;
+        }
+        Ok(())
     }
 }

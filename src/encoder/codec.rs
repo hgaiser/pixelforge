@@ -144,11 +144,6 @@ impl EncoderCommon {
         self.source_released = None;
         self.pending_signals.clear();
         match input {
-            FrameInput::Copy { image, .. } if image == slot_image => {
-                self.source = slot_binding;
-                self.pending_waits = sync.waits;
-                self.pending_signals = sync.release_signals;
-            }
             FrameInput::InPlace => {
                 self.source = slot_binding;
                 self.pending_waits = sync.waits;

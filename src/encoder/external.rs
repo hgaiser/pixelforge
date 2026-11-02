@@ -14,14 +14,12 @@
 //! sync_files, see [`Frame::wait_sync_file`](crate::Frame::wait_sync_file).
 
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use ash::vk;
 use ash::vk::TaggedStructure;
 
 use super::api::Encoder;
-use super::input::{FrameInput, FrameSync, SourceOwnership};
+use super::input::{FrameInput, FrameSync, SourceOwnership, Uses};
 use super::source::{Conversion, Source};
 use super::{EncodeFuture, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -191,10 +189,8 @@ pub struct ExternalImage {
     plane_count: u32,
     /// The encoder it belongs to, and its conversion's generation.
     owner: (u64, u64),
-    /// Whether no frame has read it yet, so its layout is still undefined.
-    fresh: AtomicBool,
-    /// When the last frame that read it is done with it.
-    last_use: Mutex<Option<TimelinePoint>>,
+    /// The frames that read it.
+    uses: Uses,
 }
 
 impl std::fmt::Debug for ExternalImage {
@@ -212,6 +208,14 @@ impl ExternalImage {
     /// Whether the encoder reads this image directly, with no copy.
     pub fn is_zero_copy(&self) -> bool {
         self.access != Access::Copy
+    }
+
+    /// The points after which every frame submitted so far is done with the
+    /// buffer, so its producer can write it again. Empty before the first
+    /// frame. For a producer that takes a sync_file instead, see
+    /// [`Frame::signal_sync_file`](crate::Frame::signal_sync_file).
+    pub fn released(&self) -> Vec<TimelinePoint> {
+        self.uses.points()
     }
 
     /// The DRM format modifier.
@@ -268,31 +272,21 @@ impl ExternalImage {
     fn ownership(&self) -> SourceOwnership {
         let foreign = self.context.external().foreign_family();
         SourceOwnership {
-            old_layout: if self.fresh.load(Ordering::Acquire) {
-                vk::ImageLayout::UNDEFINED
-            } else {
+            old_layout: if self.uses.was_read() {
                 vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::UNDEFINED
             },
             acquire_from: Some(foreign),
             release_to: Some(foreign),
+            final_layout: vk::ImageLayout::GENERAL,
         }
-    }
-
-    fn last_use(&self) -> Option<TimelinePoint> {
-        *self.last_use.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    fn mark_used(&self, released: TimelinePoint) {
-        self.fresh.store(false, Ordering::Release);
-        *self.last_use.lock().unwrap_or_else(|p| p.into_inner()) = Some(released);
     }
 }
 
 impl Drop for ExternalImage {
     fn drop(&mut self) {
-        if let Some(point) = self.last_use() {
-            let _ = self.context.wait_point(point);
-        }
+        let _ = self.uses.wait(&self.context);
         let device = self.context.device();
         unsafe {
             if let Some(view) = self.view {
@@ -798,8 +792,7 @@ impl Encoder {
             modifier,
             plane_count,
             owner: (self.id(), self.generation()),
-            fresh: AtomicBool::new(true),
-            last_use: Mutex::new(None),
+            uses: Uses::default(),
         })
     }
 
@@ -909,9 +902,8 @@ impl Encoder {
         }
         // The previous frame's release has to come before this frame's
         // acquire, even when both run on the same queue.
-        if let Some(point) = external.last_use() {
-            sync.waits.push(point.wait_info());
-        }
+        sync.waits
+            .extend(external.uses.points().iter().map(TimelinePoint::wait_info));
         let ownership = external.ownership();
         let future = match external.access {
             Access::Encode => self.encode_input(
@@ -932,7 +924,7 @@ impl Encoder {
             )?,
             Access::Sample => self.convert_and_encode(external.image, ownership, sync)?,
         };
-        external.mark_used(future.source_released());
+        external.uses.record(future.source_released());
         Ok(future)
     }
 }

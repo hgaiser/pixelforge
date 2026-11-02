@@ -54,7 +54,7 @@ use crate::vulkan::VideoContext;
 /// A handle to the packet a single `EncodePipeline::submit_current` will
 /// eventually produce.
 ///
-/// Returned by `Encoder::encode`, one per submitted frame. Awaiting it yields
+/// Returned by `Encoder::submit`, one per submitted frame. Awaiting it yields
 /// that frame's [`EncodedPacket`] once the GPU finishes encoding and the
 /// completion thread reads the bitstream back. Futures resolve in submission
 /// order (one submission → one readback → one packet) as long as you await them
@@ -73,24 +73,16 @@ pub struct EncodeFuture {
 }
 
 impl EncodeFuture {
-    /// The point after which this frame's source may be written again, or
-    /// handed back to whatever produced it.
-    ///
-    /// Which submission reaches it depends on how the source was read: the
+    /// The point after which this frame's source may be written again: the
     /// copy into the encoder's input image, the colour conversion, or the
-    /// encode itself for a source read directly. It is usually long before the
-    /// packet is ready. Waiting on it on the GPU, before the next write to the
-    /// source, is enough.
-    ///
-    /// The semaphore stays valid for as long as the encoder's
-    /// [`VideoContext`] does.
-    pub fn source_released(&self) -> TimelinePoint {
+    /// encode itself for a source read directly.
+    pub(crate) fn source_released(&self) -> TimelinePoint {
         self.released
     }
 
     /// The sync_file asked for with
     /// [`Frame::signal_sync_file`](crate::Frame::signal_sync_file): it
-    /// signals at [`Self::source_released`]. `None` if it was not asked for,
+    /// signals once the frame is done with its source. `None` if it was not asked for,
     /// was already taken, or had already signalled when it was made, which
     /// the driver may report that way.
     #[cfg(feature = "dmabuf")]

@@ -14,7 +14,7 @@
 //!   while the current one decodes. Frames arrive on the
 //!   [`DecodeSource`] as they complete, and the two halves can be driven from
 //!   separate threads. Mirrors
-//!   [`Encoder::encode`](crate::encoder::Encoder::encode).
+//!   [`Encoder::submit`](crate::encoder::Encoder::submit).
 //! - **Stream-driven**: the Vulkan video session is created lazily from the
 //!   stream's own parameter sets, so no dimensions or profile need to be
 //!   configured up front. Mid-stream resolution changes recreate the session

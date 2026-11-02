@@ -17,8 +17,9 @@ use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
     Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec,
-    Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputFormat,
-    OutputFormat, RateControlMode, RgbSource, Source, VideoContext, VideoContextBuilder,
+    Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, Handoff,
+    InputFormat, OutputFormat, RateControlMode, RgbSource, Source, SourceImage, VideoContext,
+    VideoContextBuilder,
 };
 
 const WIDTH: u32 = 320;
@@ -84,6 +85,20 @@ fn rgb(format: InputFormat) -> Source {
     Source::Rgb(RgbSource::new(format, ColorSpec::Srgb))
 }
 
+/// `src` as a source to encode from, handed over in `GENERAL`.
+fn source_image(
+    context: &VideoContext,
+    src: &SrcImage,
+) -> Result<SourceImage, pixelforge::PixelForgeError> {
+    SourceImage::new(
+        context,
+        src.image,
+        Handoff::Device {
+            layout: vk::ImageLayout::GENERAL,
+        },
+    )
+}
+
 /// Encode the frames with a YUV encoder and a colour converter the test runs
 /// itself.
 fn encode_by_hand(
@@ -95,8 +110,9 @@ fn encode_by_hand(
     let mut stream = Vec::new();
     for n in 0..FRAMES {
         let src = source(context, n)?;
-        converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
-        let packet = pollster::block_on(encoder.encode(encoder.input_image())?)?;
+        let slot = encoder.input_slot()?;
+        converter.convert(src.image, vk::ImageLayout::GENERAL, slot.image())?;
+        let packet = pollster::block_on(encoder.submit(Frame::input(slot))?)?;
         stream.extend_from_slice(&packet.data);
     }
     Ok(stream)
@@ -118,7 +134,8 @@ fn encode_rgb(
     let mut stream = Vec::new();
     for n in 0..FRAMES {
         let src = source(context, n)?;
-        let packet = pollster::block_on(encoder.encode(src.image)?)?;
+        let image = source_image(context, &src)?;
+        let packet = pollster::block_on(encoder.submit(Frame::image(&image))?)?;
         stream.extend_from_slice(&packet.data);
     }
     Ok(stream)
@@ -346,8 +363,8 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
             encoder.set_color_description(ColorDescription::bt709().with_full_range(true))?;
         }
         let src = source(&context, n)?;
-        let packet =
-            pollster::block_on(encoder.submit(Frame::image(src.image, vk::ImageLayout::GENERAL))?)?;
+        let image = source_image(&context, &src)?;
+        let packet = pollster::block_on(encoder.submit(Frame::image(&image))?)?;
         pts.push(packet.pts);
         keys.push(packet.is_key_frame);
     }

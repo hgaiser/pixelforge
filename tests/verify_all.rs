@@ -11,7 +11,7 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
 };
 use std::fs::File;
@@ -174,14 +174,14 @@ fn run_test(
             // Upload directly to encoder's input image to avoid cross-queue
             // copy issues (InputImage uses the transfer queue, encoder uses the
             // video encode queue which doesn't support transfer ops).
-            let encoder_image = encoder.input_image();
+            let slot = encoder.input_slot()?;
             match format {
-                PixelFormat::Yuv420 => input_image.upload_yuv420_to(encoder_image, frame)?,
-                PixelFormat::Yuv444 => input_image.upload_yuv444_to(encoder_image, frame)?,
+                PixelFormat::Yuv420 => input_image.upload_yuv420_to(&slot, frame)?,
+                PixelFormat::Yuv444 => input_image.upload_yuv444_to(&slot, frame)?,
                 _ => return Err("Unsupported format".into()),
             }
 
-            pending.push_back(encoder.encode(encoder_image)?);
+            pending.push_back(encoder.submit(Frame::input(slot))?);
             while pending.len() > 2 {
                 let packet = pollster::block_on(pending.pop_front().unwrap())?;
                 output_file.write_all(&packet.data)?;

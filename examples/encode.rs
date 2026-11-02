@@ -10,7 +10,7 @@
 //! The codec defaults to `h264`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
     VideoContextBuilder,
 };
 use std::fs::File;
@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input_image.upload_yuv420(frame)?;
 
         // Submit the frame (async) and keep the pipeline at most ~2 deep.
-        pending.push_back(encoder.encode(input_image.image())?);
+        pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         while pending.len() > 2 {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;
             write_packet(packet, &mut total_bytes)?;

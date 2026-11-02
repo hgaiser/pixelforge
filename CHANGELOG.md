@@ -14,10 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VK_VALVE_video_encode_rgb_conversion` where the device can and the colour
   converter's shader otherwise (`Encoder::conversion`,
   `EncodeConfig::with_conversion`).
-- Add `Encoder::submit` and `Frame`: one way to hand over a frame, whatever
-  the conversion, with its GPU waits.
-- Add `EncodeFuture::source_released`: the point after which a frame's source
-  may be written again.
+- Add `Encoder::submit` and `Frame`: the one way to hand over a frame,
+  whatever the conversion, with its GPU waits.
+- Add `SourceImage` and `Handoff`: a caller's image to encode from. It keeps
+  track of the frames that read it (`SourceImage::released`), and its drop
+  waits for them.
+- Add `Encoder::input_slot` and `InputSlot`: the encoder's own input image,
+  to write a frame in place and submit with `Frame::input`.
+- Add `InputImage::source`.
 - Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
   `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
   `Frame::external`. The encoder reads a buffer directly where the device
@@ -31,13 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The copy of a frame into the encoder's input image no longer waits on the
-  CPU: the encode waits for it on the GPU. `Encoder::encode_after` and
-  `Encoder::submit` return before the source is read; `Encoder::encode` still
-  returns once the source can be written again.
-- `Encoder::encode_after` takes the source image's layout, as
-  `ColorConverter::convert_async` does: for `UNDEFINED`, a first-time
-  external-memory import, the copy into the input image acquires it from
-  `VK_QUEUE_FAMILY_EXTERNAL`.
+  CPU: the encode waits for it on the GPU. `Encoder::submit` returns before
+  the source is read.
+- **Breaking:** `Encoder::encode`, `Encoder::encode_after` and
+  `Encoder::input_image` are removed. Submit a `Frame` with `Encoder::submit`:
+  `Frame::image(&source_image)` for an image of the caller's,
+  `Frame::input(encoder.input_slot()?)` for the input image written in place.
+  An imported image that `UNDEFINED` used to mark is `Handoff::External`.
+- **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
+  `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
+  frames that read the image are done with it.
 - `Encoder::set_color_description` also updates the conversion of an RGB
   source, and makes the encoder again where the encoder converts. Packet
   timestamps carry on.

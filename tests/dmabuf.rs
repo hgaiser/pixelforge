@@ -18,8 +18,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::external::drm_format;
 use pixelforge::{
     Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufPlane, EncodeBitDepth,
-    EncodeConfig, Encoder, ExternalImage, Frame, InputFormat, InputImage, PixelFormat,
-    RateControlMode, RgbSource, Source, VideoContext, VideoContextBuilder,
+    EncodeConfig, Encoder, ExternalImage, Frame, Handoff, InputFormat, InputImage, PixelFormat,
+    RateControlMode, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -442,7 +442,7 @@ fn encode_reference(
     let mut stream = Vec::new();
     for frame in frames {
         input.upload_nv12(frame)?;
-        stream.extend(pollster::block_on(encoder.encode(input.image())?)?.data);
+        stream.extend(pollster::block_on(encoder.submit(Frame::image(input.source()))?)?.data);
     }
     Ok(stream)
 }
@@ -578,7 +578,14 @@ fn rgb_buffers_are_converted_directly() -> Result<(), Box<dyn std::error::Error>
     for n in 0..FRAMES {
         let data = bgra_frame(w, h, n);
         let src = unsafe { common::source::create_src_image(&context, w, h, &data)? };
-        reference.extend(pollster::block_on(reference_encoder.encode(src.image)?)?.data);
+        let image = SourceImage::new(
+            &context,
+            src.image,
+            Handoff::Device {
+                layout: vk::ImageLayout::GENERAL,
+            },
+        )?;
+        reference.extend(pollster::block_on(reference_encoder.submit(Frame::image(&image))?)?.data);
         producer.write(&data)?;
         stream.extend(pollster::block_on(encoder.submit(Frame::external(&allocated))?)?.data);
     }
