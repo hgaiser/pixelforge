@@ -8,7 +8,8 @@
 
 mod pipeline;
 
-use crate::encoder::{Codec, ColorDescription};
+use crate::encoder::ColorDescription;
+use crate::encoder::input::SourceOwnership;
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::TimelineChain;
@@ -325,43 +326,11 @@ impl ColorConverterConfig {
         )
     }
 
-    /// The RGB input to give a `codec` encoder instead of running this
-    /// conversion, when the encoder can do it itself.
-    ///
-    /// The hardware applies only the YUV matrix, so this is `Some` only for a
-    /// conversion that is nothing more: source and target are the same space,
-    /// so no transfer function or gamut change is involved, and the output is
-    /// 4:2:0 at the input's bit depth, NV12 from 8-bit RGB or P010 from
-    /// `ABGR2101010`. The device is then asked, with
-    /// [`VideoContext::supports_rgb_encode_input`], whether it does that
-    /// matrix and range for `codec` and takes this format.
-    ///
-    /// When `Some`, build the encoder with
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
-    /// and this format, and with [`Self::color_description`], then hand it the
-    /// RGB images directly and skip the converter.
-    pub fn rgb_encode_input(&self, context: &VideoContext, codec: Codec) -> Option<InputFormat> {
-        if self.source != self.target {
-            return None;
-        }
-        let shape_matches = match self.output_format {
-            OutputFormat::NV12 => matches!(
-                self.input_format,
-                InputFormat::BGRx | InputFormat::BGRA | InputFormat::RGBx | InputFormat::RGBA
-            ),
-            OutputFormat::P010 => self.input_format == InputFormat::ABGR2101010,
-            _ => false,
-        };
-        let desc = self.color_description()?;
-        (shape_matches && context.supports_rgb_encode_input(codec, self.input_format, &desc))
-            .then_some(self.input_format)
-    }
-
     /// Whether the shader can get from this source to this target.
     ///
     /// Anything that would need tone mapping or a forward gamma encode is not
     /// implemented, and is rejected rather than silently passed through.
-    fn conversion_supported(&self) -> bool {
+    pub(crate) fn conversion_supported(&self) -> bool {
         match self.target {
             // Anything can be converted to HDR.
             ColorSpec::Bt2020Pq => true,
@@ -373,7 +342,7 @@ impl ColorConverterConfig {
     }
 
     /// Error explaining why [`Self::conversion_supported`] said no.
-    fn unsupported_conversion(&self) -> PixelForgeError {
+    pub(crate) fn unsupported_conversion(&self) -> PixelForgeError {
         let reason = if !self.target.is_encodable() {
             "video cannot be encoded in a linear space, so it can only be a source"
         } else {
@@ -833,6 +802,27 @@ impl ColorConverter {
         target_image: vk::Image,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint> {
+        let waits: Vec<vk::SemaphoreSubmitInfo<'static>> =
+            wait.iter().map(TimelinePoint::wait_info).collect();
+        self.convert_with(
+            src_image,
+            SourceOwnership::caller_image(src_layout),
+            target_image,
+            &waits,
+            &[],
+        )
+    }
+
+    /// [`Self::convert_async`] with the source's ownership transfers spelled
+    /// out, and extra semaphores to wait on and signal.
+    pub(crate) fn convert_with(
+        &mut self,
+        src_image: vk::Image,
+        ownership: SourceOwnership,
+        target_image: vk::Image,
+        waits: &[vk::SemaphoreSubmitInfo<'static>],
+        extra_signals: &[vk::SemaphoreSubmitInfo<'static>],
+    ) -> Result<TimelinePoint> {
         // Before anything is reused, and before the previous view goes.
         self.wait_idle()?;
         let src_view = self.create_src_view(src_image)?;
@@ -854,47 +844,17 @@ impl ColorConverter {
 
             // --- Phase 1: Transition source image for shader read ---
 
-            // For external memory (DMA-BUF) imports with EXCLUSIVE sharing,
-            // the first use must include a queue family acquire operation.
-            // Set srcQueueFamilyIndex to EXTERNAL (ownership is foreign)
-            // and dstQueueFamilyIndex to the encoder's compute queue family.
-            let needs_acquire = src_layout == vk::ImageLayout::UNDEFINED;
-            let src_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(src_layout)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(if needs_acquire {
-                    vk::QUEUE_FAMILY_EXTERNAL
-                } else {
-                    vk::QUEUE_FAMILY_IGNORED
-                })
-                .dst_queue_family_index(if needs_acquire {
-                    self.context.compute_queue_family()
-                } else {
-                    vk::QUEUE_FAMILY_IGNORED
-                })
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(if needs_acquire {
-                    vk::AccessFlags::empty()
-                } else {
-                    vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
-                })
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-
-            device.cmd_pipeline_barrier(
+            let compute_family = self.context.compute_queue_family();
+            let src_barrier = [ownership.acquire_barrier(
+                src_image,
+                compute_family,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            )];
+            self.context.sync2().cmd_pipeline_barrier2(
                 self.command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_barrier],
+                &vk::DependencyInfo::default().image_memory_barriers(&src_barrier),
             );
 
             // --- Phase 2: Run compute shader (reads source image directly) ---
@@ -1064,31 +1024,27 @@ impl ColorConverter {
                     layer_count: 1,
                 });
 
-            // Transition source image back to GENERAL for reuse.
-            let src_barrier_back = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-
             device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[target_barrier_to_encode, src_barrier_back],
+                &[target_barrier_to_encode],
+            );
+
+            // Transition the source back to GENERAL for reuse, handing it back
+            // to its owner if it has one.
+            let src_back = [ownership.release_barrier(
+                src_image,
+                compute_family,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+            )];
+            self.context.sync2().cmd_pipeline_barrier2(
+                self.command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&src_back),
             );
 
             device
@@ -1096,17 +1052,18 @@ impl ColorConverter {
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
 
-        let waits: Vec<vk::SemaphoreSubmitInfo> =
-            wait.iter().map(TimelinePoint::wait_info).collect();
         let (semaphore, value) = self.timeline.pending_signal();
-        let signals = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(semaphore)
-            .value(value)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let mut signals = vec![
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        ];
+        signals.extend_from_slice(extra_signals);
         let command_buffers =
             [vk::CommandBufferSubmitInfo::default().command_buffer(self.command_buffer)];
         let submit_info = vk::SubmitInfo2::default()
-            .wait_semaphore_infos(&waits)
+            .wait_semaphore_infos(waits)
             .command_buffer_infos(&command_buffers)
             .signal_semaphore_infos(&signals);
 

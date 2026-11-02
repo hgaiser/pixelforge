@@ -5,18 +5,24 @@
 //! - GOP structure management (`gop` module) - reusable for H.264/H.265.
 //! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
 
+mod api;
 pub mod av1;
 pub mod bitwriter;
 pub(crate) mod codec;
 pub mod dpb;
+#[cfg(feature = "dmabuf")]
+pub mod external;
+mod frame;
 pub mod gop;
 pub mod h264;
 pub mod h265;
+pub(crate) mod input;
 pub(crate) mod pipeline;
 pub(crate) mod profile;
 pub mod reorder;
 pub mod resources;
 pub(crate) mod rgb;
+mod source;
 pub(crate) mod support;
 
 use ash::vk;
@@ -43,10 +49,6 @@ pub const DEFAULT_H265_QP: u32 = 28;
 
 /// Default maximum number of reference frames.
 pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
-
-use crate::error::Result;
-use crate::sync::TimelinePoint;
-use crate::vulkan::VideoContext;
 
 /// Video codec types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,9 +347,12 @@ pub struct EncodeConfig {
     /// Color description for VUI signaling.
     /// Defaults to BT.709, limited range, when `None`.
     pub color_description: Option<ColorDescription>,
-    /// Take RGB input and let the encoder convert it to YUV itself, through
-    /// `VK_VALVE_video_encode_rgb_conversion`. See [`Self::with_rgb_input`].
-    pub rgb_input: Option<crate::converter::InputFormat>,
+    /// What the frames handed to the encoder are. YUV by default; see
+    /// [`Self::with_source`].
+    pub source: Source,
+    /// Which conversion to use for an RGB source; see
+    /// [`Self::with_conversion`].
+    pub conversion: ConversionPreference,
     /// Usage hint for encoding.
     pub encode_usage_hint: EncodeUsageHint,
     /// Content hint for encoding.
@@ -379,7 +384,8 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
-            rgb_input: None,
+            source: Source::Yuv,
+            conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -408,7 +414,8 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
-            rgb_input: None,
+            source: Source::Yuv,
+            conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -437,7 +444,8 @@ impl EncodeConfig {
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color_description: None,
-            rgb_input: None,
+            source: Source::Yuv,
+            conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
@@ -526,24 +534,21 @@ impl EncodeConfig {
         self
     }
 
-    /// Take `format` RGB images as input and convert them to YUV in the
-    /// encoder itself, with no colour conversion shader.
+    /// Say what the frames handed to the encoder are.
     ///
-    /// Needs `VK_VALVE_video_encode_rgb_conversion` (see
-    /// [`VideoContext::has_video_encode_rgb_conversion`]), and a driver that
-    /// accepts `format` as encode input for this codec, profile and bit depth;
-    /// [`Encoder::new`] fails otherwise. The YUV matrix and range come from
-    /// [`Self::color_description`], so set that to what the stream should
-    /// carry. The hardware applies only the matrix: a source that needs a
-    /// transfer function or gamut change still has to go through
-    /// [`ColorConverter`](crate::ColorConverter), which
-    /// [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
-    /// decides for you.
-    ///
-    /// With this set, [`Encoder::input_image`] is an RGB image, and
-    /// [`Encoder::encode`] copies an RGB source into it.
-    pub fn with_rgb_input(mut self, format: crate::converter::InputFormat) -> Self {
-        self.rgb_input = Some(format);
+    /// For [`Source::Rgb`], the encoder converts them to the YUV that
+    /// [`Self::color_description`] describes, which then also picks the
+    /// conversion's target: BT.709 for SDR, BT.2020 with PQ for HDR10.
+    /// [`Encoder::new`] picks how, see [`Conversion`].
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Choose the conversion for an RGB source, rather than let
+    /// [`Encoder::new`] pick. For tests, and for comparing the two.
+    pub fn with_conversion(mut self, preference: ConversionPreference) -> Self {
+        self.conversion = preference;
         self
     }
 
@@ -566,7 +571,10 @@ impl EncodeConfig {
     }
 }
 
+pub use api::Encoder;
+pub use frame::Frame;
 pub use pipeline::EncodeFuture;
+pub use source::{Conversion, ConversionPreference, RgbSource, Source};
 
 /// Statistic about the encoded video packet.
 #[derive(Debug, Clone)]
@@ -594,198 +602,6 @@ pub struct EncodedPacket {
     pub dts: u64,
     /// Optional stats about the packet
     pub stats: Option<EncodedPacketStats>,
-}
-
-/// The codec-erased operations every [`codec::CodecEncoder`] exposes.
-///
-/// One blanket impl covers all codecs, so [`Encoder`] can hold any of them
-/// behind a single boxed pointer instead of an enum that re-dispatches by hand.
-trait EncoderApi: Send {
-    fn input_image(&self) -> vk::Image;
-    fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture>;
-    fn flush(&mut self) -> Result<()>;
-    fn request_idr(&mut self);
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
-}
-
-impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
-    fn input_image(&self) -> vk::Image {
-        codec::CodecEncoder::input_image(self)
-    }
-    fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
-        codec::CodecEncoder::encode_after(self, src_image, src_layout, wait)
-    }
-    fn flush(&mut self) -> Result<()> {
-        codec::CodecEncoder::flush(self)
-    }
-    fn request_idr(&mut self) {
-        codec::CodecEncoder::request_idr(self)
-    }
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        codec::CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
-    }
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        codec::CodecEncoder::set_color_description(self, desc)
-    }
-}
-
-/// Video encoder supporting multiple codecs.
-///
-/// Constructed via [`Encoder::new`], which selects the codec from the config and
-/// boxes the corresponding `codec::CodecEncoder`. All codecs share one generic
-/// implementation; this type just erases which one is in use.
-pub struct Encoder(Box<dyn EncoderApi>);
-
-impl Encoder {
-    /// Create a new encoder for the codec named in `config`.
-    pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
-        if let Some(format) = config.rgb_input {
-            rgb::check_rgb_input(&context, &config, format)?;
-        }
-        let inner: Box<dyn EncoderApi> = match config.codec {
-            Codec::H264 => Box::new(self::h264::H264::create(context, config)?),
-            Codec::H265 => Box::new(self::h265::H265::create(context, config)?),
-            Codec::AV1 => Box::new(self::av1::Av1::create(context, config)?),
-        };
-        Ok(Encoder(inner))
-    }
-
-    /// Get the internal input image.
-    ///
-    /// This image can be used as a target for `ColorConverter::convert` to avoid
-    /// an intermediate copy.
-    pub fn input_image(&self) -> vk::Image {
-        self.0.input_image()
-    }
-
-    /// Encode a frame from a GPU image.
-    ///
-    /// This accepts a source NV12 (YUV420) or planar YUV444 image on the GPU and encodes it directly.
-    /// The source image must match the format and dimensions in the encoder configuration.
-    ///
-    /// Encoding is asynchronous: this submits the frame without blocking and
-    /// returns an [`EncodeFuture`] that resolves with the encoded packet once the
-    /// GPU finishes and a background readback thread reads it back. The call only
-    /// blocks if every pipeline slot is still in flight (backpressure).
-    ///
-    /// Use `InputImage` to create an image from YUV data:
-    /// ```no_run
-    /// use pixelforge::{InputImage, Encoder, EncodeConfig, EncodeBitDepth, PixelFormat, VideoContext, Codec};
-    ///
-    /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = EncodeConfig::h264(1920, 1080);
-    /// let mut encoder = Encoder::new(context.clone(), config)?;
-    /// let mut input = InputImage::new(
-    ///     context,
-    ///     Codec::H264,
-    ///     1920,
-    ///     1080,
-    ///     EncodeBitDepth::Eight,
-    ///     PixelFormat::Yuv420,
-    /// )?;
-    ///
-    /// // Upload YUV420 data to the input image
-    /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
-    /// input.upload_yuv420(&yuv_data)?;
-    ///
-    /// // Submit the frame and await its packet.
-    /// let future = encoder.encode(input.image())?;
-    /// let packet = pollster::block_on(future)?;
-    /// // ... use packet.data ...
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        self.encode_after(src_image, vk::ImageLayout::GENERAL, &[])
-    }
-
-    /// Encode a frame once GPU work the caller submitted has finished.
-    ///
-    /// Like [`Self::encode`], but the frame's first GPU submission waits for
-    /// every point in `wait` before touching `src_image`. Pass the point
-    /// returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
-    /// to encode what it converted without waiting for the conversion on the
-    /// CPU, or a point the caller's own rendering signals.
-    ///
-    /// Only a `src_image` that is [`Self::input_image`] avoids the CPU
-    /// entirely. Any other image is first copied into the input image, and
-    /// that copy is waited for on the CPU before the encode is recorded, so
-    /// this call then blocks until the points in `wait` are reached and the
-    /// copy is done. Render or convert into [`Self::input_image`] to keep the
-    /// whole handover on the GPU.
-    ///
-    /// `src_layout` is the layout `src_image` is in, as for
-    /// [`ColorConverter::convert_async`](crate::ColorConverter::convert_async):
-    /// `UNDEFINED` is a first-time external-memory import, which the copy
-    /// acquires from `VK_QUEUE_FAMILY_EXTERNAL`. The copy leaves the image in
-    /// `GENERAL`, owned by
-    /// [`VideoContext::transfer_queue_family`](crate::VideoContext::transfer_queue_family).
-    /// It is ignored for [`Self::input_image`].
-    pub fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
-        self.0.encode_after(src_image, src_layout, wait)
-    }
-
-    /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).
-    ///
-    /// Packets are delivered through the [`EncodeFuture`]s returned by
-    /// [`Encoder::encode`]; await those to obtain them. Once this returns, every
-    /// outstanding future has been resolved.
-    pub fn flush(&mut self) -> Result<()> {
-        self.0.flush()
-    }
-
-    /// Request that the next frame be an IDR frame.
-    pub fn request_idr(&mut self) {
-        self.0.request_idr()
-    }
-
-    /// Recover from packet loss without a full IDR (reference frame invalidation).
-    ///
-    /// When a client reports that it could not decode a range of frames, every
-    /// reference picture the encoder still holds from the earliest lost frame
-    /// onward is transitively undecodable on the client. This drops those
-    /// references so the next P-frame is predicted from the most recent
-    /// *surviving* reference instead — a much cheaper recovery than re-sending a
-    /// full keyframe. If no reference survives (the loss covers the encoder's
-    /// whole reference window), it transparently falls back to forcing an IDR.
-    ///
-    /// `first_lost_display_order` is the display order — the `pts` reported on
-    /// [`EncodedPacket`]s — of the earliest frame the client lost.
-    ///
-    /// Effective recovery requires the encoder to keep more than one reference
-    /// (see [`EncodeConfig::with_max_reference_frames`]); with a single
-    /// reference this necessarily falls back to an IDR. This applies uniformly
-    /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
-    /// re-anchors prediction to the most recent survivor, falling back to an
-    /// IDR (AV1: key frame) only when the loss covers the entire window.
-    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        self.0.invalidate_reference_frames(first_lost_display_order)
-    }
-
-    /// Update the color description (VUI parameters) for the encoder.
-    ///
-    /// This recreates the video session parameters with an updated SPS/VPS/sequence
-    /// header containing the new color description. The next frame will be encoded as
-    /// an IDR/key frame with the new parameters.
-    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        self.0.set_color_description(desc)
-    }
 }
 
 #[cfg(test)]

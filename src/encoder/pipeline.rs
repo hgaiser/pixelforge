@@ -64,14 +64,56 @@ use crate::vulkan::VideoContext;
 /// still reads the slot back (its send simply finds no receiver) and frees it.
 pub struct EncodeFuture {
     rx: oneshot::Receiver<Result<EncodedPacket>>,
+    released: TimelinePoint,
+    /// Added to the packet's timestamps, so they carry on across an encoder
+    /// that was made again for a colour change.
+    pub(crate) pts_offset: u64,
+    #[cfg(feature = "dmabuf")]
+    pub(crate) release_sync_file: Option<std::os::fd::OwnedFd>,
+}
+
+impl EncodeFuture {
+    /// The point after which this frame's source may be written again, or
+    /// handed back to whatever produced it.
+    ///
+    /// Which submission reaches it depends on how the source was read: the
+    /// copy into the encoder's input image, the colour conversion, or the
+    /// encode itself for a source read directly. It is usually long before the
+    /// packet is ready. Waiting on it on the GPU, before the next write to the
+    /// source, is enough.
+    ///
+    /// The semaphore stays valid for as long as the encoder's
+    /// [`VideoContext`] does.
+    pub fn source_released(&self) -> TimelinePoint {
+        self.released
+    }
+
+    /// The sync_file asked for with
+    /// [`Frame::signal_sync_file`](crate::Frame::signal_sync_file): it
+    /// signals at [`Self::source_released`]. `None` if it was not asked for,
+    /// was already taken, or had already signalled when it was made, which
+    /// the driver may report that way.
+    #[cfg(feature = "dmabuf")]
+    pub fn take_release_sync_file(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.release_sync_file.take()
+    }
+
+    pub(crate) fn set_released(&mut self, point: TimelinePoint) {
+        self.released = point;
+    }
 }
 
 impl Future for EncodeFuture {
     type Output = Result<EncodedPacket>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let offset = self.pts_offset;
         match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Ok(result)) => Poll::Ready(result.map(|mut packet| {
+                packet.pts += offset;
+                packet.dts += offset;
+                packet
+            })),
             // The sender was dropped without sending. The completion thread only
             // drops a sender after sending, so this indicates encoder teardown.
             Poll::Ready(Err(oneshot::Canceled)) => {
@@ -363,7 +405,8 @@ impl EncodePipeline {
         device: &ash::Device,
         sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
-        external_waits: &[TimelinePoint],
+        external_waits: &[vk::SemaphoreSubmitInfo<'static>],
+        extra_signals: &[vk::SemaphoreSubmitInfo<'static>],
     ) -> Result<EncodeFuture> {
         let wait = self.timeline.wait();
         let signal = self.timeline.pending_signal();
@@ -409,8 +452,19 @@ impl EncodePipeline {
                     .value(value)
                     .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
             })
-            .chain(external_waits.iter().map(TimelinePoint::wait_info))
+            .chain(external_waits.iter().copied())
             .collect();
+        // ALL_COMMANDS rather than the encode stage: the timeline value is
+        // also handed out as the point after which a directly read source is
+        // free, and its release barrier comes after the encode.
+        let signals: Vec<vk::SemaphoreSubmitInfo> = std::iter::once(
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(signal.0)
+                .value(signal.1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        )
+        .chain(extra_signals.iter().copied())
+        .collect();
         unsafe {
             submit_encode_only(
                 device,
@@ -419,7 +473,7 @@ impl EncodePipeline {
                 fence,
                 encode_queue,
                 &waits,
-                Some(signal),
+                &signals,
             )?;
         }
         let submit_time = std::time::Instant::now();
@@ -449,7 +503,24 @@ impl EncodePipeline {
             let _ = tx.send(work);
         }
 
-        Ok(EncodeFuture { rx: result_rx })
+        Ok(EncodeFuture {
+            rx: result_rx,
+            released: TimelinePoint::new(signal.0, signal.1),
+            pts_offset: 0,
+            #[cfg(feature = "dmabuf")]
+            release_sync_file: None,
+        })
+    }
+
+    /// Index of the slot the next frame will be encoded into.
+    pub(crate) fn current_index(&self) -> usize {
+        self.current_slot
+    }
+
+    /// The timeline the encodes signal. Retired to the context rather than
+    /// destroyed, since a caller may still wait on a point it handed out.
+    pub(crate) fn timeline_semaphore(&self) -> vk::Semaphore {
+        self.timeline.semaphore()
     }
 
     /// Advance to the next slot after a frame has been submitted.
@@ -478,7 +549,8 @@ impl EncodePipeline {
         }
     }
 
-    /// Destroy all slot resources and the timeline semaphore.
+    /// Destroy all slot resources. The timeline semaphore is left for the
+    /// caller to retire, see [`Self::timeline_semaphore`].
     ///
     /// # Safety
     ///
@@ -508,9 +580,6 @@ impl EncodePipeline {
                 device.destroy_image(slot.input_image, None);
                 device.free_memory(slot.input_image_memory, None);
             }
-        }
-        unsafe {
-            self.timeline.destroy(device);
         }
     }
 }

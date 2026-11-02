@@ -9,20 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add RGB input converted by the encoder itself through
-  `VK_VALVE_video_encode_rgb_conversion`: `EncodeConfig::with_rgb_input`.
-- Add `VideoContext::supports_rgb_encode_input` and
-  `ColorConverterConfig::rgb_encode_input`, which say when a conversion can be
-  left to the encoder.
-- Add `VideoContext::has_video_encode_rgb_conversion` and
+- Add RGB input: `EncodeConfig::with_source(Source::Rgb(..))`. The encoder
+  converts RGB frames to the YUV its colour description describes, through
+  `VK_VALVE_video_encode_rgb_conversion` where the device can and the colour
+  converter's shader otherwise (`Encoder::conversion`,
+  `EncodeConfig::with_conversion`).
+- Add `Encoder::submit` and `Frame`: one way to hand over a frame, whatever
+  the conversion, with its GPU waits.
+- Add `EncodeFuture::source_released`: the point after which a frame's source
+  may be written again.
+- Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
+  `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
+  `Frame::external`. The encoder reads a buffer directly where the device
+  can, and copies it otherwise.
+- Add sync_file fences (feature `dmabuf`): `Frame::wait_sync_file`,
+  `Frame::signal_sync_file` and `EncodeFuture::take_release_sync_file`.
+- Add `VideoContext::supports_rgb_encode_input`,
+  `VideoContext::has_video_encode_rgb_conversion` and
   `DeviceFeatures::video_encode_rgb_conversion`.
 
 ### Changed
 
+- The copy of a frame into the encoder's input image no longer waits on the
+  CPU: the encode waits for it on the GPU. `Encoder::encode_after` and
+  `Encoder::submit` return before the source is read; `Encoder::encode` still
+  returns once the source can be written again.
 - `Encoder::encode_after` takes the source image's layout, as
   `ColorConverter::convert_async` does: for `UNDEFINED`, a first-time
   external-memory import, the copy into the input image acquires it from
   `VK_QUEUE_FAMILY_EXTERNAL`.
+- `Encoder::set_color_description` also updates the conversion of an RGB
+  source, and makes the encoder again where the encoder converts. Packet
+  timestamps carry on.
+- The `dmabuf` feature enables its extensions only where the device has them,
+  rather than failing device creation where it does not.
+
+### Fixed
+
+- The source image barrier of the input copy now waits for earlier work on
+  the image, rather than starting at `TOP_OF_PIPE`.
 
 ## [0.10.0] - 19-10-2026
 

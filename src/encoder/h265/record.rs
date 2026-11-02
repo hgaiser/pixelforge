@@ -31,7 +31,7 @@ impl H265 {
         let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
-        let input_image_view = slot.input_image_view;
+        let input_image_view = common.source_view();
 
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
@@ -47,6 +47,7 @@ impl H265 {
                 &ref_dpb_slots,
                 common.dpb_slot_active[common.current_dpb_slot as usize],
             );
+            common.record_source_acquire(command_buffer);
         }
 
         let slice_type = if is_idr {
@@ -293,7 +294,7 @@ impl H265 {
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
-            .coded_extent(coded_extent)
+            .coded_extent(common.source_coded_extent())
             .base_array_layer(0)
             .image_view_binding(input_image_view);
 
@@ -527,6 +528,8 @@ impl H265 {
 
             let end_coding_info = vk::VideoEndCodingInfoKHR::default();
             (common.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_coding_info);
+
+            common.record_source_release(command_buffer);
 
             device
                 .end_command_buffer(command_buffer)

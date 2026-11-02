@@ -7,6 +7,7 @@
 //! external memory, no export and import, and a semaphore instead of a CPU
 //! wait where one side hands a frame to the other.
 
+use super::ExternalSupport;
 use super::queues::{self, QueueOverrides};
 use super::{
     DeviceExtensions, DeviceFeatures, DeviceQueue, DeviceRequirements, QueueRoles, VideoContext,
@@ -42,6 +43,7 @@ struct EncodePlan {
     sampler_ycbcr_conversion: bool,
     internally_synchronized_queues: bool,
     rgb_conversion: bool,
+    external: ExternalSupport,
 }
 
 impl EncodePlan {
@@ -158,6 +160,7 @@ impl EncodePlan {
             ),
             rgb_conversion: has(ash::valve::video_encode_rgb_conversion::NAME)
                 && rgb.video_encode_rgb_conversion != 0,
+            external: ExternalSupport::detect(has),
         })
     }
 
@@ -187,6 +190,7 @@ impl EncodePlan {
         if self.rgb_conversion {
             names.push(ash::valve::video_encode_rgb_conversion::NAME);
         }
+        names.extend(self.external.extension_names());
         names
     }
 
@@ -225,7 +229,7 @@ impl VideoContextBuilder {
     /// whenever the device has it. On a device without it, encoding from YUV
     /// input still works and only the converter is unavailable.
     /// `VK_VALVE_video_encode_rgb_conversion` is included the same way, for
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder).
     pub fn encode_device_requirements(
         &self,
         entry: &ash::Entry,
@@ -335,6 +339,7 @@ impl VideoContext {
         Ok(VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
+                timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 entry,
                 instance,
                 physical_device,
@@ -355,6 +360,7 @@ impl VideoContext {
                 has_push_descriptor: plan.push_descriptor,
                 has_video_encode_rgb_conversion: plan.rgb_conversion,
                 has_unified_image_layouts: false,
+                external: plan.external,
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.

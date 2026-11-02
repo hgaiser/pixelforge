@@ -1,13 +1,12 @@
-//! Encoding RGB input with the encoder's own colour conversion, through
-//! `VK_VALVE_video_encode_rgb_conversion`, against the colour converter.
+//! Encoding an RGB [`Source`], through each [`Conversion`] the encoder can
+//! pick.
 //!
-//! When the conversion is nothing but the YUV matrix, the encoder can take the
-//! RGB frame as it is and the shader does not run at all. These tests encode
-//! the same frames both ways and check the hardware path lands where the
-//! shader does.
-//!
-//! Skipped on devices without the extension, which today is everything but
-//! AMD under RADV.
+//! With [`Conversion::Shader`] the encoder runs the colour converter itself,
+//! so its stream must be byte-identical to converting by hand and encoding
+//! the result. With [`Conversion::Encoder`] the encoder converts through
+//! `VK_VALVE_video_encode_rgb_conversion`; those tests check that it lands
+//! where the shader does, and skip on devices without the extension, which
+//! today is everything but AMD under RADV.
 
 #[allow(dead_code)]
 mod common;
@@ -18,8 +17,8 @@ use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
     Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec,
-    EncodeBitDepth, EncodeConfig, Encoder, InputFormat, OutputFormat, RateControlMode,
-    VideoContext, VideoContextBuilder,
+    Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputFormat,
+    OutputFormat, RateControlMode, RgbSource, Source, VideoContext, VideoContextBuilder,
 };
 
 const WIDTH: u32 = 320;
@@ -61,8 +60,8 @@ fn moving_frame(n: u32) -> Vec<u8> {
     data
 }
 
-/// Upload frame `n`. It is left in `GENERAL`, which is where [`Encoder::encode`]
-/// expects a source it copies from.
+/// Upload frame `n`. It is left in `GENERAL`, the layout [`Encoder::encode`]
+/// expects.
 fn source(context: &VideoContext, n: u32) -> Result<SrcImage, Box<dyn std::error::Error>> {
     Ok(unsafe { create_src_image(context, WIDTH, HEIGHT, &moving_frame(n))? })
 }
@@ -81,8 +80,13 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         .with_color_description(converter_config().color_description().unwrap())
 }
 
-/// Encode the frames with the colour converter doing the conversion.
-fn encode_with_shader(
+fn rgb(format: InputFormat) -> Source {
+    Source::Rgb(RgbSource::new(format, ColorSpec::Srgb))
+}
+
+/// Encode the frames with a YUV encoder and a colour converter the test runs
+/// itself.
+fn encode_by_hand(
     context: &VideoContext,
     codec: Codec,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -98,13 +102,19 @@ fn encode_with_shader(
     Ok(stream)
 }
 
-/// Encode the frames with the encoder doing the conversion.
+/// Encode the frames with an RGB source and the given conversion.
 fn encode_rgb(
     context: &VideoContext,
     codec: Codec,
     format: InputFormat,
+    preference: ConversionPreference,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut encoder = Encoder::new(context.clone(), encode_config(codec).with_rgb_input(format))?;
+    let mut encoder = Encoder::new(
+        context.clone(),
+        encode_config(codec)
+            .with_source(rgb(format))
+            .with_conversion(preference),
+    )?;
     let mut stream = Vec::new();
     for n in 0..FRAMES {
         let src = source(context, n)?;
@@ -142,24 +152,76 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-/// The format to hand a `codec` encoder, or `None` to skip it on this device.
-fn rgb_format(context: &VideoContext, codec: Codec, test: &str) -> Option<InputFormat> {
-    let format = converter_config().rgb_encode_input(context, codec);
-    if format.is_none() {
-        eprintln!("skipping {test} for {codec:?}: this device has no RGB input for it");
+/// Whether the encoder can convert `format` for `codec` here; prints why a
+/// test is skipped when not.
+fn encoder_converts(context: &VideoContext, codec: Codec, test: &str) -> bool {
+    let desc = converter_config().color_description().unwrap();
+    let ok = context.supports_rgb_encode_input(codec, InputFormat::BGRA, &desc);
+    if !ok {
+        eprintln!("skipping {test} for {codec:?}: the encoder cannot convert RGB here");
     }
-    format
+    ok
+}
+
+/// The shader path inside the encoder does exactly what converting by hand
+/// does, so the streams match byte for byte.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn shader_source_matches_converting_by_hand() -> Result<(), Box<dyn std::error::Error>> {
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = context(codec) else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let by_hand = encode_by_hand(&context, codec)?;
+        let shader = encode_rgb(
+            &context,
+            codec,
+            InputFormat::BGRA,
+            ConversionPreference::Shader,
+        )?;
+        assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
+        assert!(by_hand == shader, "{codec:?}: the streams differ");
+    }
+    Ok(())
+}
+
+/// `Auto` picks the encoder's own conversion exactly where it is available.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn auto_picks_the_encoder_where_it_can() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context(Codec::H264)?;
+    let encoder = Encoder::new(
+        context.clone(),
+        encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
+    )?;
+    let desc = converter_config().color_description().unwrap();
+    let expected = if context.supports_rgb_encode_input(Codec::H264, InputFormat::BGRA, &desc) {
+        Conversion::Encoder
+    } else {
+        Conversion::Shader
+    };
+    assert_eq!(encoder.conversion(), expected);
+    Ok(())
 }
 
 #[test]
 #[ignore = "requires a Vulkan Video device with VK_VALVE_video_encode_rgb_conversion"]
 fn rgb_input_matches_the_converter() -> Result<(), Box<dyn std::error::Error>> {
     let context = context(Codec::H264)?;
-    let Some(format) = rgb_format(&context, Codec::H264, "rgb_input_matches_the_converter") else {
+    if !encoder_converts(&context, Codec::H264, "rgb_input_matches_the_converter") {
         return Ok(());
-    };
-    let shader = decode_all(&context, &encode_with_shader(&context, Codec::H264)?)?;
-    let hardware = decode_all(&context, &encode_rgb(&context, Codec::H264, format)?)?;
+    }
+    let shader = decode_all(&context, &encode_by_hand(&context, Codec::H264)?)?;
+    let hardware = decode_all(
+        &context,
+        &encode_rgb(
+            &context,
+            Codec::H264,
+            InputFormat::BGRA,
+            ConversionPreference::Encoder,
+        )?,
+    )?;
     assert_eq!(hardware.len(), FRAMES as usize, "frame count");
     let psnrs: Vec<f64> = hardware
         .iter()
@@ -187,10 +249,15 @@ fn rgb_input_encodes_every_codec() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        let Some(format) = rgb_format(&context, codec, "rgb_input_encodes_every_codec") else {
+        if !encoder_converts(&context, codec, "rgb_input_encodes_every_codec") {
             continue;
-        };
-        let stream = encode_rgb(&context, codec, format)?;
+        }
+        let stream = encode_rgb(
+            &context,
+            codec,
+            InputFormat::BGRA,
+            ConversionPreference::Encoder,
+        )?;
         assert!(!stream.is_empty(), "{codec:?}: empty stream");
         if let Ok(dir) = std::env::var("PIXELFORGE_RGB_STREAM_DIR") {
             std::fs::write(format!("{dir}/rgb.{codec:?}").to_lowercase(), &stream)?;
@@ -199,10 +266,11 @@ fn rgb_input_encodes_every_codec() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `supports_rgb_encode_input` must agree with what an encoder can actually
-/// be created for, on every device: one that answers yes for something the
-/// encoder then refuses sends a caller down a path that fails, and one that
-/// answers no for something that works leaves the shader running for nothing.
+/// `supports_rgb_encode_input` must agree with what an encoder forced to
+/// convert can actually be created for, on every device: one that answers
+/// yes for something the encoder then refuses would make `Auto` fail, and one
+/// that answers no for something that works leaves the shader running for
+/// nothing.
 #[test]
 #[ignore = "requires a Vulkan Video device"]
 fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>> {
@@ -234,13 +302,19 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
                 EncodeBitDepth::Eight
             };
             for (name, desc) in &descriptions {
+                let color = if desc.is_hdr() {
+                    ColorSpec::Bt2020Pq
+                } else {
+                    ColorSpec::Srgb
+                };
                 let supported = context.supports_rgb_encode_input(codec, format, desc);
                 let created = Encoder::new(
                     context.clone(),
                     encode_config(codec)
                         .with_bit_depth(bit_depth)
                         .with_color_description(*desc)
-                        .with_rgb_input(format),
+                        .with_source(Source::Rgb(RgbSource::new(format, color)))
+                        .with_conversion(ConversionPreference::Encoder),
                 )
                 .is_ok();
                 eprintln!("{codec:?} {format:?} {name}: query={supported} encoder={created}");
@@ -251,5 +325,40 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
             }
         }
     }
+    Ok(())
+}
+
+/// A colour change keeps the conversion in step with the label, the next
+/// packet is a key frame, and timestamps carry on.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context(Codec::H264)?;
+    let mut encoder = Encoder::new(
+        context.clone(),
+        encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
+    )?;
+    let conversion = encoder.conversion();
+    let mut pts = Vec::new();
+    let mut keys = Vec::new();
+    for n in 0..FRAMES {
+        if n == FRAMES / 2 {
+            encoder.set_color_description(ColorDescription::bt709().with_full_range(true))?;
+        }
+        let src = source(&context, n)?;
+        let packet =
+            pollster::block_on(encoder.submit(Frame::image(src.image, vk::ImageLayout::GENERAL))?)?;
+        pts.push(packet.pts);
+        keys.push(packet.is_key_frame);
+    }
+    assert_eq!(pts, (0..u64::from(FRAMES)).collect::<Vec<_>>());
+    assert!(keys[0] && keys[FRAMES as usize / 2], "key frames: {keys:?}");
+    assert!(
+        encoder.config().color_description.unwrap().full_range,
+        "the description was not kept"
+    );
+    // Full range is not something every encoder converts to; where it does
+    // not, the shader takes over.
+    println!("conversion {conversion:?} -> {:?}", encoder.conversion());
     Ok(())
 }

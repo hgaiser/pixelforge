@@ -15,9 +15,14 @@
 use ash::vk;
 use ash::vk::TaggedStructure;
 
+use crate::converter::InputFormat;
 use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
-use crate::encoder::pipeline::{EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata};
+use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
+use crate::encoder::pipeline::{
+    ENCODE_PIPELINE_DEPTH, EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata,
+};
+use crate::encoder::profile::EncodeProfile;
 use crate::encoder::resources::{
     EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
     create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
@@ -27,6 +32,7 @@ use crate::encoder::rgb::RgbConversionCaps;
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
+use crate::video::{TimelineChain, allocate_command_buffers};
 use crate::vulkan::VideoContext;
 
 /// Per-encoder state shared by every codec.
@@ -73,11 +79,29 @@ pub(crate) struct EncoderCommon {
 
     pub command_pool: vk::CommandPool,
     pub upload_command_pool: vk::CommandPool,
-    pub upload_command_buffer: vk::CommandBuffer,
     pub upload_fence: vk::Fence,
-    /// Caller work this frame's first submission must wait for. The upload
-    /// takes them when it copies, otherwise the encode submission does.
-    pub pending_waits: Vec<TimelinePoint>,
+    /// One upload command buffer per pipeline slot. A slot is handed out again
+    /// only once its encode is complete, and that encode waited for the
+    /// slot's upload, so the buffer is free by then.
+    pub upload_command_buffers: Vec<vk::CommandBuffer>,
+    /// Signalled by each upload; the encode of the same frame waits on it.
+    pub upload_timeline: TimelineChain,
+    /// What the current frame's encode submission waits for.
+    pub pending_waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// What the current frame's encode submission signals besides its
+    /// timeline: a release the caller asked for, when the encode is what
+    /// reads the source last.
+    pub pending_signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// What the current frame's encode reads.
+    pub source: SourceBinding,
+    /// When the current frame's source is free again, if something before
+    /// the encode was the last to read it.
+    pub source_released: Option<TimelinePoint>,
+    /// The session's video profile, for images made after creation.
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    pub profile: EncodeProfile,
+    /// The RGB format the encoder converts from, when it takes RGB input.
+    pub rgb_input: Option<InputFormat>,
 }
 
 impl EncoderCommon {
@@ -96,36 +120,174 @@ impl EncoderCommon {
         }
     }
 
-    /// Copy a source image, in `src_layout`, into the current slot's input
-    /// image. No-op when the source already *is* the slot image (e.g.
-    /// converted in place).
-    pub fn upload(&mut self, src_image: vk::Image, src_layout: vk::ImageLayout) -> Result<()> {
-        let (dst_image, input_image_layout) = {
+    /// Set up what the current frame's encode reads, copying the source into
+    /// the slot's input image first when it has to.
+    ///
+    /// `sync.waits` go to the frame's first submission and
+    /// `sync.release_signals` to the one that is last to read the source:
+    /// the copy when there is one, the encode otherwise.
+    pub fn prepare_source(&mut self, input: FrameInput, sync: FrameSync) -> Result<()> {
+        let (slot_image, slot_view, slot_layout) = {
             let slot = self.pipeline.current();
-            (slot.input_image, slot.input_image_layout)
+            (
+                slot.input_image,
+                slot.input_image_view,
+                slot.input_image_layout,
+            )
         };
-        if src_image == dst_image {
-            return Ok(());
+        let slot_binding = SourceBinding {
+            image: slot_image,
+            view: slot_view,
+            extent: None,
+            ownership: None,
+        };
+        self.source_released = None;
+        self.pending_signals.clear();
+        match input {
+            FrameInput::Copy { image, .. } if image == slot_image => {
+                self.source = slot_binding;
+                self.pending_waits = sync.waits;
+                self.pending_signals = sync.release_signals;
+            }
+            FrameInput::InPlace => {
+                self.source = slot_binding;
+                self.pending_waits = sync.waits;
+                self.pending_signals = sync.release_signals;
+            }
+            FrameInput::Copy { image, ownership } => {
+                let (semaphore, value) = self.upload_timeline.pending_signal();
+                let done = vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+                let mut signals = vec![done];
+                signals.extend(sync.release_signals);
+                let params = UploadParams {
+                    upload_command_buffer: self.upload_command_buffers
+                        [self.pipeline.current_index()],
+                    src_image: image,
+                    src_ownership: ownership,
+                    dst_image: slot_image,
+                    width: self.config.dimensions.width,
+                    height: self.config.dimensions.height,
+                    pixel_format: self.config.pixel_format,
+                    input_image_layout: slot_layout,
+                    rgb: self.rgb_input.is_some(),
+                    upload_queue: self.context.transfer_queue(),
+                    waits: &sync.waits,
+                    signals: &signals,
+                };
+                upload_image_to_input(&self.context, &params)?;
+                self.upload_timeline.commit();
+                self.pipeline.current_mut().input_image_layout =
+                    vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
+                let point = TimelinePoint::new(semaphore, value);
+                self.pending_waits = vec![point.wait_info()];
+                self.source_released = Some(point);
+                self.source = slot_binding;
+            }
+            FrameInput::Direct {
+                image,
+                view,
+                extent,
+                ownership,
+            } => {
+                self.source = SourceBinding {
+                    image,
+                    view,
+                    extent: Some(extent),
+                    ownership: Some(ownership),
+                };
+                self.pending_waits = sync.waits;
+                self.pending_signals = sync.release_signals;
+            }
         }
-        let waits = std::mem::take(&mut self.pending_waits);
-
-        let params = UploadParams {
-            upload_command_buffer: self.upload_command_buffer,
-            upload_fence: self.upload_fence,
-            src_image,
-            src_layout,
-            dst_image,
-            width: self.config.dimensions.width,
-            height: self.config.dimensions.height,
-            pixel_format: self.config.pixel_format,
-            input_image_layout,
-            rgb: self.config.rgb_input.is_some(),
-            upload_queue: self.context.transfer_queue(),
-            waits: &waits,
-        };
-        upload_image_to_input(&self.context, &params)?;
-        self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
         Ok(())
+    }
+
+    /// The view the current frame's encode reads.
+    pub fn source_view(&self) -> vk::ImageView {
+        self.source.view
+    }
+
+    /// The coded extent of the current frame's source picture.
+    ///
+    /// The aligned extent for the encoder's own input images, which are made
+    /// that large and have their padding zeroed. A source read directly may
+    /// be only the display size, as a DMA-BUF from a capture protocol has to
+    /// be. Its coded extent is then the display size, which the spec allows:
+    /// the stream headers already crop to it, and what the encoder reads
+    /// beyond the image is the implementation's padding.
+    pub fn source_coded_extent(&self) -> vk::Extent2D {
+        let aligned = vk::Extent2D {
+            width: self.aligned_width,
+            height: self.aligned_height,
+        };
+        match self.source.extent {
+            Some(extent) if extent.width < aligned.width || extent.height < aligned.height => {
+                vk::Extent2D {
+                    width: self.config.dimensions.width,
+                    height: self.config.dimensions.height,
+                }
+            }
+            _ => aligned,
+        }
+    }
+
+    /// Record the barrier that brings a directly read source into
+    /// `VIDEO_ENCODE_SRC_KHR` on the encode queue. Nothing to do for the
+    /// encoder's own input images, which are already there.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` must be recording, before the encode.
+    pub unsafe fn record_source_acquire(&self, command_buffer: vk::CommandBuffer) {
+        let (Some(ownership), Some(family)) = (
+            self.source.ownership,
+            self.context.video_encode_queue_family(),
+        ) else {
+            return;
+        };
+        let barrier = [ownership.acquire_barrier(
+            self.source.image,
+            family,
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+        )];
+        unsafe {
+            self.context.sync2().cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+            );
+        }
+    }
+
+    /// Record the barrier that hands a directly read source back after the
+    /// encode, in `GENERAL`.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` must be recording, after the encode.
+    pub unsafe fn record_source_release(&self, command_buffer: vk::CommandBuffer) {
+        let (Some(ownership), Some(family)) = (
+            self.source.ownership,
+            self.context.video_encode_queue_family(),
+        ) else {
+            return;
+        };
+        let barrier = [ownership.release_barrier(
+            self.source.image,
+            family,
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+        )];
+        unsafe {
+            self.context.sync2().cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+            );
+        }
     }
 
     /// Record the metadata for the packet the current slot will produce.
@@ -140,12 +302,17 @@ impl EncoderCommon {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
         let waits = std::mem::take(&mut self.pending_waits);
-        let future = self.pipeline.submit_current(
+        let signals = std::mem::take(&mut self.pending_signals);
+        let mut future = self.pipeline.submit_current(
             self.context.device(),
             self.context.sync2(),
             encode_queue,
             &waits,
+            &signals,
         )?;
+        if let Some(point) = self.source_released.take() {
+            future.set_released(point);
+        }
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
         Ok(future)
     }
@@ -159,6 +326,19 @@ impl EncoderCommon {
     pub fn device(&self) -> &ash::Device {
         self.context.device()
     }
+}
+
+/// What one frame's encode reads: the slot's own input image, or a source
+/// read directly.
+#[derive(Default)]
+pub(crate) struct SourceBinding {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    /// The image's size, for a source read directly; `None` for the slot's
+    /// input image, which has the aligned extent.
+    pub extent: Option<vk::Extent2D>,
+    /// The ownership transfers the encode does, for a source read directly.
+    pub ownership: Option<SourceOwnership>,
 }
 
 /// Everything a single frame needs to know about its schedule, snapshotted by
@@ -327,18 +507,11 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pipeline.input_image()
     }
 
-    /// Encode one frame once `wait` is reached, returning a future for its
-    /// packet. See [`crate::Encoder::encode_after`].
-    pub fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
+    /// Encode one frame from `input`, returning a future for its packet.
+    /// See [`crate::Encoder::submit`].
+    pub fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
         let plan = self.common.begin_frame();
-        self.common.pending_waits.clear();
-        self.common.pending_waits.extend_from_slice(wait);
-        self.common.upload(src_image, src_layout)?;
+        self.common.prepare_source(input, sync)?;
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
@@ -415,6 +588,13 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
             }
 
             common.pipeline.destroy(device);
+            // A caller may still wait on points these handed out.
+            common
+                .context
+                .retire_semaphore(common.pipeline.timeline_semaphore());
+            common
+                .context
+                .retire_semaphore(common.upload_timeline.semaphore());
 
             destroy_encoder_resources(
                 device,
@@ -441,8 +621,11 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
 pub(crate) struct CommonInitRequest<'a> {
     pub context: &'a VideoContext,
     pub config: &'a EncodeConfig,
-    /// The codec profile, with its `VideoEncode*ProfileInfoKHR` already chained.
-    pub profile_info: &'a vk::VideoProfileInfoKHR<'a>,
+    /// The codec profile. Moved into [`EncoderCommon`], since images made
+    /// later have to name it too.
+    pub profile: EncodeProfile,
+    /// The RGB format the encoder converts from, when it takes RGB input.
+    pub rgb_input: Option<InputFormat>,
     /// Device capabilities for this profile, resolved by [`query_video_caps`].
     pub caps: &'a DeviceVideoCaps,
     /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
@@ -454,8 +637,7 @@ pub(crate) struct CommonInitRequest<'a> {
     /// `SEPARATE_REFERENCE_IMAGES` (H.264/H.265 yes; AV1 no).
     pub allow_layered_dpb: bool,
     /// What the hardware RGB conversion supports for this profile, queried
-    /// alongside the codec capabilities when [`EncodeConfig::rgb_input`] is
-    /// set.
+    /// alongside the codec capabilities when `rgb_input` is set.
     pub rgb_caps: Option<RgbConversionCaps>,
 }
 
@@ -529,9 +711,10 @@ pub(crate) fn query_video_caps(
 /// Query capabilities, create the video session, DPB images, command resources,
 /// the encode pipeline and the GOP structure — the ~85% of encoder
 /// initialization that is identical across codecs.
-pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit> {
+pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit> {
     let context = req.context;
     let config = req.config;
+    let profile_info = req.profile.info();
     let width = config.dimensions.width;
     let height = config.dimensions.height;
 
@@ -587,7 +770,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     // With RGB input the encoder converts, so the session needs its settings
     // and the input image is RGB; the DPB stays YUV either way.
     // `Encoder::new` has already checked the configuration itself.
-    let rgb_session = match config.rgb_input {
+    let rgb_session = match req.rgb_input {
         Some(_) => {
             let caps = req.rgb_caps.ok_or_else(|| {
                 PixelForgeError::NoSuitableDevice(
@@ -609,12 +792,12 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
     let supported_src_formats = query_supported_video_formats(
         context,
-        req.profile_info,
+        profile_info,
         vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
     )?;
     let supported_dpb_formats = query_supported_video_formats(
         context,
-        req.profile_info,
+        profile_info,
         vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
     )?;
     if supported_src_formats.is_empty() {
@@ -627,7 +810,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
             "No supported Vulkan Video DPB formats for this profile".to_string(),
         ));
     }
-    let picture_format = config
+    let picture_format = req
         .rgb_input
         .map_or(preferred_src_format, |format| format.vk_format());
     if !supported_src_formats
@@ -677,7 +860,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let mut session_create_info = vk::VideoSessionCreateInfoKHR::default()
         .queue_family_index(encode_queue_family)
         .flags(vk::VideoSessionCreateFlagsKHR::empty())
-        .video_profile(req.profile_info)
+        .video_profile(profile_info)
         .picture_format(picture_format)
         .max_coded_extent(vk::Extent2D {
             width: aligned_width,
@@ -724,7 +907,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         aligned_height,
         reference_picture_format,
         dpb_slot_count,
-        req.profile_info,
+        profile_info,
         use_layered_dpb,
     )?;
 
@@ -736,11 +919,11 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         aligned_width,
         aligned_height,
         picture_format,
-        rgb_input: config.rgb_input.is_some(),
+        rgb_input: req.rgb_input.is_some(),
         pixel_format: config.pixel_format,
         bit_depth: config.bit_depth,
         bitstream_buffer_size: req.bitstream_buffer_size,
-        profile_info: req.profile_info,
+        profile_info,
         command_pool: cmd.command_pool,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
@@ -775,9 +958,19 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         current_dpb_slot: 0,
         command_pool: cmd.command_pool,
         upload_command_pool: cmd.upload_command_pool,
-        upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
+        upload_command_buffers: allocate_command_buffers(
+            context,
+            cmd.upload_command_pool,
+            ENCODE_PIPELINE_DEPTH as u32,
+        )?,
+        upload_timeline: TimelineChain::new(context)?,
         pending_waits: Vec::new(),
+        pending_signals: Vec::new(),
+        source: SourceBinding::default(),
+        source_released: None,
+        profile: req.profile,
+        rgb_input: req.rgb_input,
     };
 
     Ok(CommonInit {

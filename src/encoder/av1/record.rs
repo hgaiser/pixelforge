@@ -32,7 +32,7 @@ impl Av1 {
         let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
-        let input_image_view = slot.input_image_view;
+        let input_image_view = common.source_view();
 
         debug!(
             "av1 record: key={}, refs_len={}, dpb_slot={}",
@@ -58,6 +58,7 @@ impl Av1 {
                 &ref_dpb_slots,
                 common.dpb_slot_active[current_dpb_slot as usize],
             );
+            common.record_source_acquire(command_buffer);
         }
 
         let frame_type = if is_key_frame {
@@ -427,6 +428,8 @@ impl Av1 {
             common
                 .video_queue_fn
                 .cmd_end_video_coding(command_buffer, &end_coding_info);
+
+            common.record_source_release(command_buffer);
 
             device
                 .end_command_buffer(command_buffer)

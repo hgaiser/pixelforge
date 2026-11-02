@@ -162,11 +162,9 @@ impl VideoContext {
     /// [`InputFormat::ABGR2101010`]. Resolution and rate control are not
     /// considered.
     ///
-    /// When this is true, build the encoder with
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
-    /// and [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description)
-    /// set to `desc`. [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
-    /// asks this for a conversion it would otherwise run.
+    /// When this is true, an encoder for an RGB [`Source`](crate::Source) in
+    /// `format`, with `desc` as its colour description, picks
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder) by itself.
     pub fn supports_rgb_encode_input(
         &self,
         codec: Codec,
