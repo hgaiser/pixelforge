@@ -52,15 +52,24 @@ was selected.
 The colour converter is not public. An RGB source is the only way to use it,
 so its target and range always follow the stream's colour.
 
-### Colour changes
+### Source and colour changes
 
-`Encoder::set_color(StreamColor)` is the one way to change colour:
+`Encoder::reconfigure(Source, StreamColor)` is the one way to change the
+source or the colour. Both decide the conversion, so they change together:
+there is no moment where a new source meets the old colour, a pair the
+conversion may not do. A call that changes nothing does nothing, so a caller
+whose frames change format or colour space (a compositor) calls it for every
+frame.
 
-- `None` and `Shader`: the session parameters are made again (as before), and
-  the shader gets the new target and range.
-- `Encoder`: the matrix and range are fixed in the video session, so the codec
-  encoder is made again, and the path is selected again. Packet timestamps
-  continue from where they were. The next frame is an IDR in all cases.
+- `None` kept: the session parameters are made again for a new colour.
+- `Shader` kept: the converter switches in place. Its input format, source,
+  target and range are all push constants, and its source view is made per
+  conversion. The session parameters are made again for a new colour.
+- `Encoder`, or a change of conversion: the input format, matrix and range
+  are fixed in the video session, so the codec encoder is made again, and the
+  path is selected again. Packet timestamps continue from where they were.
+
+A new colour makes the next frame an IDR in all cases.
 
 This removes the bug where the label changed and the hardware conversion did
 not.

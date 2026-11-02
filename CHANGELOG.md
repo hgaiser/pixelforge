@@ -64,13 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames that read the image are done with it.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
-  `Encoder::set_color` replaces `set_color_description`, and
+  `Encoder::reconfigure` replaces `set_color_description`, and
   `VideoContext::supports_rgb_encode_input` takes a `StreamColor`. `Sdr` and
   `Hdr10` name the two colours an RGB source converts to, with their range;
   `Other` carries any H.273 description, for a YUV source only.
-- `Encoder::set_color` also updates the conversion of an RGB source, and
-  makes the encoder again where the encoder converts. Packet timestamps carry
-  on.
+- `Encoder::reconfigure(source, color)` changes the source and the stream
+  colour together, so the conversion follows both: the colour converter
+  switches in place, and where the encoder converts it is made again. Packet
+  timestamps carry on.
 - The `dmabuf` feature enables its extensions only where the device has them,
   rather than failing device creation where it does not.
 

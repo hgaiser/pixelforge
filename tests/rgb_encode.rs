@@ -10,7 +10,7 @@
 
 #[allow(dead_code)]
 mod common;
-use common::source::{SrcImage, create_src_image};
+use common::source::{SrcImage, create_src_image, create_src_image_as};
 use common::{Readback, decode_stream};
 
 use ash::vk;
@@ -319,9 +319,12 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     let mut keys = Vec::new();
     for n in 0..FRAMES {
         if n == FRAMES / 2 {
-            encoder.set_color(StreamColor::Sdr {
-                range: ColorRange::Full,
-            })?;
+            encoder.reconfigure(
+                rgb(InputFormat::BGRA),
+                StreamColor::Sdr {
+                    range: ColorRange::Full,
+                },
+            )?;
         }
         let src = source(&context, n)?;
         let image = source_image(&context, &src)?;
@@ -341,5 +344,60 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     // Full range is not something every encoder converts to; where it does
     // not, the shader takes over.
     println!("conversion {conversion:?} -> {:?}", encoder.conversion());
+    Ok(())
+}
+
+/// A source that changes its pixel layout mid-stream is read in its new
+/// layout from the next frame on: the shader switches in place, with no new
+/// key frame, and the picture stays the same.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn a_format_change_switches_the_shader_in_place() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context(Codec::H264)?;
+    let reference = encode_rgb(
+        &context,
+        Codec::H264,
+        InputFormat::BGRA,
+        ConversionPreference::Shader,
+    )?;
+    let mut encoder = Encoder::new(
+        context.clone(),
+        encode_config(Codec::H264)
+            .with_source(rgb(InputFormat::BGRA))
+            .with_conversion(ConversionPreference::Shader),
+    )?;
+    let mut stream = Vec::new();
+    let mut keys = Vec::new();
+    for n in 0..FRAMES {
+        let mut pixels = moving_frame(n);
+        let mut format = vk::Format::B8G8R8A8_UNORM;
+        if n >= FRAMES / 2 {
+            encoder.reconfigure(rgb(InputFormat::RGBA), StreamColor::default())?;
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            format = vk::Format::R8G8B8A8_UNORM;
+        }
+        let src = unsafe { create_src_image_as(&context, WIDTH, HEIGHT, format, &pixels)? };
+        let image = source_image(&context, &src)?;
+        let packet = pollster::block_on(encoder.submit(Frame::image(&image))?)?;
+        keys.push(packet.is_key_frame);
+        stream.extend_from_slice(&packet.data);
+    }
+    assert_eq!(encoder.conversion(), Conversion::Shader);
+    assert!(
+        !keys[FRAMES as usize / 2],
+        "the format change made a key frame: {keys:?}"
+    );
+    let expected = decode_all(&context, &reference)?;
+    let actual = decode_all(&context, &stream)?;
+    assert_eq!(actual.len(), FRAMES as usize, "frame count");
+    for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+        let p = psnr(a, e);
+        assert!(
+            p >= 40.0,
+            "frame {i}: {p:.2} dB against the unchanged source"
+        );
+    }
     Ok(())
 }

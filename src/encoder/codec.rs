@@ -2,7 +2,7 @@
 //!
 //! Everything that is identical across H.264, H.265 and AV1 lives here:
 //! the shared per-encoder state ([`EncoderCommon`]), the generic driver
-//! ([`CodecEncoder`]) that owns the public `submit`/`flush`/`set_color`
+//! ([`CodecEncoder`]) that owns the public `submit`/`flush`/`reconfigure`
 //! flow, the shared initialization scaffolding ([`build_encoder_common`]) and the
 //! shared rate-control decision ([`RateControlPlan`]).
 //!

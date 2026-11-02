@@ -895,8 +895,8 @@ impl Encoder {
     ) -> Result<EncodeFuture> {
         if external.owner != (self.id(), self.generation()) {
             return Err(PixelForgeError::InvalidInput(
-                "this ExternalImage was made by another encoder, or before a colour change \
-                 changed the conversion; import or allocate it again"
+                "this ExternalImage was made by another encoder, or before a reconfigure \
+                 changed the source or the conversion; import or allocate it again"
                     .to_string(),
             ));
         }

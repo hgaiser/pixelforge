@@ -101,10 +101,22 @@ pub unsafe fn create_src_image(
     height: u32,
     pixels: &[u8],
 ) -> Result<SrcImage, Box<dyn std::error::Error>> {
+    unsafe { create_src_image_as(context, width, height, vk::Format::B8G8R8A8_UNORM, pixels) }
+}
+
+/// [`create_src_image`] for `pixels` in `format`, any format of 4 bytes per
+/// pixel.
+pub unsafe fn create_src_image_as(
+    context: &VideoContext,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    pixels: &[u8],
+) -> Result<SrcImage, Box<dyn std::error::Error>> {
     let device = context.device();
     let info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::B8G8R8A8_UNORM)
+        .format(format)
         .extent(vk::Extent3D {
             width,
             height,

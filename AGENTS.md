@@ -158,6 +158,13 @@ see a passing test's. Without `VK_LAYER_KHRONOS_validation` installed,
 pixelforge logs a warning and carries on with validation disabled, so absence
 of errors means nothing if the layer is missing.
 
+On NVIDIA (615.78.08) a decode submit under validation crashes inside the
+driver (`vkQueueSubmit2` from `DecodePipeline::submit_decode`), so every test
+that decodes (`roundtrip`, `adopted`, and the `rgb_encode` tests that compare
+decoded frames) segfaults there with `PIXELFORGE_VALIDATION=1`. Run those
+without validation on that driver, and check their encode half under
+validation separately.
+
 Run the ignored tests once without validation as well. The layer gives every
 object a unique handle, while drivers reuse the handles of destroyed objects
 freely, so anything that remembers state by handle can pass with validation

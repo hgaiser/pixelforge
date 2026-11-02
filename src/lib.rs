@@ -195,7 +195,7 @@
 //! [`StreamColor::Hdr10`] (BT.2020 with PQ), each with its range. The source
 //! and the stream are described once each, so the conversion and the
 //! stream's label cannot disagree, and a colour change through
-//! [`Encoder::set_color`] changes both.
+//! [`Encoder::reconfigure`] changes both.
 //!
 //! ```rust,no_run
 //! use pixelforge::{

@@ -6,7 +6,7 @@ use ash::vk;
 use super::codec::{CodecEncoder, EncoderCommon, VideoCodec};
 use super::frame::{Frame, FrameSource, InputSlot};
 use super::input::{FrameInput, FrameSync, SourceOwnership};
-use super::source::{Conversion, ConversionPreference, plan, target_space};
+use super::source::{Conversion, Source, plan};
 use super::source_image::SourceImage;
 use super::{Codec, EncodeConfig, EncodeFuture, StreamColor};
 use crate::converter::ColorConverter;
@@ -371,50 +371,61 @@ impl Encoder {
         self.inner.invalidate_reference_frames(local)
     }
 
-    /// Change what the stream says about its colours, and what the encoder
-    /// makes its YUV to match.
+    /// Change what the frames are and what the stream says about its
+    /// colours, together.
     ///
-    /// The next frame is an IDR/key frame carrying the new header. For an RGB
-    /// source the conversion follows: the colour converter gets the new target
-    /// and range, and where the encoder converts, it is made again with the
-    /// new matrix and range, since those are fixed in its video session.
-    /// Packet timestamps carry on across that. If the new colour needs a
-    /// different [`Conversion`], images imported or allocated for the old one
-    /// have to be made again.
+    /// Both decide the conversion, so they change in one call: there is no
+    /// moment where the new source meets the old colour, a pair the
+    /// conversion may not be able to do. A call that changes nothing does
+    /// nothing, so it is cheap to make for every frame.
     ///
-    /// On error the encoder is left as it was.
-    pub fn set_color(&mut self, color: StreamColor) -> Result<()> {
+    /// A new colour makes the next frame an IDR/key frame carrying the new
+    /// header. The conversion follows:
+    ///
+    /// - with [`Conversion::Shader`] kept, the colour converter switches in
+    ///   place;
+    /// - where the encoder converts, or the conversion changes, the codec
+    ///   encoder is made again, because its video session fixes the input
+    ///   format, matrix and range. Packet timestamps carry on across that.
+    ///
+    /// An `ExternalImage` made before a change of source or conversion has to
+    /// be made again. On error the encoder is left as it was.
+    pub fn reconfigure(&mut self, source: Source, color: StreamColor) -> Result<()> {
+        if (source, color) == (self.config.source, self.config.color) {
+            return Ok(());
+        }
         let mut config = self.config.clone();
+        config.source = source;
         config.color = color;
-        match self.conversion {
-            Conversion::None => self.inner.set_color(color)?,
-            Conversion::Shader if self.shader_still_converts(&config) => {
-                let (target, range) = target_space(&color).expect("the plan checked the target");
+        let next = plan(&self.context, &config)?;
+        match (self.conversion, next.conversion, next.converter) {
+            (Conversion::None, Conversion::None, _) => self.inner.set_color(color)?,
+            (Conversion::Shader, Conversion::Shader, Some(next_converter))
+                if self
+                    .converter
+                    .as_ref()
+                    .is_some_and(|c| c.can_become(&next_converter)) =>
+            {
                 let converter = self
                     .converter
                     .as_mut()
                     .expect("a shader conversion has a converter");
-                let (old_target, old_range) = (converter.config().target, converter.config().range);
-                converter.set_target(target)?;
-                converter.set_range(range);
-                if let Err(e) = self.inner.set_color(color) {
-                    let _ = converter.set_target(old_target);
-                    converter.set_range(old_range);
+                let old = converter.config().clone();
+                converter.reconfigure(next_converter)?;
+                if color != self.config.color
+                    && let Err(e) = self.inner.set_color(color)
+                {
+                    let _ = converter.reconfigure(old);
                     return Err(e);
                 }
+                if source != self.config.source {
+                    self.generation += 1;
+                }
             }
-            Conversion::Shader | Conversion::Encoder => self.rebuild(config.clone())?,
+            _ => self.rebuild(config.clone())?,
         }
         self.config = config;
         Ok(())
-    }
-
-    /// Whether the colour converter this encoder has can produce what
-    /// `config` describes, so the encoder can keep it.
-    fn shader_still_converts(&self, config: &EncodeConfig) -> bool {
-        let mut probe = config.clone();
-        probe.conversion = ConversionPreference::Shader;
-        plan(&self.context, &probe).is_ok()
     }
 
     /// Make the codec encoder again for `config`, keeping the timestamps
@@ -427,11 +438,12 @@ impl Encoder {
         next.id = self.id;
         // A slot taken before is not a slot of the new encoder.
         next.ticket = self.ticket + 1;
-        next.generation = if next.conversion == self.conversion {
-            self.generation
-        } else {
-            self.generation + 1
-        };
+        next.generation =
+            if (next.conversion, next.config.source) == (self.conversion, self.config.source) {
+                self.generation
+            } else {
+                self.generation + 1
+            };
         #[cfg(feature = "dmabuf")]
         {
             next.sync_files = self.sync_files.take();

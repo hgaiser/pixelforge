@@ -382,31 +382,35 @@ impl ColorConverter {
         self.output_buffer
     }
 
-    /// Change what the encoded stream should be, for subsequent conversions.
-    ///
-    /// Takes effect on the next conversion without recreating the pipeline,
-    /// since the target is passed via push constants.
-    ///
-    /// Returns an error, and leaves the converter untouched, if the configured
-    /// source cannot reach the new target.
-    pub fn set_target(&mut self, target: ColorSpec) -> Result<()> {
-        let candidate = ColorConverterConfig {
-            target,
-            ..self.config.clone()
-        };
-        if !candidate.conversion_supported() {
-            return Err(candidate.unsupported_conversion());
-        }
-        self.config.target = target;
-        Ok(())
+    /// Whether [`Self::reconfigure`] can switch this converter to `config`:
+    /// the same size and output, which its buffers are made for.
+    pub fn can_become(&self, config: &ColorConverterConfig) -> bool {
+        (config.width, config.height, config.output_format)
+            == (
+                self.config.width,
+                self.config.height,
+                self.config.output_format,
+            )
     }
 
-    /// Change the quantization range for subsequent conversions.
+    /// Switch to `config` for subsequent conversions: its input format,
+    /// source, target, range and reference white. They all reach the shader
+    /// as push constants, and the source view is made per conversion, so
+    /// nothing is made again.
     ///
-    /// Takes effect on the next conversion without recreating the pipeline,
-    /// since the range is passed via push constants.
-    pub fn set_range(&mut self, range: ColorRange) {
-        self.config.range = range;
+    /// Returns an error, and leaves the converter untouched, if the shader
+    /// cannot do that conversion or [`Self::can_become`] is false.
+    pub fn reconfigure(&mut self, config: ColorConverterConfig) -> Result<()> {
+        if !self.can_become(&config) {
+            return Err(PixelForgeError::InvalidInput(
+                "a converter cannot change its size or output format".to_string(),
+            ));
+        }
+        if !config.conversion_supported() {
+            return Err(config.unsupported_conversion());
+        }
+        self.config = config;
+        Ok(())
     }
 
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
