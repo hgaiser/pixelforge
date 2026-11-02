@@ -34,10 +34,6 @@ impl H264 {
         let profile = EncodeProfile::new(&config, rgb_input.is_some())?;
         let profile_info = profile.info();
 
-        // The driver's preferred entropy mode is H.264-specific (some require
-        // CAVLC for High 4:4:4 Predictive).
-        let preferred_entropy_cabac = query_preferred_entropy_cabac(&context, profile_info);
-
         // Query device capabilities with the H.264-specific capability struct
         // chained in (required by the driver).
         let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
@@ -51,6 +47,12 @@ impl H264 {
         }
         let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
         let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
+
+        // The driver's preferred entropy mode is H.264-specific (some require
+        // CAVLC for High 4:4:4 Predictive). Only after the capability query,
+        // which fails for an unsupported profile: a quality level query for one
+        // is invalid (VUID-VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR-pVideoProfile-08259).
+        let preferred_entropy_cabac = query_preferred_entropy_cabac(&context, profile_info);
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
