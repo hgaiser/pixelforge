@@ -129,23 +129,22 @@ impl RgbConversionCaps {
         // and a player that is not told assumes chroma sits on the left luma
         // sample of each pair, and midway between the two rows (H.264 and
         // H.265 chroma location type 0, which most AV1 players follow as well).
-        // Asking the hardware for exactly that keeps colour edges where the
-        // player will put them. A driver that cannot gets the other option.
-        let pick = |supported: Offset, preferred: Offset| {
-            if supported.contains(preferred) {
-                preferred
-            } else if supported.contains(Offset::COSITED_EVEN) {
-                Offset::COSITED_EVEN
-            } else {
-                Offset::MIDPOINT
-            }
-        };
+        // The hardware has to produce exactly that: a driver that can only
+        // site chroma elsewhere would shift color edges without the stream
+        // saying so, so it gets no RGB input and the caller converts instead.
+        let (x, y) = (Offset::COSITED_EVEN, Offset::MIDPOINT);
+        if !self.x_chroma_offsets.contains(x) || !self.y_chroma_offsets.contains(y) {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "RGB input: the driver sites chroma at {:?} x {:?}, not {x:?} x {y:?}, which the stream implies",
+                self.x_chroma_offsets, self.y_chroma_offsets
+            )));
+        }
         Ok(
             vk::VideoEncodeSessionRgbConversionCreateInfoVALVE::default()
                 .rgb_model(model)
                 .rgb_range(range)
-                .x_chroma_offset(pick(self.x_chroma_offsets, Offset::COSITED_EVEN))
-                .y_chroma_offset(pick(self.y_chroma_offsets, Offset::MIDPOINT)),
+                .x_chroma_offset(x)
+                .y_chroma_offset(y),
         )
     }
 }
@@ -219,5 +218,65 @@ impl VideoContext {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::VideoEncodeRgbChromaOffsetFlagsVALVE as Offset;
+    use vk::VideoEncodeRgbModelConversionFlagsVALVE as Model;
+    use vk::VideoEncodeRgbRangeCompressionFlagsVALVE as Range;
+
+    /// What RADV reports (Mesa radv_video.c): chroma cosited horizontally,
+    /// either way vertically.
+    fn radv() -> RgbConversionCaps {
+        RgbConversionCaps {
+            models: Model::YCBCR_709 | Model::YCBCR_2020,
+            ranges: Range::FULL_RANGE | Range::NARROW_RANGE,
+            x_chroma_offsets: Offset::COSITED_EVEN,
+            y_chroma_offsets: Offset::MIDPOINT | Offset::COSITED_EVEN,
+        }
+    }
+
+    #[test]
+    fn sites_chroma_where_the_stream_implies() {
+        let info = radv().session_info(&ColorDescription::bt709()).unwrap();
+        assert_eq!(info.x_chroma_offset, Offset::COSITED_EVEN);
+        assert_eq!(info.y_chroma_offset, Offset::MIDPOINT);
+        assert_eq!(info.rgb_model, Model::YCBCR_709);
+        assert_eq!(info.rgb_range, Range::NARROW_RANGE);
+    }
+
+    #[test]
+    fn refuses_other_chroma_siting() {
+        let midpoint_x = RgbConversionCaps {
+            x_chroma_offsets: Offset::MIDPOINT,
+            ..radv()
+        };
+        assert!(midpoint_x.session_info(&ColorDescription::bt709()).is_err());
+        let cosited_y = RgbConversionCaps {
+            y_chroma_offsets: Offset::COSITED_EVEN,
+            ..radv()
+        };
+        assert!(cosited_y.session_info(&ColorDescription::bt709()).is_err());
+    }
+
+    #[test]
+    fn refuses_an_unsupported_matrix_or_range() {
+        let no_2020 = RgbConversionCaps {
+            models: Model::YCBCR_709,
+            ..radv()
+        };
+        assert!(
+            no_2020
+                .session_info(&ColorDescription::bt2020_pq())
+                .is_err()
+        );
+        let full_only = RgbConversionCaps {
+            ranges: Range::FULL_RANGE,
+            ..radv()
+        };
+        assert!(full_only.session_info(&ColorDescription::bt709()).is_err());
     }
 }
