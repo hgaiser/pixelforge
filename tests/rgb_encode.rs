@@ -1,9 +1,9 @@
 //! Encoding an RGB [`Source`], through each [`Conversion`] the encoder can
 //! pick.
 //!
-//! With [`Conversion::Shader`] the encoder runs the colour converter itself,
-//! so its stream must be byte-identical to converting by hand and encoding
-//! the result. With [`Conversion::Encoder`] the encoder converts through
+//! With [`Conversion::Shader`] the encoder runs the colour converter itself;
+//! the crate's own tests check that it is byte-identical to converting by
+//! hand. With [`Conversion::Encoder`] the encoder converts through
 //! `VK_VALVE_video_encode_rgb_conversion`; those tests check that it lands
 //! where the shader does, and skip on devices without the extension, which
 //! today is everything but AMD under RADV.
@@ -16,10 +16,9 @@ use common::{Readback, decode_stream};
 use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec,
-    Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, Handoff,
-    InputFormat, OutputFormat, RateControlMode, RgbSource, Source, SourceImage, VideoContext,
-    VideoContextBuilder,
+    Codec, ColorDescription, ColorSpec, Conversion, ConversionPreference, EncodeBitDepth,
+    EncodeConfig, Encoder, Frame, Handoff, InputFormat, RateControlMode, RgbSource, Source,
+    SourceImage, VideoContext, VideoContextBuilder,
 };
 
 const WIDTH: u32 = 320;
@@ -37,18 +36,6 @@ fn context(codec: Codec) -> Result<VideoContext, Box<dyn std::error::Error>> {
     Ok(builder.build()?)
 }
 
-fn converter_config() -> ColorConverterConfig {
-    ColorConverterConfig::new(
-        WIDTH,
-        HEIGHT,
-        InputFormat::BGRA,
-        OutputFormat::NV12,
-        ColorSpec::Srgb,
-        ColorSpec::Srgb,
-        ColorRange::Limited,
-    )
-}
-
 /// A BGRA frame that moves with `n`.
 fn moving_frame(n: u32) -> Vec<u8> {
     let mut data = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
@@ -61,8 +48,7 @@ fn moving_frame(n: u32) -> Vec<u8> {
     data
 }
 
-/// Upload frame `n`. It is left in `GENERAL`, the layout [`Encoder::encode`]
-/// expects.
+/// Upload frame `n`. It is left in `GENERAL`.
 fn source(context: &VideoContext, n: u32) -> Result<SrcImage, Box<dyn std::error::Error>> {
     Ok(unsafe { create_src_image(context, WIDTH, HEIGHT, &moving_frame(n))? })
 }
@@ -78,7 +64,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         .with_quality_level(22)
         .with_frame_rate(30, 1)
         .with_b_frames(0)
-        .with_color_description(converter_config().color_description().unwrap())
+        .with_color_description(ColorDescription::bt709())
 }
 
 fn rgb(format: InputFormat) -> Source {
@@ -97,25 +83,6 @@ fn source_image(
             layout: vk::ImageLayout::GENERAL,
         },
     )
-}
-
-/// Encode the frames with a YUV encoder and a colour converter the test runs
-/// itself.
-fn encode_by_hand(
-    context: &VideoContext,
-    codec: Codec,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut encoder = Encoder::new(context.clone(), encode_config(codec))?;
-    let mut converter = ColorConverter::new(context.clone(), converter_config())?;
-    let mut stream = Vec::new();
-    for n in 0..FRAMES {
-        let src = source(context, n)?;
-        let slot = encoder.input_slot()?;
-        converter.convert(src.image, vk::ImageLayout::GENERAL, slot.image())?;
-        let packet = pollster::block_on(encoder.submit(Frame::input(slot))?)?;
-        stream.extend_from_slice(&packet.data);
-    }
-    Ok(stream)
 }
 
 /// Encode the frames with an RGB source and the given conversion.
@@ -172,35 +139,12 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// Whether the encoder can convert `format` for `codec` here; prints why a
 /// test is skipped when not.
 fn encoder_converts(context: &VideoContext, codec: Codec, test: &str) -> bool {
-    let desc = converter_config().color_description().unwrap();
+    let desc = ColorDescription::bt709();
     let ok = context.supports_rgb_encode_input(codec, InputFormat::BGRA, &desc);
     if !ok {
         eprintln!("skipping {test} for {codec:?}: the encoder cannot convert RGB here");
     }
     ok
-}
-
-/// The shader path inside the encoder does exactly what converting by hand
-/// does, so the streams match byte for byte.
-#[test]
-#[ignore = "requires a Vulkan Video device"]
-fn shader_source_matches_converting_by_hand() -> Result<(), Box<dyn std::error::Error>> {
-    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
-        let Ok(context) = context(codec) else {
-            eprintln!("{codec:?}: no encoder on this device");
-            continue;
-        };
-        let by_hand = encode_by_hand(&context, codec)?;
-        let shader = encode_rgb(
-            &context,
-            codec,
-            InputFormat::BGRA,
-            ConversionPreference::Shader,
-        )?;
-        assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
-        assert!(by_hand == shader, "{codec:?}: the streams differ");
-    }
-    Ok(())
 }
 
 /// `Auto` picks the encoder's own conversion exactly where it is available.
@@ -212,7 +156,7 @@ fn auto_picks_the_encoder_where_it_can() -> Result<(), Box<dyn std::error::Error
         context.clone(),
         encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
     )?;
-    let desc = converter_config().color_description().unwrap();
+    let desc = ColorDescription::bt709();
     let expected = if context.supports_rgb_encode_input(Codec::H264, InputFormat::BGRA, &desc) {
         Conversion::Encoder
     } else {
@@ -229,7 +173,15 @@ fn rgb_input_matches_the_converter() -> Result<(), Box<dyn std::error::Error>> {
     if !encoder_converts(&context, Codec::H264, "rgb_input_matches_the_converter") {
         return Ok(());
     }
-    let shader = decode_all(&context, &encode_by_hand(&context, Codec::H264)?)?;
+    let shader = decode_all(
+        &context,
+        &encode_rgb(
+            &context,
+            Codec::H264,
+            InputFormat::BGRA,
+            ConversionPreference::Shader,
+        )?,
+    )?;
     let hardware = decode_all(
         &context,
         &encode_rgb(

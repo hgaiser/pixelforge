@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Frame::image(&source_image)` for an image of the caller's,
   `Frame::input(encoder.input_slot()?)` for the input image written in place.
   An imported image that `UNDEFINED` used to mark is `Handoff::External`.
+- **Breaking:** `ColorConverter`, `ColorConverterConfig` and `OutputFormat`
+  are no longer public. Describe an RGB source with `Source::Rgb` instead, and
+  the encoder runs the converter itself, with the right target and range.
 - **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
   `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
   frames that read the image are done with it.

@@ -46,6 +46,9 @@ because no conversion produces it.
 work is an error from `Encoder::new`. `Encoder::conversion()` tells which path
 was selected.
 
+The colour converter is not public. An RGB source is the only way to use it,
+so its target and range always follow the stream's colour description.
+
 ### Colour changes
 
 `Encoder::set_color_description` is the one way to change colour:

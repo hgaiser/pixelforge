@@ -19,8 +19,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, Encoder, Frame,
-    InputFormat, OutputFormat, RateControlMode, TimelinePoint,
+    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, InputFormat,
+    RateControlMode, RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -228,24 +228,22 @@ fn moving_frame(n: u32) -> Vec<u8> {
     data
 }
 
-/// How [`encode_all`] hands each frame from the converter to the encoder.
+/// How [`encode_all`] orders each frame against the caller's rendering.
 #[derive(Clone, Copy, PartialEq)]
-enum Handoff {
-    /// `convert`, which waits on the CPU, then `encode`.
+enum Wait {
+    /// Each frame is submitted once rendered, and its source is waited for
+    /// on the CPU before the next one.
     Cpu,
-    /// `convert_async` waiting on a point the caller signals, then
-    /// `encode_after` waiting on the conversion: ordered on the GPU, with
-    /// nothing waited for on the CPU until the packets are collected.
+    /// Each frame waits on the GPU for a point the caller signals only after
+    /// the submission: the conversion has to wait for it, and nothing waits
+    /// on the CPU until the packets are collected.
     Gpu,
 }
 
-/// Convert and encode `ENCODE_FRAMES` frames as H.264 on `context`, the way a
-/// capture pipeline would: an RGB image goes through the colour converter
-/// straight into the encoder's input.
-fn encode_all(
-    context: &VideoContext,
-    handoff: Handoff,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+/// Encode `ENCODE_FRAMES` RGB frames as H.264 on `context`, the way a capture
+/// pipeline would: the encoder converts each one with the colour converter's
+/// shader, straight into its input image.
+fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let device = context.device();
     let mut encoder = Encoder::new(
         context.clone(),
@@ -253,24 +251,17 @@ fn encode_all(
             .with_rate_control(RateControlMode::Cqp)
             .with_quality_level(22)
             .with_frame_rate(30, 1)
-            .with_b_frames(0),
-    )?;
-    let mut converter = ColorConverter::new(
-        context.clone(),
-        ColorConverterConfig::new(
-            ENCODE_WIDTH,
-            ENCODE_HEIGHT,
-            InputFormat::BGRA,
-            OutputFormat::NV12,
-            ColorSpec::Srgb,
-            ColorSpec::Srgb,
-            ColorRange::Limited,
-        ),
+            .with_b_frames(0)
+            .with_source(Source::Rgb(RgbSource::new(
+                InputFormat::BGRA,
+                ColorSpec::Srgb,
+            )))
+            .with_conversion(ConversionPreference::Shader),
     )?;
 
-    // Stands in for the caller's own rendering: each frame's conversion waits
-    // for a value the "renderer" signals once the frame is ready. The KHR
-    // entry points, since the adopted device is Vulkan 1.1.
+    // Stands in for the caller's own rendering: each frame waits for a value
+    // the "renderer" signals once the frame is ready. The KHR entry points,
+    // since the adopted device is Vulkan 1.1.
     let timeline_fns = ash::khr::timeline_semaphore::Device::load(context.instance(), device);
     let mut type_info = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -282,33 +273,32 @@ fn encode_all(
         )?
     };
 
-    // Signalled after the converter is dropped, see the last encode below.
-    let after_drop = u64::from(ENCODE_FRAMES) + 1;
-
-    // Every source stays alive until the end: with a GPU handoff nothing says
-    // a conversion has finished reading one until its packet is back.
+    // Every source stays alive until the end. The images are dropped after
+    // their `SourceImage`s, which wait for the frames that read them.
+    let mut images = Vec::new();
     let mut sources = Vec::new();
     let mut pending = Vec::new();
     for n in 0..ENCODE_FRAMES {
-        let src =
+        let image =
             unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
-        let slot = encoder.input_slot()?;
-        let target = slot.image();
-        let future = match handoff {
-            Handoff::Cpu => {
-                converter.convert(src.image, vk::ImageLayout::GENERAL, target)?;
-                encoder.submit(Frame::input(slot))?
+        let source = SourceImage::new(
+            context,
+            image.image,
+            Handoff::Device {
+                layout: vk::ImageLayout::GENERAL,
+            },
+        )?;
+        let future = match wait {
+            Wait::Cpu => {
+                let future = encoder.submit(Frame::image(&source))?;
+                source.wait_released()?;
+                future
             }
-            Handoff::Gpu => {
+            Wait::Gpu => {
                 let ready = TimelinePoint::new(rendered, u64::from(n) + 1);
-                let converted = converter.convert_async(
-                    src.image,
-                    vk::ImageLayout::GENERAL,
-                    target,
-                    &[ready],
-                )?;
-                // Signalled only after the conversion was submitted, so it
-                // really has to wait.
+                let future = encoder.submit(Frame::image(&source).wait(&[ready]))?;
+                // Signalled only after the frame was submitted, so it really
+                // has to wait.
                 unsafe {
                     timeline_fns.signal_semaphore(
                         &vk::SemaphoreSignalInfo::default()
@@ -316,38 +306,20 @@ fn encode_all(
                             .value(ready.value),
                     )?
                 };
-                // The last encode also waits for a point signalled only once
-                // the converter is gone, so it is certainly still queued,
-                // waiting on the converter's semaphore, when that happens.
-                let mut waits = vec![converted];
-                if n + 1 == ENCODE_FRAMES {
-                    waits.push(TimelinePoint::new(rendered, after_drop));
-                }
-                encoder.submit(Frame::input(slot).wait(&waits))?
+                future
             }
         };
-        sources.push(src);
+        images.push(image);
+        sources.push(source);
         pending.push(future);
-    }
-    // Dropped while an encode that waits on its points is still queued, as a
-    // caller rebuilding its converter might: its semaphore has to outlive
-    // that wait.
-    drop(converter);
-    if matches!(handoff, Handoff::Gpu) {
-        unsafe {
-            timeline_fns.signal_semaphore(
-                &vk::SemaphoreSignalInfo::default()
-                    .semaphore(rendered)
-                    .value(after_drop),
-            )?
-        };
     }
     let mut stream = Vec::new();
     for future in pending {
         stream.extend_from_slice(&pollster::block_on(future)?.data);
     }
-    drop(encoder);
     drop(sources);
+    drop(encoder);
+    drop(images);
     unsafe { device.destroy_semaphore(rendered, None) };
     Ok(stream)
 }
@@ -377,7 +349,7 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .require_encode(Codec::H264)
         .require_decode(Codec::H264)
         .build()?;
-    let expected = encode_all(&own, Handoff::Cpu)?;
+    let expected = encode_all(&own, Wait::Cpu)?;
 
     let (entry, instance) = instance_1_1()?;
     let builder = VideoContextBuilder::new().require_encode(Codec::H264);
@@ -398,7 +370,7 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
             app.physical_device,
             app.device.clone(),
         )?;
-    let actual = encode_all(&context, Handoff::Gpu)?;
+    let actual = encode_all(&context, Wait::Gpu)?;
     drop(context);
 
     // Both streams decoded by the same decoder, so any difference is the

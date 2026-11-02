@@ -254,9 +254,6 @@ default, see [`ColorSpec::reference_white_nits`], overridable with
 
 Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 
-[`ColorConverter`] is the same shader on its own, for converting without
-encoding.
-
 ### Submitting frames
 
 [`Encoder::submit`] is the one way to encode a frame. It takes a [`Frame`]:

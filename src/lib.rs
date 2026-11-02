@@ -251,9 +251,6 @@
 //!
 //! Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 //!
-//! [`ColorConverter`] is the same shader on its own, for converting without
-//! encoding.
-//!
 //! ## Submitting frames
 //!
 //! [`Encoder::submit`] is the one way to encode a frame. It takes a [`Frame`]:
@@ -378,6 +375,10 @@
 //! This project was heavily inspired by the [vk_video_samples](https://github.com/nvpro-samples/vk_video_samples)
 //! repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.
 
+// The device tests share `tests/common/source.rs`, which names the crate.
+#[cfg(test)]
+extern crate self as pixelforge;
+
 pub mod converter;
 pub mod decoder;
 pub mod encoder;
@@ -395,9 +396,7 @@ pub(crate) const fn align4(size: usize) -> usize {
     (size + 3) & !3
 }
 
-pub use converter::{
-    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, InputFormat, OutputFormat,
-};
+pub use converter::{ColorRange, ColorSpec, InputFormat};
 pub use decoder::{
     DecodeConfig, DecodeSink, DecodeSource, DecodeStatus, DecodedFrame, Decoder, FramePoll, Framing,
 };

@@ -15,11 +15,10 @@ use crate::sync::TimelinePoint;
 use crate::video::TimelineChain;
 use crate::vulkan::VideoContext;
 use ash::vk;
-use tracing::debug;
 
 /// A colour space, used for both ends of a conversion:
-/// [`ColorConverterConfig::source`] for the input and
-/// [`ColorConverterConfig::target`] for the encoded output.
+/// [`RgbSource::color`](crate::RgbSource::color) for the input, and the
+/// stream's colour description for the encoded output.
 ///
 /// The two linear spaces can only be an input. Video files have no way to say
 /// "linear", so nothing could be decoded correctly; see
@@ -56,7 +55,7 @@ impl ColorSpec {
     ///
     /// `None` for `Bt2020Pq`, which already carries real brightness values.
     /// Override it with
-    /// [`ColorConverterConfig::with_reference_white_nits`].
+    /// [`RgbSource::with_reference_white_nits`](crate::RgbSource::with_reference_white_nits).
     pub fn reference_white_nits(&self) -> Option<f32> {
         match self {
             Self::Srgb | Self::Bt2020Linear => Some(203.0),
@@ -76,7 +75,7 @@ impl ColorSpec {
     /// What to tell a player about video in this space.
     ///
     /// `None` when [`Self::is_encodable`] is false. The range is set
-    /// separately, by [`ColorConverterConfig::color_description`].
+    /// separately.
     pub fn color_description(&self) -> Option<ColorDescription> {
         match self {
             // sRGB and BT.709 differ slightly in their curves, but video
@@ -157,10 +156,12 @@ impl InputFormat {
 
 /// Supported output YUV formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     /// NV12: Y plane followed by interleaved UV (4:2:0), 8-bit.
     NV12,
-    /// I420: Y plane, U plane, V plane (4:2:0), 8-bit.
+    /// I420: Y plane, U plane, V plane (4:2:0), 8-bit. The shader has the
+    /// mode, and no encoder input takes it.
+    #[allow(dead_code)]
     I420,
     /// YUV444 8-bit: 2-plane semi-planar (Y plane + interleaved UV) at full resolution.
     YUV444,
@@ -193,23 +194,14 @@ impl OutputFormat {
         crate::align4(raw)
     }
 
-    /// Get the Vulkan format for this output format.
-    pub fn vulkan_format(&self) -> vk::Format {
-        match self {
-            OutputFormat::NV12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            OutputFormat::I420 => vk::Format::G8_B8_R8_3PLANE_420_UNORM,
-            OutputFormat::YUV444 => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-            OutputFormat::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
-            OutputFormat::YUV444P10 => vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
-        }
-    }
-
     /// Returns true if this is a 10-bit format.
+    #[cfg(test)]
     pub fn is_10bit(&self) -> bool {
         matches!(self, OutputFormat::P010 | OutputFormat::YUV444P10)
     }
 
     /// Bytes per sample for this format.
+    #[cfg(test)]
     pub fn bytes_per_sample(&self) -> usize {
         if self.is_10bit() { 2 } else { 1 }
     }
@@ -221,7 +213,7 @@ impl OutputFormat {
 /// are, [`target`](Self::target) for what the encoded stream should be.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct ColorConverterConfig {
+pub(crate) struct ColorConverterConfig {
     /// Input frame width.
     pub width: u32,
     /// Input frame height.
@@ -270,54 +262,14 @@ impl ColorConverterConfig {
         }
     }
 
-    /// Override how bright the source's white is, in nits.
-    ///
-    /// Rarely needed; each space already has a sensible default, see
-    /// [`ColorSpec::reference_white_nits`].
-    pub fn with_reference_white_nits(mut self, nits: f32) -> Self {
-        self.reference_white_nits = Some(nits);
-        self
-    }
-
     /// The value the shader gets: the override, or the source's default.
     fn effective_reference_white_nits(&self) -> f32 {
         self.reference_white_nits
             .or_else(|| self.source.reference_white_nits())
             .unwrap_or(0.0)
     }
-
-    /// What to tell the encoder about the colours this conversion produces,
-    /// for
-    /// [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description).
-    ///
-    /// Taken from [`target`](Self::target) and [`range`](Self::range), so the
-    /// stream cannot end up describing something the shader did not write.
-    ///
-    /// `None` when the target is one [`ColorConverter::new`] would reject
-    /// anyway. [`ColorConverter::color_description`] gives the same answer
-    /// without the `Option`.
-    ///
-    /// ```no_run
-    /// use pixelforge::{
-    ///     ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, InputFormat, OutputFormat,
-    /// };
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let conv = ColorConverterConfig::new(
-    ///     1920,
-    ///     1080,
-    ///     InputFormat::BGRA,
-    ///     OutputFormat::P010,
-    ///     ColorSpec::Bt709Linear,
-    ///     ColorSpec::Bt2020Pq,
-    ///     ColorRange::Full,
-    /// );
-    ///
-    /// let enc = EncodeConfig::h265(1920, 1080)
-    ///     .with_color_description(conv.color_description().expect("PQ is encodable"));
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// The stream colour this configuration converts to.
+    #[cfg(test)]
     pub fn color_description(&self) -> Option<ColorDescription> {
         Some(
             self.target
@@ -360,7 +312,7 @@ impl ColorConverterConfig {
 ///
 /// Uses Vulkan compute shaders to convert RGB/BGR formats to YUV.
 /// with minimal latency and high throughput.
-pub struct ColorConverter {
+pub(crate) struct ColorConverter {
     context: VideoContext,
     config: ColorConverterConfig,
 
@@ -394,7 +346,7 @@ pub struct ColorConverter {
     /// next conversion reuses the command buffer and output buffer, and
     /// destroys this one's source view, so it waits for this one first.
     in_flight: bool,
-    /// Signalled by each conversion, for [`Self::convert_async`] to hand out.
+    /// Signalled by each conversion, for [`Self::convert_with`] to hand out.
     timeline: TimelineChain,
 }
 
@@ -411,18 +363,8 @@ impl ColorConverter {
         pipeline::create_converter(context, config)
     }
 
-    /// Get the video context.
-    ///
-    /// Returns a reference to the VideoContext used by this converter.
-    pub fn context(&self) -> &VideoContext {
-        &self.context
-    }
-
-    /// What to tell the encoder about the colours this converter produces, for
-    /// [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description).
-    ///
-    /// [`ColorConverterConfig::color_description`] without the `Option`: this
-    /// converter exists, so its target was already checked.
+    /// The stream colour this converter produces.
+    #[cfg(test)]
     pub fn color_description(&self) -> ColorDescription {
         self.config
             .color_description()
@@ -434,47 +376,19 @@ impl ColorConverter {
         &self.config
     }
 
-    /// Get the output buffer.
-    ///
-    /// Returns the Vulkan buffer containing raw YUV data.
-    /// This is useful for direct GPU-to-GPU transfers.
+    /// The buffer the shader writes the YUV planes to.
+    #[cfg(test)]
     pub fn output_buffer(&self) -> vk::Buffer {
         self.output_buffer
     }
 
-    /// Change what the input pixels are, for subsequent conversions.
-    ///
-    /// Takes effect on the next `convert()` without recreating the pipeline,
-    /// since the source is passed via push constants.
-    ///
-    /// Returns an error, and leaves the converter untouched, if the new source
-    /// cannot reach the configured target.
-    pub fn set_source(&mut self, source: ColorSpec) -> Result<()> {
-        let candidate = ColorConverterConfig {
-            source,
-            ..self.config.clone()
-        };
-        if !candidate.conversion_supported() {
-            return Err(candidate.unsupported_conversion());
-        }
-        self.config.source = source;
-        Ok(())
-    }
-
     /// Change what the encoded stream should be, for subsequent conversions.
     ///
-    /// Takes effect on the next `convert()` without recreating the pipeline,
+    /// Takes effect on the next conversion without recreating the pipeline,
     /// since the target is passed via push constants.
     ///
     /// Returns an error, and leaves the converter untouched, if the configured
     /// source cannot reach the new target.
-    ///
-    /// The target is half of what [`ColorConverterConfig::color_description`]
-    /// derives from, so an encoder told about the old one is now describing the
-    /// wrong signal. Pass the new description to
-    /// [`Encoder::set_color_description`](crate::Encoder::set_color_description),
-    /// which rebuilds the session parameters and makes the next frame an IDR
-    /// carrying the updated header.
     pub fn set_target(&mut self, target: ColorSpec) -> Result<()> {
         let candidate = ColorConverterConfig {
             target,
@@ -489,10 +403,8 @@ impl ColorConverter {
 
     /// Change the quantization range for subsequent conversions.
     ///
-    /// Takes effect on the next `convert()` without recreating the pipeline,
-    /// since the range is passed via push constants. The range is the other
-    /// half of [`ColorConverterConfig::color_description`], so the same
-    /// re-declaration as [`Self::set_target`] applies.
+    /// Takes effect on the next conversion without recreating the pipeline,
+    /// since the range is passed via push constants.
     pub fn set_range(&mut self, range: ColorRange) {
         self.config.range = range;
     }
@@ -741,86 +653,14 @@ impl ColorConverter {
         }
     }
 
-    /// Convert an input image directly to a target image (zero-copy encoder path).
+    /// Convert `src_image` into `target_image`, the encoder's input image,
+    /// which is left in `VIDEO_ENCODE_SRC_KHR` layout.
     ///
-    /// This is the most efficient path for encoding: it converts the source image.
-    /// directly into the encoder's input image, eliminating an intermediate copy.
-    ///
-    /// The target image must:
-    /// - Have the same dimensions as the converter's configuration
-    /// - Be in a format compatible with NV12/YUV (G8_B8R8_2PLANE_420_UNORM)
-    /// - Have TRANSFER_DST usage flag
-    ///
-    /// After this call, the target image will be in VIDEO_ENCODE_SRC_KHR layout,
-    /// ready for encoding.
-    ///
-    /// # Arguments
-    /// * `src_image` - Source RGB/BGR image (e.g., from DMA-BUF import)
-    /// * `src_layout` - Current layout of the source image (e.g., `GENERAL` for cached
-    ///   imports, `UNDEFINED` for first-time imports that haven't been transitioned yet)
-    /// * `target_image` - Target image to write YUV data to (e.g., encoder's input_image)
-    ///
-    /// # Returns
-    /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
-    pub fn convert(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        target_image: vk::Image,
-    ) -> Result<()> {
-        let start = std::time::Instant::now();
-        self.convert_async(src_image, src_layout, target_image, &[])?;
-        self.wait_idle()?;
-        debug!("ColorConverter::convert() took {:?}", start.elapsed());
-        Ok(())
-    }
-
-    /// Convert like [`Self::convert`], but without waiting on the CPU.
-    ///
-    /// The conversion waits on the GPU for every point in `wait` before
-    /// reading `src_image`, and returns the point it signals when done. Pass
-    /// that to [`Frame::wait`](crate::Frame::wait) to
-    /// encode the result, and wait on it before writing `src_image` again.
-    ///
-    /// On a device shared with the caller, where the caller renders or copies
-    /// into `src_image` itself, this is the whole handover: the caller's
-    /// submission signals a [`TimelinePoint`], the conversion waits on it, the
-    /// encode waits on the conversion. If the caller's queue is in another
-    /// family than [`VideoContext::compute_queue_family`], create `src_image`
-    /// with `VK_SHARING_MODE_CONCURRENT` across both, and pass the layout it
-    /// is actually in as `src_layout`: `UNDEFINED` is taken to mean a
-    /// first-time external-memory import and acquires ownership from
-    /// `VK_QUEUE_FAMILY_EXTERNAL`, which an image that never left the device
-    /// does not have to give.
-    ///
-    /// The next call to either method waits for this conversion to finish
-    /// before recording, since both reuse the same command buffer.
-    pub fn convert_async(
-        &mut self,
-        src_image: vk::Image,
-        src_layout: vk::ImageLayout,
-        target_image: vk::Image,
-        wait: &[TimelinePoint],
-    ) -> Result<TimelinePoint> {
-        let waits: Vec<vk::SemaphoreSubmitInfo<'static>> =
-            wait.iter().map(TimelinePoint::wait_info).collect();
-        self.convert_with(
-            src_image,
-            SourceOwnership {
-                old_layout: src_layout,
-                acquire_from: (src_layout == vk::ImageLayout::UNDEFINED)
-                    .then_some(vk::QUEUE_FAMILY_EXTERNAL),
-                release_to: None,
-                final_layout: vk::ImageLayout::GENERAL,
-            },
-            target_image,
-            &waits,
-            &[],
-        )
-    }
-
-    /// [`Self::convert_async`] with the source's ownership transfers spelled
-    /// out, and extra semaphores to wait on and signal.
+    /// The conversion waits for `waits` on the GPU, acquires and releases the
+    /// source as `ownership` says, signals `extra_signals` with its own
+    /// timeline, and returns the point it signals when done. The next call
+    /// waits for this conversion to finish before recording, since every
+    /// call reuses the same command buffer.
     pub(crate) fn convert_with(
         &mut self,
         src_image: vk::Image,
@@ -1166,6 +1006,9 @@ impl Drop for ColorConverter {
 }
 
 #[cfg(test)]
+mod device_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1281,7 +1124,8 @@ mod tests {
         assert_eq!(base.reference_white_nits, None);
         assert_eq!(base.effective_reference_white_nits(), 80.0);
 
-        let overridden = base.clone().with_reference_white_nits(203.0);
+        let mut overridden = base.clone();
+        overridden.reference_white_nits = Some(203.0);
         assert_eq!(overridden.effective_reference_white_nits(), 203.0);
         // The space itself is untouched; the override lives on the conversion.
         assert_eq!(overridden.source, ColorSpec::Bt709Linear);

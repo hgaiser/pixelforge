@@ -119,9 +119,12 @@ run it after touching submission or barrier code.
 
 An RGB source (`Source::Rgb`) is converted by the encoder itself
 (`Conversion::Encoder`) only with `VK_VALVE_video_encode_rgb_conversion`,
-which today only RADV has. `tests/rgb_encode.rs` checks the shader path
-everywhere (byte-identical to converting by hand), and on RADV compares the
-encoder's conversion against it and checks that `supports_rgb_encode_input`
+which today only RADV has. The colour converter is crate-private, so its
+device tests are in the crate (`src/converter/device_tests.rs`, run with
+`cargo test --lib -- --ignored`): they check the shader against the same maths
+on the CPU, and the shader path inside the encoder against converting by hand
+(byte-identical). `tests/rgb_encode.rs` on RADV compares the encoder's
+conversion against the shader's and checks that `supports_rgb_encode_input`
 agrees with encoder creation, so a green run elsewhere says little about the
 encoder path. Under validation that path draws two messages that are the
 layer's, not pixelforge's: the layer does not model that extension, so it
