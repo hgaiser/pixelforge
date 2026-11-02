@@ -10,7 +10,7 @@ use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h264_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::error::{PixelForgeError, Result};
+use crate::error::Result;
 use crate::vulkan::VideoContext;
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -23,16 +23,6 @@ impl H264 {
         config: EncodeConfig,
         rgb_input: Option<InputFormat>,
     ) -> Result<CodecEncoder<Self>> {
-        // B-frames are not yet supported. `with_b_frames` is public and accepts
-        // any count, so this is reachable from safe caller code: report it
-        // rather than panicking inside the library.
-        if config.b_frame_count != 0 {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.264 encode: B-frames are not yet supported; set b_frame_count = 0 (got {})",
-                config.b_frame_count
-            )));
-        }
-
         info!(
             "Creating H.264 encoder: {}x{}, pixel_format={:?}",
             config.dimensions.width, config.dimensions.height, config.pixel_format

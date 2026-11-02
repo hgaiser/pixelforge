@@ -128,15 +128,11 @@ fn run_encode_test(
     })
     .with_frame_rate(60, 1)
     .with_gop_size(120)
-    .with_b_frames(0)
     .with_encode_content_hint(pixelforge::EncodeContentHint::Rendered)
     .with_encode_usage_hint(pixelforge::EncodeUsageHint::Streaming)
     .with_encoder_tuning_mode(tuning_mode);
 
-    println!(
-        "Config: {:?}, GOP={}, B-frames={}",
-        config.rate_control, config.gop_size, config.b_frame_count
-    );
+    println!("Config: {:?}, GOP={}", config.rate_control, config.gop_size);
 
     // Create input image for uploading frames.
     let mut input_image = InputImage::new(

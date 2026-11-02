@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a peak below the target. `RateControlMode::Disabled` was the same as
   `Cqp` and is gone. `DEFAULT_TARGET_BITRATE` and `DEFAULT_MAX_BITRATE` are
   removed; `DEFAULT_AV1_Q_INDEX` is added.
+- **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
+  field are removed. No codec encodes B-frames yet, and every encoder refused
+  a count above 0 at runtime.
 - **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
   `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
   frames that read the image are done with it.

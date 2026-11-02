@@ -7,7 +7,7 @@ use crate::encoder::codec::{
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::error::{PixelForgeError, Result};
+use crate::error::Result;
 use crate::vulkan::VideoContext;
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -20,15 +20,6 @@ impl Av1 {
         config: EncodeConfig,
         rgb_input: Option<InputFormat>,
     ) -> Result<CodecEncoder<Self>> {
-        // Reachable from safe caller code via `with_b_frames`, so report it
-        // rather than panicking inside the library.
-        if config.b_frame_count != 0 {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "AV1 encode: B-frames are not yet supported; set b_frame_count = 0 (got {})",
-                config.b_frame_count
-            )));
-        }
-
         info!(
             "Creating AV1 encoder: {}x{}, pixel_format={:?}",
             config.dimensions.width, config.dimensions.height, config.pixel_format

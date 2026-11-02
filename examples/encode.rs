@@ -94,12 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config
         .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
-        .with_gop_size(30)
-        .with_b_frames(0);
+        .with_gop_size(30);
 
     println!(
-        "Config: {:?}, GOP={}, B-frames={}\n",
-        config.rate_control, config.gop_size, config.b_frame_count
+        "Config: {:?}, GOP={}\n",
+        config.rate_control, config.gop_size
     );
 
     // Create input image for uploading frames.

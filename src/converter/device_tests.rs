@@ -189,16 +189,13 @@ fn encoders(
 ) -> Result<(Encoder, Option<Encoder>), Box<dyn std::error::Error>> {
     let eight = Encoder::new(
         context.clone(),
-        EncodeConfig::h264(WIDTH, HEIGHT)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
+        EncodeConfig::h264(WIDTH, HEIGHT).with_frame_rate(30, 1),
     )?;
     let ten = Encoder::new(
         context.clone(),
         EncodeConfig::h265(WIDTH, HEIGHT)
             .with_bit_depth(EncodeBitDepth::Ten)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
+            .with_frame_rate(30, 1),
     )
     .ok();
     if ten.is_none() {
@@ -525,7 +522,6 @@ fn encode_config(codec: Codec) -> EncodeConfig {
     }
     .with_rate_control(RateControl::Cqp { qp: 22 })
     .with_frame_rate(30, 1)
-    .with_b_frames(0)
     .with_color(StreamColor::default())
 }
 

@@ -23,15 +23,6 @@ impl H265 {
         config: EncodeConfig,
         rgb_input: Option<InputFormat>,
     ) -> Result<CodecEncoder<Self>> {
-        // Reachable from safe caller code via `with_b_frames`, so report it
-        // rather than panicking inside the library.
-        if config.b_frame_count != 0 {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.265 encode: B-frames are not yet supported; set b_frame_count = 0 (got {})",
-                config.b_frame_count
-            )));
-        }
-
         info!(
             "Creating H.265 encoder: {}x{}, pixel_format={:?}",
             config.dimensions.width, config.dimensions.height, config.pixel_format

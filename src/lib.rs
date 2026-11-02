@@ -24,7 +24,7 @@
 //!   for it, read with no copy where the driver allows, with sync_file fences
 //!   (Linux only).
 //!
-//! > **Note**: B-frame support is not yet implemented. Setting `b_frame_count > 0` will panic.
+//! > **Note**: B-frame encoding is not yet implemented, so there is no option for it.
 //!
 //! # Supported Codecs
 //!

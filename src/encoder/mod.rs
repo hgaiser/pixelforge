@@ -410,8 +410,9 @@ pub struct EncodeConfig {
     pub frame_rate_denominator: u32,
     /// GOP size (distance between IDR frames).
     pub gop_size: u32,
-    /// Number of consecutive B-frames.
-    pub b_frame_count: u32,
+    /// Number of consecutive B-frames. Always 0: no codec encodes B-frames
+    /// yet, so there is no setter.
+    pub(crate) b_frame_count: u32,
     /// Maximum number of reference frames.
     pub max_reference_frames: u32,
     /// VBV/HRD virtual buffer size in milliseconds, for
@@ -554,12 +555,6 @@ impl EncodeConfig {
     /// Set the GOP size.
     pub fn with_gop_size(mut self, size: u32) -> Self {
         self.gop_size = size;
-        self
-    }
-
-    /// Set the number of B-frames.
-    pub fn with_b_frames(mut self, count: u32) -> Self {
-        self.b_frame_count = count;
         self
     }
 
@@ -858,13 +853,6 @@ mod tests {
         }
 
         #[test]
-        fn test_with_b_frames() {
-            let config = EncodeConfig::h264(1920, 1080).with_b_frames(2);
-
-            assert_eq!(config.b_frame_count, 2);
-        }
-
-        #[test]
         fn test_with_max_reference_frames() {
             let config = EncodeConfig::h264(1920, 1080).with_max_reference_frames(8);
 
@@ -911,7 +899,6 @@ mod tests {
                     max: 10_000_000,
                 })
                 .with_gop_size(120)
-                .with_b_frames(2)
                 .with_frame_rate(60, 1)
                 .with_pixel_format(PixelFormat::Yuv420)
                 .with_bit_depth(BitDepth::Eight);
@@ -924,7 +911,6 @@ mod tests {
                 }
             );
             assert_eq!(config.gop_size, 120);
-            assert_eq!(config.b_frame_count, 2);
             assert_eq!(config.frame_rate_numerator, 60);
         }
     }

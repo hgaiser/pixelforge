@@ -107,8 +107,7 @@ fn run_codec(
     .with_pixel_format(PixelFormat::Yuv420)
     .with_bit_depth(EncodeBitDepth::Eight)
     // Infinite GOP so the recovery can only come from RFI, never a periodic IDR.
-    .with_gop_size(0)
-    .with_b_frames(0);
+    .with_gop_size(0);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
     let mut input_image = InputImage::new(

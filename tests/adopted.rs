@@ -250,7 +250,6 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
         EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT)
             .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
-            .with_b_frames(0)
             .with_source(Source::Rgb(RgbSource::new(
                 InputFormat::BGRA,
                 ColorSpec::Srgb,

@@ -62,7 +62,6 @@ fn encode_config(codec: Codec) -> EncodeConfig {
     config
         .with_rate_control(RateControl::Cqp { qp: 22 })
         .with_frame_rate(30, 1)
-        .with_b_frames(0)
         .with_color(StreamColor::default())
 }
 

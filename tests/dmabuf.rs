@@ -39,7 +39,6 @@ fn config(codec: Codec, width: u32, height: u32) -> EncodeConfig {
         Codec::AV1 => EncodeConfig::av1(width, height),
     }
     .with_rate_control(RateControl::Cqp { qp: 22 })
-    .with_b_frames(0)
 }
 
 /// An NV12 frame that moves with `n`.
