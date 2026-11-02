@@ -274,11 +274,7 @@ impl H265 {
         };
 
         let rc = RateControlPlan::new(&common.config, 26);
-        let constant_qp = if rc.is_disabled() {
-            common.config.quality_level as i32
-        } else {
-            0
-        };
+        let constant_qp = if rc.is_disabled() { rc.qp as i32 } else { 0 };
         let nalu_slice_entries = [vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
             .constant_qp(constant_qp)
             .std_slice_segment_header(&slice_header)];

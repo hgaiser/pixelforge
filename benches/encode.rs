@@ -10,7 +10,7 @@
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, Frame, InputImage,
-    PixelFormat, RateControlMode, VideoContextBuilder,
+    PixelFormat, RateControl, VideoContextBuilder,
 };
 use std::fs::File;
 use std::io::Read;
@@ -122,12 +122,10 @@ fn run_encode_test(
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     }
     .with_rate_control(if matches!(tuning_mode, EncoderTuningMode::Lossless) {
-        RateControlMode::Cqp
+        RateControl::default_for(codec)
     } else {
-        RateControlMode::Cbr
+        RateControl::Cbr { bitrate: 8_000_000 }
     })
-    .with_target_bitrate(8_000_000)
-    .with_max_bitrate(12_000_000)
     .with_frame_rate(60, 1)
     .with_gop_size(120)
     .with_b_frames(0)
@@ -136,8 +134,8 @@ fn run_encode_test(
     .with_encoder_tuning_mode(tuning_mode);
 
     println!(
-        "Config: {:?}, bitrate={}, GOP={}, B-frames={}",
-        config.rate_control_mode, config.target_bitrate, config.gop_size, config.b_frame_count
+        "Config: {:?}, GOP={}, B-frames={}",
+        config.rate_control, config.gop_size, config.b_frame_count
     );
 
     // Create input image for uploading frames.

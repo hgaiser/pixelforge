@@ -22,7 +22,7 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 
@@ -57,8 +57,7 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
     let frame_count = yuv.len() / frame_size;
 
     let config = EncodeConfig::h264(WIDTH, HEIGHT)
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(26)
+        .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
         .with_gop_size(GOP)
         .with_b_frames(B_FRAMES);

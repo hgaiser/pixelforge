@@ -20,7 +20,7 @@ use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
     ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, InputFormat,
-    RateControlMode, RgbSource, Source, SourceImage, TimelinePoint,
+    RateControl, RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -248,8 +248,7 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
     let mut encoder = Encoder::new(
         context.clone(),
         EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_quality_level(22)
+            .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
             .with_b_frames(0)
             .with_source(Source::Rgb(RgbSource::new(

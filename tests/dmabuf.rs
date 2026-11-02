@@ -19,7 +19,7 @@ use pixelforge::encoder::external::drm_format;
 use pixelforge::{
     Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufPlane, EncodeBitDepth,
     EncodeConfig, Encoder, ExternalImage, Frame, Handoff, InputFormat, InputImage, PixelFormat,
-    RateControlMode, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    RateControl, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -38,8 +38,7 @@ fn config(codec: Codec, width: u32, height: u32) -> EncodeConfig {
         Codec::H265 => EncodeConfig::h265(width, height),
         Codec::AV1 => EncodeConfig::av1(width, height),
     }
-    .with_rate_control(RateControlMode::Cqp)
-    .with_quality_level(22)
+    .with_rate_control(RateControl::Cqp { qp: 22 })
     .with_b_frames(0)
 }
 

@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 
@@ -108,8 +108,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let config = EncodeConfig::h264(1920, 1080)
-        .with_rate_control(RateControlMode::Vbr)
-        .with_target_bitrate(5_000_000)
+        .with_rate_control(RateControl::Vbr {
+            target: 5_000_000,
+            max: 7_500_000,
+        })
         .with_frame_rate(30, 1)
         .with_gop_size(60);
 

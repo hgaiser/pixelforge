@@ -17,7 +17,7 @@ use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
     Codec, ColorDescription, ColorSpec, Conversion, ConversionPreference, EncodeBitDepth,
-    EncodeConfig, Encoder, Frame, Handoff, InputFormat, RateControlMode, RgbSource, Source,
+    EncodeConfig, Encoder, Frame, Handoff, InputFormat, RateControl, RgbSource, Source,
     SourceImage, VideoContext, VideoContextBuilder,
 };
 
@@ -60,8 +60,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     };
     config
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(22)
+        .with_rate_control(RateControl::Cqp { qp: 22 })
         .with_frame_rate(30, 1)
         .with_b_frames(0)
         .with_color_description(ColorDescription::bt709())

@@ -37,7 +37,7 @@ use super::{
 use crate::encoder::input::SourceOwnership;
 use crate::{
     Codec, ColorDescription, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame,
-    Handoff, RateControlMode, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    Handoff, RateControl, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
 };
 use ash::vk;
 
@@ -189,7 +189,6 @@ fn encoders(
     let eight = Encoder::new(
         context.clone(),
         EncodeConfig::h264(WIDTH, HEIGHT)
-            .with_rate_control(RateControlMode::Cqp)
             .with_frame_rate(30, 1)
             .with_b_frames(0),
     )?;
@@ -197,7 +196,6 @@ fn encoders(
         context.clone(),
         EncodeConfig::h265(WIDTH, HEIGHT)
             .with_bit_depth(EncodeBitDepth::Ten)
-            .with_rate_control(RateControlMode::Cqp)
             .with_frame_rate(30, 1)
             .with_b_frames(0),
     )
@@ -524,8 +522,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         Codec::H265 => EncodeConfig::h265(ENCODE_WIDTH, ENCODE_HEIGHT),
         Codec::AV1 => EncodeConfig::av1(ENCODE_WIDTH, ENCODE_HEIGHT),
     }
-    .with_rate_control(RateControlMode::Cqp)
-    .with_quality_level(22)
+    .with_rate_control(RateControl::Cqp { qp: 22 })
     .with_frame_rate(30, 1)
     .with_b_frames(0)
     .with_color_description(ColorDescription::bt709())

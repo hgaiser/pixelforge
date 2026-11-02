@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `ColorConverter`, `ColorConverterConfig` and `OutputFormat`
   are no longer public. Describe an RGB source with `Source::Rgb` instead, and
   the encoder runs the converter itself, with the right target and range.
+- **Breaking:** `RateControl` replaces `RateControlMode`, `quality_level`,
+  `target_bitrate` and `max_bitrate`: `Cqp { qp }`, `Cbr { bitrate }` or
+  `Vbr { target, max }`, so each mode carries exactly the values it uses.
+  `Encoder::new` refuses a quantizer out of the codec's range, a bitrate of 0,
+  and a peak below the target. `RateControlMode::Disabled` was the same as
+  `Cqp` and is gone. `DEFAULT_TARGET_BITRATE` and `DEFAULT_MAX_BITRATE` are
+  removed; `DEFAULT_AV1_Q_INDEX` is added.
 - **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
   `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
   frames that read the image are done with it.

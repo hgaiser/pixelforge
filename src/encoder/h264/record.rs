@@ -129,10 +129,8 @@ impl H264 {
             ),
         };
 
-        let slice_qp_delta = match common.config.rate_control_mode {
-            crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => {
-                (common.config.quality_level as i32 - 26) as i8
-            }
+        let slice_qp_delta = match common.config.rate_control {
+            crate::encoder::RateControl::Cqp { qp } => (qp as i32 - 26) as i8,
             _ => 0,
         };
 

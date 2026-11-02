@@ -90,6 +90,7 @@ impl Encoder {
     /// gets from the source to [`EncodeConfig::color_description`], or if
     /// [`EncodeConfig::conversion`] asks for one that cannot.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
+        config.rate_control.check(config.codec)?;
         let plan = plan(&context, &config)?;
         if let Some(format) = plan.rgb_input {
             super::rgb::check_rgb_input(&context, &config, format)?;

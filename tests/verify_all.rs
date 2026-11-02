@@ -11,7 +11,7 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 use std::fs::File;
@@ -129,8 +129,7 @@ fn run_test(
             Codec::H265 => EncodeConfig::h265(WIDTH, HEIGHT),
             Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
         }
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(10)
+        .with_rate_control(RateControl::Cqp { qp: 10 })
         .with_pixel_format(format)
         .with_bit_depth(depth);
 

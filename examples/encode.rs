@@ -10,7 +10,7 @@
 //! The codec defaults to `h264`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 use std::fs::File;
@@ -92,15 +92,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure encoder.
     let config = config
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(26)
+        .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
         .with_gop_size(30)
         .with_b_frames(0);
 
     println!(
-        "Config: {:?}, QP={}, GOP={}, B-frames={}\n",
-        config.rate_control_mode, config.quality_level, config.gop_size, config.b_frame_count
+        "Config: {:?}, GOP={}, B-frames={}\n",
+        config.rate_control, config.gop_size, config.b_frame_count
     );
 
     // Create input image for uploading frames.

@@ -30,12 +30,6 @@ use ash::vk;
 
 // Default encoder configuration constants.
 
-/// Default target bitrate in bits per second (4 Mbps).
-pub const DEFAULT_TARGET_BITRATE: u32 = 4_000_000;
-
-/// Default maximum bitrate in bits per second (6 Mbps).
-pub const DEFAULT_MAX_BITRATE: u32 = 6_000_000;
-
 /// Default frame rate (frames per second).
 pub const DEFAULT_FRAME_RATE: u32 = 30;
 
@@ -47,6 +41,9 @@ pub const DEFAULT_H264_QP: u32 = 26;
 
 /// Default QP (quantization parameter) for H.265.
 pub const DEFAULT_H265_QP: u32 = 28;
+
+/// Default quantizer index for AV1.
+pub const DEFAULT_AV1_Q_INDEX: u32 = 128;
 
 /// Default maximum number of reference frames.
 pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
@@ -124,18 +121,65 @@ impl From<BitDepth> for vk::VideoComponentBitDepthFlagsKHR {
     }
 }
 
-/// Rate control modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RateControlMode {
-    /// Disabled rate control - constant QP.
-    #[default]
-    Disabled,
-    /// Constant QP mode.
-    Cqp,
-    /// Constant bitrate mode.
-    Cbr,
-    /// Variable bitrate mode.
-    Vbr,
+/// How the encoder spends bits, with the values that mode needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Every frame at one quantizer, and no bitrate target.
+    Cqp {
+        /// The QP, 0 to 51, for H.264 and H.265; the quantizer index, 0 to
+        /// 255, for AV1. Lower is better quality and more bits.
+        qp: u32,
+    },
+    /// A constant bitrate.
+    Cbr {
+        /// Bits per second.
+        bitrate: u32,
+    },
+    /// A variable bitrate around a target, up to a peak.
+    Vbr {
+        /// Average bits per second.
+        target: u32,
+        /// Peak bits per second, at least `target`.
+        max: u32,
+    },
+}
+
+impl RateControl {
+    /// The default for `codec`: a constant quantizer of middling quality.
+    pub fn default_for(codec: Codec) -> Self {
+        Self::Cqp {
+            qp: match codec {
+                Codec::H264 => DEFAULT_H264_QP,
+                Codec::H265 => DEFAULT_H265_QP,
+                Codec::AV1 => DEFAULT_AV1_Q_INDEX,
+            },
+        }
+    }
+
+    /// Why this cannot be used for `codec`, if it cannot.
+    pub(crate) fn check(&self, codec: Codec) -> crate::error::Result<()> {
+        let invalid = |reason: String| Err(crate::error::PixelForgeError::InvalidInput(reason));
+        match *self {
+            Self::Cqp { qp } => {
+                let max = if codec == Codec::AV1 { 255 } else { 51 };
+                if qp > max {
+                    return invalid(format!(
+                        "{codec:?} takes a quantizer of 0 to {max}, not {qp}"
+                    ));
+                }
+            }
+            Self::Cbr { bitrate: 0 } | Self::Vbr { target: 0, .. } => {
+                return invalid("a bitrate of 0".to_string());
+            }
+            Self::Vbr { target, max } if max < target => {
+                return invalid(format!(
+                    "a peak bitrate of {max} is below the target of {target}"
+                ));
+            }
+            Self::Cbr { .. } | Self::Vbr { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 /// Encode usage hints.
@@ -316,14 +360,8 @@ pub struct EncodeConfig {
     pub pixel_format: PixelFormat,
     /// Bit depth per component.
     pub bit_depth: BitDepth,
-    /// Rate control mode.
-    pub rate_control_mode: RateControlMode,
-    /// Target bitrate in bits per second.
-    pub target_bitrate: u32,
-    /// Maximum bitrate in bits per second.
-    pub max_bitrate: u32,
-    /// Quality level for CQP mode (QP value).
-    pub quality_level: u32,
+    /// How the encoder spends bits. Checked by [`Encoder::new`].
+    pub rate_control: RateControl,
     /// Frame rate numerator.
     pub frame_rate_numerator: u32,
     /// Frame rate denominator.
@@ -334,12 +372,14 @@ pub struct EncodeConfig {
     pub b_frame_count: u32,
     /// Maximum number of reference frames.
     pub max_reference_frames: u32,
-    /// VBV/HRD virtual buffer size in milliseconds.
+    /// VBV/HRD virtual buffer size in milliseconds, for
+    /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much the encoder can deviate from the target bitrate
     /// on a per-frame basis. Smaller values produce more uniform frame
     /// sizes.
     pub virtual_buffer_size_ms: u32,
-    /// Initial VBV buffer fullness in milliseconds.
+    /// Initial VBV buffer fullness in milliseconds, for
+    /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much budget the encoder has for IDR/I-frames.
     /// Setting this to 0 constrains IDR frames to the same budget as
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
@@ -373,10 +413,7 @@ impl EncodeConfig {
             dimensions: Dimensions { width, height },
             pixel_format: PixelFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: DEFAULT_H264_QP,
+            rate_control: RateControl::default_for(Codec::H264),
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -403,10 +440,7 @@ impl EncodeConfig {
             dimensions: Dimensions { width, height },
             pixel_format: PixelFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: DEFAULT_H265_QP,
+            rate_control: RateControl::default_for(Codec::H265),
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -433,10 +467,7 @@ impl EncodeConfig {
             dimensions: Dimensions { width, height },
             pixel_format: PixelFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: 128, // AV1 uses 0-255 QP range
+            rate_control: RateControl::default_for(Codec::AV1),
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
@@ -453,9 +484,9 @@ impl EncodeConfig {
         }
     }
 
-    /// Set the rate control mode.
-    pub fn with_rate_control(mut self, mode: RateControlMode) -> Self {
-        self.rate_control_mode = mode;
+    /// Set how the encoder spends bits.
+    pub fn with_rate_control(mut self, rate_control: RateControl) -> Self {
+        self.rate_control = rate_control;
         self
     }
 
@@ -468,12 +499,6 @@ impl EncodeConfig {
     /// Set the bit depth (8 or 10 bit).
     pub fn with_bit_depth(mut self, depth: BitDepth) -> Self {
         self.bit_depth = depth;
-        self
-    }
-
-    /// Set the quality level (QP for CQP mode).
-    pub fn with_quality_level(mut self, level: u32) -> Self {
-        self.quality_level = level;
         self
     }
 
@@ -499,18 +524,6 @@ impl EncodeConfig {
     /// Set the maximum reference frames.
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
-        self
-    }
-
-    /// Set the target bitrate.
-    pub fn with_target_bitrate(mut self, bitrate: u32) -> Self {
-        self.target_bitrate = bitrate;
-        self
-    }
-
-    /// Set the maximum bitrate.
-    pub fn with_max_bitrate(mut self, bitrate: u32) -> Self {
-        self.max_bitrate = bitrate;
         self
     }
 
@@ -691,13 +704,44 @@ mod tests {
         }
     }
 
-    // RateControlMode tests.
+    // RateControl tests.
     mod rate_control_tests {
         use super::*;
 
         #[test]
-        fn test_default() {
-            assert_eq!(RateControlMode::default(), RateControlMode::Disabled);
+        fn defaults_are_a_constant_quantizer() {
+            assert_eq!(
+                RateControl::default_for(Codec::H264),
+                RateControl::Cqp { qp: 26 }
+            );
+            assert_eq!(
+                RateControl::default_for(Codec::AV1),
+                RateControl::Cqp { qp: 128 }
+            );
+        }
+
+        #[test]
+        fn check_refuses_what_cannot_work() {
+            assert!(RateControl::Cqp { qp: 51 }.check(Codec::H264).is_ok());
+            assert!(RateControl::Cqp { qp: 52 }.check(Codec::H265).is_err());
+            assert!(RateControl::Cqp { qp: 255 }.check(Codec::AV1).is_ok());
+            assert!(RateControl::Cbr { bitrate: 0 }.check(Codec::H264).is_err());
+            assert!(
+                RateControl::Vbr {
+                    target: 8_000_000,
+                    max: 6_000_000
+                }
+                .check(Codec::H264)
+                .is_err()
+            );
+            assert!(
+                RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 8_000_000
+                }
+                .check(Codec::H264)
+                .is_ok()
+            );
         }
     }
 
@@ -714,8 +758,7 @@ mod tests {
             assert_eq!(config.dimensions.height, 1080);
             assert_eq!(config.pixel_format, PixelFormat::Yuv420);
             assert_eq!(config.bit_depth, BitDepth::Eight);
-            assert_eq!(config.rate_control_mode, RateControlMode::Disabled);
-            assert_eq!(config.quality_level, 26);
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 26 });
             assert_eq!(config.gop_size, 30);
             assert_eq!(config.b_frame_count, 0);
             assert_eq!(config.frame_rate_numerator, 30);
@@ -729,14 +772,16 @@ mod tests {
             assert_eq!(config.codec, Codec::H265);
             assert_eq!(config.dimensions.width, 3840);
             assert_eq!(config.dimensions.height, 2160);
-            assert_eq!(config.quality_level, 28); // H.265 uses slightly higher QP
+            // H.265 uses slightly higher QP.
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 28 });
         }
 
         #[test]
         fn test_with_rate_control() {
-            let config = EncodeConfig::h264(1920, 1080).with_rate_control(RateControlMode::Cbr);
+            let rate_control = RateControl::Cbr { bitrate: 8_000_000 };
+            let config = EncodeConfig::h264(1920, 1080).with_rate_control(rate_control);
 
-            assert_eq!(config.rate_control_mode, RateControlMode::Cbr);
+            assert_eq!(config.rate_control, rate_control);
         }
 
         #[test]
@@ -751,13 +796,6 @@ mod tests {
             let config = EncodeConfig::h265(1920, 1080).with_bit_depth(BitDepth::Ten);
 
             assert_eq!(config.bit_depth, BitDepth::Ten);
-        }
-
-        #[test]
-        fn test_with_quality_level() {
-            let config = EncodeConfig::h264(1920, 1080).with_quality_level(20);
-
-            assert_eq!(config.quality_level, 20);
         }
 
         #[test]
@@ -790,20 +828,6 @@ mod tests {
         }
 
         #[test]
-        fn test_with_target_bitrate() {
-            let config = EncodeConfig::h264(1920, 1080).with_target_bitrate(8_000_000);
-
-            assert_eq!(config.target_bitrate, 8_000_000);
-        }
-
-        #[test]
-        fn test_with_max_bitrate() {
-            let config = EncodeConfig::h264(1920, 1080).with_max_bitrate(12_000_000);
-
-            assert_eq!(config.max_bitrate, 12_000_000);
-        }
-
-        #[test]
         fn test_av1_defaults() {
             let config = EncodeConfig::av1(2560, 1440);
 
@@ -812,8 +836,8 @@ mod tests {
             assert_eq!(config.dimensions.height, 1440);
             assert_eq!(config.pixel_format, PixelFormat::Yuv420);
             assert_eq!(config.bit_depth, BitDepth::Eight);
-            assert_eq!(config.rate_control_mode, RateControlMode::Disabled);
-            assert_eq!(config.quality_level, 128); // AV1 uses 0-255 QP range
+            // AV1 uses a 0-255 quantizer index.
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 128 });
             assert_eq!(config.gop_size, 30);
             assert_eq!(config.b_frame_count, 0);
             assert_eq!(config.frame_rate_numerator, 30);
@@ -823,39 +847,38 @@ mod tests {
         #[test]
         fn test_av1_builder_chaining() {
             let config = EncodeConfig::av1(1920, 1080)
-                .with_rate_control(RateControlMode::Vbr)
-                .with_target_bitrate(8_000_000)
-                .with_max_bitrate(12_000_000)
+                .with_rate_control(RateControl::Cqp { qp: 100 })
                 .with_gop_size(60)
                 .with_frame_rate(60, 1)
-                .with_quality_level(100)
                 .with_max_reference_frames(2);
 
             assert_eq!(config.codec, Codec::AV1);
-            assert_eq!(config.rate_control_mode, RateControlMode::Vbr);
-            assert_eq!(config.target_bitrate, 8_000_000);
-            assert_eq!(config.max_bitrate, 12_000_000);
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 100 });
             assert_eq!(config.gop_size, 60);
             assert_eq!(config.frame_rate_numerator, 60);
-            assert_eq!(config.quality_level, 100);
             assert_eq!(config.max_reference_frames, 2);
         }
 
         #[test]
         fn test_builder_chaining() {
             let config = EncodeConfig::h264(1920, 1080)
-                .with_rate_control(RateControlMode::Vbr)
-                .with_target_bitrate(6_000_000)
-                .with_max_bitrate(10_000_000)
+                .with_rate_control(RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 10_000_000,
+                })
                 .with_gop_size(120)
                 .with_b_frames(2)
                 .with_frame_rate(60, 1)
                 .with_pixel_format(PixelFormat::Yuv420)
                 .with_bit_depth(BitDepth::Eight);
 
-            assert_eq!(config.rate_control_mode, RateControlMode::Vbr);
-            assert_eq!(config.target_bitrate, 6_000_000);
-            assert_eq!(config.max_bitrate, 10_000_000);
+            assert_eq!(
+                config.rate_control,
+                RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 10_000_000
+                }
+            );
             assert_eq!(config.gop_size, 120);
             assert_eq!(config.b_frame_count, 2);
             assert_eq!(config.frame_rate_numerator, 60);

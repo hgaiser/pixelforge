@@ -29,7 +29,7 @@ use crate::encoder::resources::{
     query_supported_video_formats, upload_image_to_input,
 };
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
+use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{TimelineChain, allocate_command_buffers};
@@ -391,30 +391,30 @@ pub(crate) struct RateControlPlan {
     pub mode: vk::VideoEncodeRateControlModeFlagsKHR,
     pub average_bitrate: u32,
     pub max_bitrate: u32,
-    /// QP/q-index: the configured quality level for CQP/Disabled, otherwise the
+    /// QP/q-index: the configured quantizer for CQP, otherwise the
     /// codec's default starting point for the bitrate controller.
     pub qp: u32,
 }
 
 impl RateControlPlan {
     pub fn new(config: &EncodeConfig, controller_default_qp: u32) -> Self {
-        match config.rate_control_mode {
-            RateControlMode::Cqp | RateControlMode::Disabled => Self {
+        match config.rate_control {
+            RateControl::Cqp { qp } => Self {
                 mode: vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
                 average_bitrate: 0,
                 max_bitrate: 0,
-                qp: config.quality_level,
+                qp,
             },
-            RateControlMode::Cbr => Self {
+            RateControl::Cbr { bitrate } => Self {
                 mode: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
-                average_bitrate: config.target_bitrate,
-                max_bitrate: config.target_bitrate,
+                average_bitrate: bitrate,
+                max_bitrate: bitrate,
                 qp: controller_default_qp,
             },
-            RateControlMode::Vbr => Self {
+            RateControl::Vbr { target, max } => Self {
                 mode: vk::VideoEncodeRateControlModeFlagsKHR::VBR,
-                average_bitrate: config.target_bitrate,
-                max_bitrate: config.max_bitrate,
+                average_bitrate: target,
+                max_bitrate: max,
                 qp: controller_default_qp,
             },
         }

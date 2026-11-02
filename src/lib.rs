@@ -91,7 +91,7 @@
 //!
 //! ```rust,no_run
 //! use pixelforge::{
-//!     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+//!     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControl,
 //!     VideoContextBuilder,
 //! };
 //!
@@ -102,8 +102,10 @@
 //!         .build()?;
 //!
 //!     let config = EncodeConfig::h264(1920, 1080)
-//!         .with_rate_control(RateControlMode::Vbr)
-//!         .with_target_bitrate(5_000_000)
+//!         .with_rate_control(RateControl::Vbr {
+//!             target: 5_000_000,
+//!             max: 7_500_000,
+//!         })
 //!         .with_frame_rate(30, 1)
 //!         .with_gop_size(60);
 //!
@@ -403,10 +405,10 @@ pub use decoder::{
 #[cfg(feature = "dmabuf")]
 pub use encoder::external::{DmaBuf, DmaBufPlane, ExternalImage, InputFormats, InputModifier};
 pub use encoder::{
-    BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
-    DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,
-    DEFAULT_TARGET_BITRATE, EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint,
-    EncodedPacket, Encoder, EncoderTuningMode, Frame, FrameType, PixelFormat, RateControlMode,
+    BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_AV1_Q_INDEX, DEFAULT_FRAME_RATE,
+    DEFAULT_GOP_SIZE, DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_REFERENCE_FRAMES, EncodeConfig,
+    EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode,
+    Frame, FrameType, PixelFormat, RateControl,
 };
 pub use encoder::{
     Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,
