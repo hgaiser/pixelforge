@@ -13,7 +13,7 @@ use std::ptr;
 impl H264 {
     /// Build SPS/PPS and create Vulkan video session parameters.
     ///
-    /// Used both at init and by `set_color_description`; a single implementation
+    /// Used both at init and by `set_color`; a single implementation
     /// keeps the parameter sets bit-for-bit consistent.
     pub(super) fn build_session_params(
         &self,

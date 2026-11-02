@@ -25,11 +25,14 @@ method for each.
   RGB. `format` is the pixel layout (`InputFormat`) and `color` is what the
   pixels mean (`ColorSpec`).
 
-The stream's colour stays `EncodeConfig::color_description`. For an RGB
-source, pixelforge derives the conversion target from it: BT.709 primaries,
-transfer and matrix are `ColorSpec::Srgb`; BT.2020 and PQ are
-`ColorSpec::Bt2020Pq`. Any other description is an error for an RGB source,
-because no conversion produces it.
+The stream's colour is `EncodeConfig::color`, a `StreamColor`:
+
+- `Sdr { range }`: BT.709. An RGB source converts to `ColorSpec::Srgb`.
+- `Hdr10 { range }`: BT.2020 with PQ. An RGB source converts to
+  `ColorSpec::Bt2020Pq`.
+- `Other(ColorDescription)`: any other H.273 description, for a YUV source
+  whose pixels already are in it. It is an error for an RGB source, because
+  no conversion produces it, even when its codes say BT.709.
 
 ### Path selection
 
@@ -47,11 +50,11 @@ work is an error from `Encoder::new`. `Encoder::conversion()` tells which path
 was selected.
 
 The colour converter is not public. An RGB source is the only way to use it,
-so its target and range always follow the stream's colour description.
+so its target and range always follow the stream's colour.
 
 ### Colour changes
 
-`Encoder::set_color_description` is the one way to change colour:
+`Encoder::set_color(StreamColor)` is the one way to change colour:
 
 - `None` and `Shader`: the session parameters are made again (as before), and
   the shader gets the new target and range.

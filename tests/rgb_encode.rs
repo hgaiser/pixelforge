@@ -16,9 +16,9 @@ use common::{Readback, decode_stream};
 use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, ColorDescription, ColorSpec, Conversion, ConversionPreference, EncodeBitDepth,
-    EncodeConfig, Encoder, Frame, Handoff, InputFormat, RateControl, RgbSource, Source,
-    SourceImage, VideoContext, VideoContextBuilder,
+    Codec, ColorRange, ColorSpec, Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig,
+    Encoder, Frame, Handoff, InputFormat, RateControl, RgbSource, Source, SourceImage, StreamColor,
+    VideoContext, VideoContextBuilder,
 };
 
 const WIDTH: u32 = 320;
@@ -63,7 +63,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         .with_rate_control(RateControl::Cqp { qp: 22 })
         .with_frame_rate(30, 1)
         .with_b_frames(0)
-        .with_color_description(ColorDescription::bt709())
+        .with_color(StreamColor::default())
 }
 
 fn rgb(format: InputFormat) -> Source {
@@ -138,8 +138,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// Whether the encoder can convert `format` for `codec` here; prints why a
 /// test is skipped when not.
 fn encoder_converts(context: &VideoContext, codec: Codec, test: &str) -> bool {
-    let desc = ColorDescription::bt709();
-    let ok = context.supports_rgb_encode_input(codec, InputFormat::BGRA, &desc);
+    let ok = context.supports_rgb_encode_input(codec, InputFormat::BGRA, StreamColor::default());
     if !ok {
         eprintln!("skipping {test} for {codec:?}: the encoder cannot convert RGB here");
     }
@@ -155,8 +154,11 @@ fn auto_picks_the_encoder_where_it_can() -> Result<(), Box<dyn std::error::Error
         context.clone(),
         encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
     )?;
-    let desc = ColorDescription::bt709();
-    let expected = if context.supports_rgb_encode_input(Codec::H264, InputFormat::BGRA, &desc) {
+    let expected = if context.supports_rgb_encode_input(
+        Codec::H264,
+        InputFormat::BGRA,
+        StreamColor::default(),
+    ) {
         Conversion::Encoder
     } else {
         Conversion::Shader
@@ -246,13 +248,20 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
     let context = VideoContextBuilder::new()
         .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
         .build()?;
-    let descriptions = [
-        ("BT.709 limited", ColorDescription::bt709()),
+    let colors = [
+        ("SDR limited", StreamColor::default()),
         (
-            "BT.709 full",
-            ColorDescription::bt709().with_full_range(true),
+            "SDR full",
+            StreamColor::Sdr {
+                range: ColorRange::Full,
+            },
         ),
-        ("BT.2020", ColorDescription::bt2020_pq()),
+        (
+            "HDR10 limited",
+            StreamColor::Hdr10 {
+                range: ColorRange::Limited,
+            },
+        ),
     ];
     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
         if !context.supports_encode(codec) {
@@ -269,18 +278,18 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
             } else {
                 EncodeBitDepth::Eight
             };
-            for (name, desc) in &descriptions {
-                let color = if desc.is_hdr() {
+            for &(name, stream) in &colors {
+                let color = if matches!(stream, StreamColor::Hdr10 { .. }) {
                     ColorSpec::Bt2020Pq
                 } else {
                     ColorSpec::Srgb
                 };
-                let supported = context.supports_rgb_encode_input(codec, format, desc);
+                let supported = context.supports_rgb_encode_input(codec, format, stream);
                 let created = Encoder::new(
                     context.clone(),
                     encode_config(codec)
                         .with_bit_depth(bit_depth)
-                        .with_color_description(*desc)
+                        .with_color(stream)
                         .with_source(Source::Rgb(RgbSource::new(format, color)))
                         .with_conversion(ConversionPreference::Encoder),
                 )
@@ -311,7 +320,9 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     let mut keys = Vec::new();
     for n in 0..FRAMES {
         if n == FRAMES / 2 {
-            encoder.set_color_description(ColorDescription::bt709().with_full_range(true))?;
+            encoder.set_color(StreamColor::Sdr {
+                range: ColorRange::Full,
+            })?;
         }
         let src = source(&context, n)?;
         let image = source_image(&context, &src)?;
@@ -321,9 +332,12 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     }
     assert_eq!(pts, (0..u64::from(FRAMES)).collect::<Vec<_>>());
     assert!(keys[0] && keys[FRAMES as usize / 2], "key frames: {keys:?}");
-    assert!(
-        encoder.config().color_description.unwrap().full_range,
-        "the description was not kept"
+    assert_eq!(
+        encoder.config().color,
+        StreamColor::Sdr {
+            range: ColorRange::Full
+        },
+        "the colour was not kept"
     );
     // Full range is not something every encoder converts to; where it does
     // not, the shader takes over.

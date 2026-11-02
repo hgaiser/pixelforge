@@ -2,7 +2,7 @@
 //!
 //! Everything that is identical across H.264, H.265 and AV1 lives here:
 //! the shared per-encoder state ([`EncoderCommon`]), the generic driver
-//! ([`CodecEncoder`]) that owns the public `encode`/`flush`/`set_color_description`
+//! ([`CodecEncoder`]) that owns the public `submit`/`flush`/`set_color`
 //! flow, the shared initialization scaffolding ([`build_encoder_common`]) and the
 //! shared rate-control decision ([`RateControlPlan`]).
 //!
@@ -29,7 +29,7 @@ use crate::encoder::resources::{
     query_supported_video_formats, upload_image_to_input,
 };
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl};
+use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl, StreamColor};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{TimelineChain, allocate_command_buffers};
@@ -469,7 +469,7 @@ pub(crate) trait VideoCodec: Sized + Send {
     ) -> bool;
 
     /// Build the codec parameter sets and create Vulkan session parameters.
-    /// Used at init and by `set_color_description`.
+    /// Used at init and by `set_color`.
     fn create_session_params(
         &self,
         common: &EncoderCommon,
@@ -549,11 +549,12 @@ impl<C: VideoCodec> CodecEncoder<C> {
         }
     }
 
-    /// Rebuild session parameters with a new color description; the next frame is
+    /// Rebuild session parameters with a new stream colour; the next frame is
     /// an IDR/key frame carrying the updated header.
-    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+    pub fn set_color(&mut self, color: StreamColor) -> Result<()> {
         // Drain in-flight encodes before mutating shared session parameters.
         self.common.pipeline.wait_all_free();
+        let desc = color.description();
 
         let old_session_params = self.common.session_params;
         let new_session_params = self.codec.create_session_params(&self.common, &desc)?;
@@ -564,7 +565,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
         }
 
         self.common.session_params = new_session_params;
-        self.common.config.color_description = Some(desc);
+        self.common.config.color = color;
         self.codec.invalidate_header_cache();
         self.common.gop.request_idr();
         Ok(())
@@ -772,13 +773,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
                     "RGB input: the driver reported no conversion capabilities".to_string(),
                 )
             })?;
-            Some(
-                caps.session_info(
-                    &config
-                        .color_description
-                        .unwrap_or_else(ColorDescription::bt709),
-                )?,
-            )
+            Some(caps.session_info(&config.color.description())?)
         }
         None => None,
     };

@@ -28,6 +28,8 @@ pub(crate) mod support;
 
 use ash::vk;
 
+use crate::converter::ColorRange;
+
 // Default encoder configuration constants.
 
 /// Default frame rate (frames per second).
@@ -287,6 +289,46 @@ pub struct Dimensions {
     pub height: u32,
 }
 
+/// What the stream says about its colours: for an RGB source, also what the
+/// encoder converts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamColor {
+    /// SDR: BT.709 primaries, transfer and matrix.
+    Sdr {
+        /// The luma and chroma range.
+        range: ColorRange,
+    },
+    /// HDR10: BT.2020 primaries and matrix, with the PQ transfer.
+    Hdr10 {
+        /// The luma and chroma range.
+        range: ColorRange,
+    },
+    /// Any other H.273 description, for a YUV source whose pixels already
+    /// are in it. No conversion from RGB produces one, so [`Encoder::new`]
+    /// refuses it for [`Source::Rgb`].
+    Other(ColorDescription),
+}
+
+impl Default for StreamColor {
+    /// SDR, limited range: what players assume when a stream says nothing.
+    fn default() -> Self {
+        Self::Sdr {
+            range: ColorRange::Limited,
+        }
+    }
+}
+
+impl StreamColor {
+    /// The H.273 description written into the stream.
+    pub fn description(&self) -> ColorDescription {
+        match *self {
+            Self::Sdr { range } => ColorDescription::bt709().with_full_range(range.is_full()),
+            Self::Hdr10 { range } => ColorDescription::bt2020_pq().with_full_range(range.is_full()),
+            Self::Other(desc) => desc,
+        }
+    }
+}
+
 /// Video signal color description for VUI parameters.
 ///
 /// Describes how color is encoded in the video stream, allowing decoders
@@ -385,9 +427,9 @@ pub struct EncodeConfig {
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
-    /// Color description for VUI signaling.
-    /// Defaults to BT.709, limited range, when `None`.
-    pub color_description: Option<ColorDescription>,
+    /// What the stream says about its colours. SDR, limited range, by
+    /// default; see [`Self::with_color`].
+    pub color: StreamColor,
     /// What the frames handed to the encoder are. YUV by default; see
     /// [`Self::with_source`].
     pub source: Source,
@@ -421,7 +463,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
+            color: StreamColor::default(),
             source: Source::Yuv,
             conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -448,7 +490,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
+            color: StreamColor::default(),
             source: Source::Yuv,
             conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -475,7 +517,7 @@ impl EncodeConfig {
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
+            color: StreamColor::default(),
             source: Source::Yuv,
             conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
@@ -542,18 +584,19 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the color description for VUI signaling.
-    pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
-        self.color_description = Some(desc);
+    /// Set what the stream says about its colours.
+    ///
+    /// For [`Source::Rgb`] it is also what the encoder converts to:
+    /// [`StreamColor::Sdr`] or [`StreamColor::Hdr10`].
+    pub fn with_color(mut self, color: StreamColor) -> Self {
+        self.color = color;
         self
     }
 
     /// Say what the frames handed to the encoder are.
     ///
     /// For [`Source::Rgb`], the encoder converts them to the YUV that
-    /// [`Self::color_description`] describes, which then also picks the
-    /// conversion's target: BT.709 for SDR, BT.2020 with PQ for HDR10.
-    /// [`Encoder::new`] picks how, see [`Conversion`].
+    /// [`Self::color`] says. [`Encoder::new`] picks how, see [`Conversion`].
     pub fn with_source(mut self, source: Source) -> Self {
         self.source = source;
         self
@@ -589,6 +632,7 @@ pub use api::Encoder;
 pub use frame::{Frame, InputSlot};
 pub use pipeline::EncodeFuture;
 pub use source::{Conversion, ConversionPreference, RgbSource, Source};
+
 pub use source_image::{Handoff, SourceImage};
 
 /// Statistic about the encoded video packet.

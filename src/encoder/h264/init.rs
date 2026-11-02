@@ -1,6 +1,7 @@
 use super::{H264, MB_SIZE};
 
 use crate::converter::InputFormat;
+use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
@@ -9,7 +10,6 @@ use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h264_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::encoder::{ColorDescription, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -109,9 +109,7 @@ impl H264 {
         };
 
         let mut encoder = CodecEncoder { common, codec };
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
+        let color_desc = config.color.description();
         encoder.common.session_params = encoder
             .codec
             .build_session_params(&encoder.common, &color_desc)?;

@@ -8,8 +8,8 @@ use super::frame::{Frame, FrameSource, InputSlot};
 use super::input::{FrameInput, FrameSync, SourceOwnership};
 use super::source::{Conversion, ConversionPreference, plan, target_space};
 use super::source_image::SourceImage;
-use super::{Codec, ColorDescription, EncodeConfig, EncodeFuture};
-use crate::converter::{ColorConverter, ColorRange};
+use super::{Codec, EncodeConfig, EncodeFuture, StreamColor};
+use crate::converter::ColorConverter;
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
@@ -27,7 +27,7 @@ pub(crate) trait EncoderApi: Send {
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
+    fn set_color(&mut self, color: StreamColor) -> Result<()>;
 }
 
 impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
@@ -49,8 +49,8 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
     }
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        CodecEncoder::set_color_description(self, desc)
+    fn set_color(&mut self, color: StreamColor) -> Result<()> {
+        CodecEncoder::set_color(self, color)
     }
 }
 
@@ -87,7 +87,7 @@ impl Encoder {
     ///
     /// For an RGB [`Source`](super::Source), this also picks the
     /// [`Conversion`], see [`Self::conversion`]. It fails if no conversion
-    /// gets from the source to [`EncodeConfig::color_description`], or if
+    /// gets from the source to [`EncodeConfig::color`], or if
     /// [`EncodeConfig::conversion`] asks for one that cannot.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
         config.rate_control.check(config.codec)?;
@@ -378,23 +378,18 @@ impl Encoder {
     /// source the conversion follows: the colour converter gets the new target
     /// and range, and where the encoder converts, it is made again with the
     /// new matrix and range, since those are fixed in its video session.
-    /// Packet timestamps carry on across that. If the new description needs a
+    /// Packet timestamps carry on across that. If the new colour needs a
     /// different [`Conversion`], images imported or allocated for the old one
     /// have to be made again.
     ///
     /// On error the encoder is left as it was.
-    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
+    pub fn set_color(&mut self, color: StreamColor) -> Result<()> {
         let mut config = self.config.clone();
-        config.color_description = Some(desc);
+        config.color = color;
         match self.conversion {
-            Conversion::None => self.inner.set_color_description(desc)?,
+            Conversion::None => self.inner.set_color(color)?,
             Conversion::Shader if self.shader_still_converts(&config) => {
-                let target = target_space(&desc).expect("the plan checked the target");
-                let range = if desc.full_range {
-                    ColorRange::Full
-                } else {
-                    ColorRange::Limited
-                };
+                let (target, range) = target_space(&color).expect("the plan checked the target");
                 let converter = self
                     .converter
                     .as_mut()
@@ -402,7 +397,7 @@ impl Encoder {
                 let (old_target, old_range) = (converter.config().target, converter.config().range);
                 converter.set_target(target)?;
                 converter.set_range(range);
-                if let Err(e) = self.inner.set_color_description(desc) {
+                if let Err(e) = self.inner.set_color(color) {
                     let _ = converter.set_target(old_target);
                     converter.set_range(old_range);
                     return Err(e);

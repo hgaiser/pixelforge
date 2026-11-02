@@ -191,16 +191,16 @@
 //!
 //! An encoder takes RGB frames once it is told what they are, with a
 //! [`Source`]. It then converts them to the YUV that the stream's
-//! [`ColorDescription`] describes, and that description also picks the target:
-//! BT.709 for SDR, BT.2020 with PQ for HDR10. The source and the stream are
-//! described once each, so the conversion and the stream's label cannot
-//! disagree, and a colour change through [`Encoder::set_color_description`]
-//! changes both.
+//! [`StreamColor`] says: [`StreamColor::Sdr`] (BT.709) or
+//! [`StreamColor::Hdr10`] (BT.2020 with PQ), each with its range. The source
+//! and the stream are described once each, so the conversion and the
+//! stream's label cannot disagree, and a colour change through
+//! [`Encoder::set_color`] changes both.
 //!
 //! ```rust,no_run
 //! use pixelforge::{
-//!     Codec, ColorDescription, ColorSpec, EncodeConfig, Encoder, InputFormat, RgbSource,
-//!     Source, VideoContextBuilder,
+//!     Codec, ColorRange, ColorSpec, EncodeConfig, Encoder, InputFormat, RgbSource, Source,
+//!     StreamColor, VideoContextBuilder,
 //! };
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -212,10 +212,12 @@
 //! let config = EncodeConfig::h265(1920, 1080)
 //!     .with_bit_depth(pixelforge::EncodeBitDepth::Ten)
 //!     .with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, ColorSpec::Srgb)))
-//!     .with_color_description(ColorDescription::bt2020_pq().with_full_range(true));
+//!     .with_color(StreamColor::Hdr10 {
+//!         range: ColorRange::Full,
+//!     });
 //! let mut encoder = Encoder::new(context, config)?;
 //! println!("converting with {:?}", encoder.conversion());
-//! // let packet = encoder.encode(rgb_image)?;
+//! // let packet = encoder.submit(Frame::image(&rgb_image))?;
 //! # Ok(())
 //! # }
 //! ```
@@ -412,6 +414,7 @@ pub use encoder::{
 };
 pub use encoder::{
     Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,
+    StreamColor,
 };
 pub use error::PixelForgeError;
 pub use image::InputImage;

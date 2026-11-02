@@ -6,7 +6,7 @@
 //! RGB conversion, and always submits frames the same way.
 
 use super::rgb::rgb_input_bit_depth;
-use super::{BitDepth, ColorDescription, EncodeConfig, PixelFormat};
+use super::{BitDepth, EncodeConfig, PixelFormat, StreamColor};
 use crate::converter::{ColorConverterConfig, ColorRange, ColorSpec, InputFormat, OutputFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -87,24 +87,14 @@ pub(crate) struct Plan {
     pub converter: Option<ColorConverterConfig>,
 }
 
-/// The colour space a stream described by `desc` is in, if a conversion
-/// can produce it.
-pub(crate) fn target_space(desc: &ColorDescription) -> Option<ColorSpec> {
-    [ColorSpec::Srgb, ColorSpec::Bt2020Pq]
-        .into_iter()
-        .find(|space| {
-            space.color_description().is_some_and(|d| {
-                (
-                    d.color_primaries,
-                    d.transfer_characteristics,
-                    d.matrix_coefficients,
-                ) == (
-                    desc.color_primaries,
-                    desc.transfer_characteristics,
-                    desc.matrix_coefficients,
-                )
-            })
-        })
+/// The colour space and range a conversion from RGB writes for `color`, if
+/// one can.
+pub(crate) fn target_space(color: &StreamColor) -> Option<(ColorSpec, ColorRange)> {
+    match *color {
+        StreamColor::Sdr { range } => Some((ColorSpec::Srgb, range)),
+        StreamColor::Hdr10 { range } => Some((ColorSpec::Bt2020Pq, range)),
+        StreamColor::Other(_) => None,
+    }
 }
 
 /// The YUV the colour converter has to write for this encoder.
@@ -137,18 +127,14 @@ pub(crate) fn plan(context: &VideoContext, config: &EncodeConfig) -> Result<Plan
         Source::Rgb(rgb) => rgb,
     };
 
-    let desc = config
-        .color_description
-        .unwrap_or_else(ColorDescription::bt709);
-    let target = target_space(&desc).ok_or_else(|| {
+    let (target, range) = target_space(&config.color).ok_or_else(|| {
         PixelForgeError::InvalidInput(format!(
-            "no conversion from RGB produces the colour description {desc:?}; \
-             use BT.709 or BT.2020 with PQ"
+            "no conversion from RGB produces {:?}; use StreamColor::Sdr or StreamColor::Hdr10",
+            config.color
         ))
     })?;
-
-    let encoder = encoder_conversion(context, config, &rgb, target, &desc);
-    let shader = shader_conversion(context, config, &rgb, target, &desc);
+    let encoder = encoder_conversion(context, config, &rgb, target);
+    let shader = shader_conversion(context, config, &rgb, target, range);
 
     let use_encoder = match config.conversion {
         ConversionPreference::Encoder => {
@@ -184,7 +170,6 @@ fn encoder_conversion(
     config: &EncodeConfig,
     rgb: &RgbSource,
     target: ColorSpec,
-    desc: &ColorDescription,
 ) -> Result<()> {
     let no = |reason: String| {
         Err(PixelForgeError::InvalidInput(format!(
@@ -210,10 +195,10 @@ fn encoder_conversion(
         }
         None => return no(format!("{:?} needs tone mapping first", rgb.format)),
     }
-    if !context.supports_rgb_encode_input(config.codec, rgb.format, desc) {
+    if !context.supports_rgb_encode_input(config.codec, rgb.format, config.color) {
         return no(format!(
-            "the driver does not convert {:?} to {desc:?} for {:?}",
-            rgb.format, config.codec
+            "the driver does not convert {:?} to {:?} for {:?}",
+            rgb.format, config.color, config.codec
         ));
     }
     Ok(())
@@ -226,7 +211,7 @@ fn shader_conversion(
     config: &EncodeConfig,
     rgb: &RgbSource,
     target: ColorSpec,
-    desc: &ColorDescription,
+    range: ColorRange,
 ) -> Result<ColorConverterConfig> {
     if !context.has_push_descriptor() {
         return Err(PixelForgeError::NoSuitableDevice(
@@ -239,11 +224,6 @@ fn shader_conversion(
             config.pixel_format, config.bit_depth
         ))
     })?;
-    let range = if desc.full_range {
-        ColorRange::Full
-    } else {
-        ColorRange::Limited
-    };
     let mut converter = ColorConverterConfig::new(
         config.dimensions.width,
         config.dimensions.height,
@@ -263,26 +243,30 @@ fn shader_conversion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::ColorDescription;
 
     #[test]
-    fn target_space_follows_the_description() {
+    fn target_space_follows_the_stream_colour() {
         assert_eq!(
-            target_space(&ColorDescription::bt709()),
-            Some(ColorSpec::Srgb)
+            target_space(&StreamColor::default()),
+            Some((ColorSpec::Srgb, ColorRange::Limited))
         );
         assert_eq!(
-            target_space(&ColorDescription::bt709().with_full_range(true)),
-            Some(ColorSpec::Srgb)
-        );
-        assert_eq!(
-            target_space(&ColorDescription::bt2020_pq()),
-            Some(ColorSpec::Bt2020Pq)
+            target_space(&StreamColor::Hdr10 {
+                range: ColorRange::Full
+            }),
+            Some((ColorSpec::Bt2020Pq, ColorRange::Full))
         );
         let bt601 = ColorDescription {
             matrix_coefficients: 6,
             ..ColorDescription::bt709()
         };
-        assert_eq!(target_space(&bt601), None);
+        assert_eq!(target_space(&StreamColor::Other(bt601)), None);
+        // Even when the codes say BT.709: an RGB source names its target.
+        assert_eq!(
+            target_space(&StreamColor::Other(ColorDescription::bt709())),
+            None
+        );
     }
 
     #[test]

@@ -37,7 +37,8 @@ use super::{
 use crate::encoder::input::SourceOwnership;
 use crate::{
     Codec, ColorDescription, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame,
-    Handoff, RateControl, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    Handoff, RateControl, RgbSource, Source, SourceImage, StreamColor, VideoContext,
+    VideoContextBuilder,
 };
 use ash::vk;
 
@@ -525,7 +526,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
     .with_rate_control(RateControl::Cqp { qp: 22 })
     .with_frame_rate(30, 1)
     .with_b_frames(0)
-    .with_color_description(ColorDescription::bt709())
+    .with_color(StreamColor::default())
 }
 
 /// The streams of 8 moving frames, converted by hand and by an encoder with

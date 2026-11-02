@@ -1,12 +1,12 @@
 use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
 use crate::converter::InputFormat;
+use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::encoder::{ColorDescription, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -86,9 +86,7 @@ impl Av1 {
         };
 
         let mut encoder = CodecEncoder { common, codec };
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
+        let color_desc = config.color.description();
         encoder.common.session_params = encoder
             .codec
             .build_session_params(&encoder.common, &color_desc)?;

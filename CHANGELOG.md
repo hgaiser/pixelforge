@@ -55,9 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
   `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
   frames that read the image are done with it.
-- `Encoder::set_color_description` also updates the conversion of an RGB
-  source, and makes the encoder again where the encoder converts. Packet
-  timestamps carry on.
+- **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
+  encode API: `EncodeConfig::with_color` replaces `with_color_description`,
+  `Encoder::set_color` replaces `set_color_description`, and
+  `VideoContext::supports_rgb_encode_input` takes a `StreamColor`. `Sdr` and
+  `Hdr10` name the two colours an RGB source converts to, with their range;
+  `Other` carries any H.273 description, for a YUV source only.
+- `Encoder::set_color` also updates the conversion of an RGB source, and
+  makes the encoder again where the encoder converts. Packet timestamps carry
+  on.
 - The `dmabuf` feature enables its extensions only where the device has them,
   rather than failing device creation where it does not.
 
