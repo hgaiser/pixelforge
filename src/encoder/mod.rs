@@ -631,10 +631,11 @@ pub use source::{Conversion, ConversionPreference, RgbSource, Source};
 pub use source_image::{Handoff, SourceImage};
 
 /// Statistic about the encoded video packet.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncodedPacketStats {
-    /// GPU encode time in nanoseconds
-    pub gpu_time_ns: u64,
+    /// GPU encode time in nanoseconds, or `None` when the video encode queue
+    /// has no timestamps.
+    pub gpu_time_ns: Option<u64>,
     /// CPU wall time in nanoseconds (submission + fence wait + readback)
     pub frame_latency_ns: u64,
     /// Wall latency in nanoseconds (time between submit and bitstream ready)
@@ -654,8 +655,8 @@ pub struct EncodedPacket {
     pub pts: u64,
     /// Decode timestamp.
     pub dts: u64,
-    /// Optional stats about the packet
-    pub stats: Option<EncodedPacketStats>,
+    /// Stats about the packet.
+    pub stats: EncodedPacketStats,
 }
 
 #[cfg(test)]
@@ -941,7 +942,7 @@ mod tests {
                 is_key_frame: true,
                 pts: 0,
                 dts: 0,
-                stats: None,
+                stats: EncodedPacketStats::default(),
             };
 
             assert!(packet.is_key_frame);

@@ -804,6 +804,11 @@ impl VideoContext {
         self.inner.video_encode_timestamp_valid_bits > 0
     }
 
+    /// The selected video encode queue family's `timestampValidBits`.
+    pub(crate) fn encode_timestamp_valid_bits(&self) -> u32 {
+        self.inner.video_encode_timestamp_valid_bits
+    }
+
     pub(crate) fn video_decode_queue_family(&self) -> Option<u32> {
         self.inner.video_decode_queue_family
     }

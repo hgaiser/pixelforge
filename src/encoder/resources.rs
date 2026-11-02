@@ -1109,6 +1109,7 @@ pub(crate) unsafe fn query_timestamp_diff(
     query_pool: vk::QueryPool,
     mut timestamps: [u64; 2],
     timestamp_period: f32,
+    timestamp_valid_bits: u32,
 ) -> Option<u64> {
     if query_pool.is_null() {
         return None;
@@ -1123,9 +1124,25 @@ pub(crate) unsafe fn query_timestamp_diff(
         )
     };
     if result.is_ok() {
-        encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
+        encode_time_ns = Some(timestamp_delta_ns(
+            timestamps,
+            timestamp_period,
+            timestamp_valid_bits,
+        ));
     }
     encode_time_ns
+}
+
+/// The time between two timestamps of a counter with `valid_bits` bits, which
+/// wraps around.
+fn timestamp_delta_ns([start, end]: [u64; 2], period: f32, valid_bits: u32) -> u64 {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let ticks = end.wrapping_sub(start) & mask;
+    (ticks as f64 * f64::from(period)) as u64
 }
 
 pub(crate) struct ClearImageParams {
@@ -1145,6 +1162,20 @@ pub(crate) struct ClearImageParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_delta_scales_by_the_period() {
+        assert_eq!(timestamp_delta_ns([100, 1100], 1.0, 64), 1000);
+        assert_eq!(timestamp_delta_ns([100, 1100], 40.0, 64), 40_000);
+    }
+
+    #[test]
+    fn timestamp_delta_survives_a_wrap() {
+        // A 36-bit counter that wrapped between the two timestamps.
+        let max = (1u64 << 36) - 1;
+        assert_eq!(timestamp_delta_ns([max - 9, 10], 1.0, 36), 20);
+        assert_eq!(timestamp_delta_ns([u64::MAX - 9, 10], 1.0, 64), 20);
+    }
 
     #[test]
     fn test_gcd() {

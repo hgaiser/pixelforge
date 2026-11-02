@@ -155,11 +155,12 @@ fn run_encode_test(
 
     let mut write_packet = |packet: pixelforge::EncodedPacket| {
         total_bytes += packet.data.len();
-        if let Some(stats) = packet.stats {
-            gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
-            frame_latency_durations.push(Duration::from_nanos(stats.frame_latency_ns));
-            wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
+        let stats = packet.stats;
+        if let Some(gpu_time_ns) = stats.gpu_time_ns {
+            gpu_durations.push(Duration::from_nanos(gpu_time_ns));
         }
+        frame_latency_durations.push(Duration::from_nanos(stats.frame_latency_ns));
+        wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 

@@ -77,11 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamps carry on.
 - The `dmabuf` feature enables its extensions only where the device has them,
   rather than failing device creation where it does not.
+- `EncodedPacket::stats` is always there, and only its `gpu_time_ns` is
+  optional. Without encode queue timestamps, a packet still has its wall
+  times.
 
 ### Fixed
 
 - The source image barrier of the input copy now waits for earlier work on
   the image, rather than starting at `TOP_OF_PIPE`.
+- The GPU encode time is correct when the timestamp counter wraps between
+  the two timestamps.
 
 ## [0.10.0] - 19-10-2026
 

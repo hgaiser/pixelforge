@@ -161,6 +161,7 @@ struct WorkItem {
     metadata: SlotPacketMetadata,
     /// Timestamping resources
     timestamp_period: f32,
+    timestamp_valid_bits: u32,
     timestamp_query_pool: vk::QueryPool,
     submit_time: std::time::Instant,
     /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
@@ -186,6 +187,7 @@ pub(crate) struct EncodeSlot {
     pub query_pool: vk::QueryPool,
 
     pub timestamp_period: f32,
+    pub timestamp_valid_bits: u32,
     pub timestamp_query_pool: vk::QueryPool,
 
     /// Packet metadata recorded before submit, moved to the completion thread
@@ -248,6 +250,7 @@ impl EncodePipeline {
         // a null pool as "timestamps disabled".
         let timestamps_supported = context.encode_timestamps_supported();
         let timestamp_period = context.device_properties().limits.timestamp_period;
+        let timestamp_valid_bits = context.encode_timestamp_valid_bits();
         if !timestamps_supported {
             tracing::info!(
                 "Video encode queue family {:?} reports timestampValidBits=0; \
@@ -322,6 +325,7 @@ impl EncodePipeline {
                 encode_fence,
                 query_pool,
                 timestamp_period,
+                timestamp_valid_bits,
                 timestamp_query_pool,
                 pending_metadata: None,
             });
@@ -413,6 +417,7 @@ impl EncodePipeline {
             bitstream_ptr,
             bitstream_buffer_size,
             timestamp_period,
+            timestamp_valid_bits,
             timestamp_query_pool,
             metadata,
         ) = {
@@ -429,6 +434,7 @@ impl EncodePipeline {
                 slot.bitstream_buffer_ptr as *const u8,
                 slot.bitstream_buffer_size,
                 slot.timestamp_period,
+                slot.timestamp_valid_bits,
                 slot.timestamp_query_pool,
                 metadata,
             )
@@ -484,6 +490,7 @@ impl EncodePipeline {
             bitstream_ptr: SendPtr(bitstream_ptr),
             bitstream_buffer_size,
             timestamp_period,
+            timestamp_valid_bits,
             timestamp_query_pool,
             submit_time,
             metadata,
@@ -604,23 +611,21 @@ fn run_completion_thread(
         };
         let bitstream_ready_time = std::time::Instant::now();
 
-        let mut stats: Option<super::EncodedPacketStats> = None;
-        if let Some(gpu_encode_ns) = unsafe {
-            query_timestamp_diff(
-                &device,
-                work.timestamp_query_pool,
-                work.metadata.timestamps,
-                work.timestamp_period,
-            )
-        } {
-            stats = Some(super::EncodedPacketStats {
-                gpu_time_ns: gpu_encode_ns,
-                frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
-                wall_latency_ns: bitstream_ready_time
-                    .duration_since(work.submit_time)
-                    .as_nanos() as u64,
-            });
-        }
+        let stats = super::EncodedPacketStats {
+            gpu_time_ns: unsafe {
+                query_timestamp_diff(
+                    &device,
+                    work.timestamp_query_pool,
+                    work.metadata.timestamps,
+                    work.timestamp_period,
+                    work.timestamp_valid_bits,
+                )
+            },
+            frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
+            wall_latency_ns: bitstream_ready_time
+                .duration_since(work.submit_time)
+                .as_nanos() as u64,
+        };
 
         let packet = result.map(|()| EncodedPacket {
             data,
