@@ -27,7 +27,7 @@ use crate::encoder::rgb::RgbConversionCaps;
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
-use crate::vulkan::VideoContext;
+use crate::vulkan::{VideoContext, gpu_work_completed};
 
 /// Per-encoder state shared by every codec.
 ///
@@ -408,10 +408,37 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
         unsafe {
             let common = &mut self.common;
             let device = common.context.device();
-            // Wait on just the queues this encoder used, not the whole device.
-            let _ = device.queue_wait_idle(common.context.transfer_queue());
+            // The converter may still be writing this encoder's input image on
+            // the compute queue, even if no encode submission followed it.
+            // Wait for compute as well as the encoder's transfer and video queues.
+            let compute = device.queue_wait_idle(common.context.compute_queue());
+            if !gpu_work_completed(&compute) {
+                tracing::error!(
+                    ?compute,
+                    "Cannot prove encoder input conversion completed; retaining Vulkan resources"
+                );
+                std::mem::forget(common.context.clone());
+                return;
+            }
+            let transfer = device.queue_wait_idle(common.context.transfer_queue());
+            if !gpu_work_completed(&transfer) {
+                tracing::error!(
+                    ?transfer,
+                    "Cannot prove encoder transfer completion; retaining Vulkan resources"
+                );
+                std::mem::forget(common.context.clone());
+                return;
+            }
             if let Some(q) = common.context.video_encode_queue() {
-                let _ = device.queue_wait_idle(q);
+                let encode = device.queue_wait_idle(q);
+                if !gpu_work_completed(&encode) {
+                    tracing::error!(
+                        ?encode,
+                        "Cannot prove video encode completion; retaining Vulkan resources"
+                    );
+                    std::mem::forget(common.context.clone());
+                    return;
+                }
             }
 
             common.pipeline.destroy(device);

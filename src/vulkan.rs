@@ -7,6 +7,25 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
+/// Successful GPU waits establish completion. Vulkan treats device loss as
+/// completion for pending-command-buffer and resource-in-use cleanup rules.
+pub(crate) fn gpu_work_completed(result: &std::result::Result<(), vk::Result>) -> bool {
+    matches!(result, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST))
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+
+    #[test]
+    fn only_success_or_device_loss_permits_resource_destruction() {
+        assert!(gpu_work_completed(&Ok(())));
+        assert!(gpu_work_completed(&Err(vk::Result::ERROR_DEVICE_LOST)));
+        assert!(!gpu_work_completed(&Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)));
+        assert!(!gpu_work_completed(&Err(vk::Result::ERROR_UNKNOWN)));
+    }
+}
+
 mod encode_device;
 mod queues;
 use queues::QueueOverrides;
@@ -641,8 +660,49 @@ struct VideoContextInner {
     debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
+impl VideoContextInner {
+    /// Make sure retired timeline semaphores are no longer referenced by GPU
+    /// submissions before freeing them. A context-owned device must idle all
+    /// its queues before destruction. For a borrowed device, only wait on
+    /// pixelforge's queues; the caller remains responsible for any other work
+    /// it submitted using pixelforge's exported TimelinePoints.
+    fn wait_before_teardown(&self) -> std::result::Result<(), vk::Result> {
+        if self.owns_device {
+            return unsafe { self.device.device_wait_idle() };
+        }
+        let mut queues = vec![self.compute_queue];
+        if !queues.contains(&self.transfer_queue) {
+            queues.push(self.transfer_queue);
+        }
+        if let Some(queue) = self.video_encode_queue {
+            if !queues.contains(&queue) {
+                queues.push(queue);
+            }
+        }
+        if let Some(queue) = self.video_decode_queue {
+            if !queues.contains(&queue) {
+                queues.push(queue);
+            }
+        }
+        for queue in queues {
+            unsafe { self.device.queue_wait_idle(queue)? };
+        }
+        Ok(())
+    }
+}
+
 impl Drop for VideoContextInner {
     fn drop(&mut self) {
+        let completion = self.wait_before_teardown();
+        if !gpu_work_completed(&completion) {
+            tracing::error!(
+                ?completion,
+                "Cannot prove GPU completion; retaining Vulkan device and retired semaphores"
+            );
+            // ash handles have no automatic destructor. Retain rather than
+            // destroy resources with unresolved GPU references.
+            return;
+        }
         // Ours whoever owns the device, and gone before the device can be.
         let retired = std::mem::take(
             self.retired_semaphores
