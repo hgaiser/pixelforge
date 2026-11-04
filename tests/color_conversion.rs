@@ -14,7 +14,7 @@
 //! target rather than from the shader's branches, so a wrong branch shows up as
 //! a large disagreement.
 //!
-//! Luma only, since chroma is averaged over 2x2 blocks and that averaging would
+//! Luma only, since chroma is filtered over neighbouring pixels and that filter would
 //! muddy the comparison. The test frame is deliberately not grey: grey converts
 //! to exact values and would hide the very errors being looked for.
 //!

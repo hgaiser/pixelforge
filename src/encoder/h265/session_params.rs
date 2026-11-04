@@ -128,7 +128,9 @@ impl H265 {
                 1,
                 if desc.full_range { 1 } else { 0 },
                 1,
-                0,
+                // chroma_loc_info_present_flag: 4:2:0 chroma sits on the left
+                // luma sample, midway between the two rows (type 0).
+                matches!(config.pixel_format, PixelFormat::Yuv420) as u32,
                 0,
                 0,
                 0,
