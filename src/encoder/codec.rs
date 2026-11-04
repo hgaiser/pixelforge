@@ -626,8 +626,11 @@ pub(crate) struct CommonInitRequest<'a> {
     pub caps: &'a DeviceVideoCaps,
     /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
     pub align_unit: u32,
-    /// Upper bound on active reference pictures the codec's syntax allows.
-    pub max_active_refs_cap: usize,
+    /// Upper bound on the reference window the codec's syntax allows.
+    pub max_reference_window: usize,
+    /// How many references one frame may predict from, from the codec's own
+    /// capabilities (`maxPPictureL0ReferenceCount`, `maxSingleReferenceCount`).
+    pub max_frame_references: usize,
     pub bitstream_buffer_size: usize,
     /// Whether the codec can use a layered DPB image when the driver lacks
     /// `SEPARATE_REFERENCE_IMAGES` (H.264/H.265 yes; AV1 no).
@@ -638,9 +641,12 @@ pub(crate) struct CommonInitRequest<'a> {
 }
 
 /// Result of [`build_encoder_common`]: the assembled common state plus the
-/// negotiated active-reference count the codec needs for its parameter sets.
+/// negotiated reference counts the codec needs for its parameter sets.
 pub(crate) struct CommonInit {
     pub common: EncoderCommon,
+    /// How many reconstructed frames stay in the DPB as references.
+    pub reference_window: u32,
+    /// How many of the newest of those one frame predicts from.
     pub active_reference_count: u32,
 }
 
@@ -818,7 +824,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         .find(|f| *f == preferred_src_format)
         .unwrap_or(supported_dpb_formats[0].format);
 
-    // Negotiate DPB slots and active references.
+    // Negotiate the reference window and the references each frame uses.
+    //
+    // The window is how many reconstructed frames stay in the DPB, which is
+    // what reference frame invalidation can recover from. Each frame predicts
+    // from only the newest `active` of them, so a device that predicts from
+    // one or two references still keeps older frames to fall back on. This is
+    // the model NVENC documents for `NvEncInvalidateRefFrames`.
     let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;
     let max_active_supported = capabilities.max_active_reference_pictures as usize;
     if max_dpb_slots_supported < 2 {
@@ -827,18 +839,36 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
             max_dpb_slots_supported
         )));
     }
-    let mut target_active_refs = (config.max_reference_frames as usize)
+    // At least 1: `max_dpb_slots_supported` is at least 2, and every codec's
+    // window cap and `MAX_DPB_SLOTS` are larger.
+    let window_limit = req
+        .max_reference_window
+        .min(max_dpb_slots_supported - 1)
+        .min(MAX_DPB_SLOTS - 1);
+    let reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
+    let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
-        .min(req.max_active_refs_cap);
-    if target_active_refs < 1 && max_active_supported >= 1 {
-        target_active_refs = 1;
+        .min(req.max_frame_references);
+    // `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` predicts from fewer references than
+    // the device allows, to reproduce a device with tighter limits.
+    if let Some(cap) = std::env::var("PIXELFORGE_MAX_ACTIVE_REFERENCES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        max_active_reference_pictures = max_active_reference_pictures.min(cap);
+    }
+    if max_active_reference_pictures < 1 && max_active_supported >= 1 {
+        max_active_reference_pictures = 1;
     }
     // B-frames are not yet supported, so a reconstructed-frame slot plus the
-    // active references is enough.
-    let dpb_slot_count = (target_active_refs + 1)
-        .min(max_dpb_slots_supported)
-        .min(MAX_DPB_SLOTS);
-    let max_active_reference_pictures = target_active_refs.min(dpb_slot_count.saturating_sub(1));
+    // window is enough.
+    let dpb_slot_count = reference_window + 1;
+    tracing::debug!(
+        "Reference window {reference_window}, {max_active_reference_pictures} used per frame \
+         (device: {max_dpb_slots_supported} DPB slots, {max_active_supported} active, \
+         {} per frame)",
+        req.max_frame_references
+    );
 
     let encode_queue_family = context.video_encode_queue_family().ok_or_else(|| {
         PixelForgeError::NoSuitableDevice("No video encode queue family available".to_string())
@@ -965,6 +995,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
 
     Ok(CommonInit {
         common,
+        reference_window: reference_window as u32,
         active_reference_count: max_active_reference_pictures as u32,
     })
 }

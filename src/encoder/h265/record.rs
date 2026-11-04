@@ -36,7 +36,10 @@ impl H265 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        let ref_dpb_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+        // Only the references this frame predicts from go to the encode. The
+        // rest of the window stays in its DPB slots, untouched.
+        let used_references = self.used_references();
+        let ref_dpb_slots: Vec<u8> = used_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
                 common.context.sync2(),
@@ -127,7 +130,11 @@ impl H265 {
                 let diff = prev_delta_poc - delta_poc;
                 delta_poc_s0_minus1[num_negative_pics as usize] = (diff - 1).max(0) as u16;
                 prev_delta_poc = delta_poc;
-                used_by_curr_pic_s0_flag |= 1 << num_negative_pics;
+                // Every held reference stays in the set, so the decoder keeps
+                // it too, but only the newest are used by this picture.
+                if i < used_references.len() {
+                    used_by_curr_pic_s0_flag |= 1 << num_negative_pics;
+                }
                 num_negative_pics += 1;
             }
             if is_b_frame && self.has_backward_reference {
@@ -213,8 +220,8 @@ impl H265 {
                 (0, 0)
             }
         } else if !is_idr && !self.l0_references.is_empty() {
-            let count = self.l0_references.len();
-            for (i, ref_info) in self.l0_references.iter().enumerate() {
+            let count = used_references.len();
+            for (i, ref_info) in used_references.iter().enumerate() {
                 if i < 15 {
                     ref_list0[i] = ref_info.dpb_slot;
                 }
@@ -339,7 +346,7 @@ impl H265 {
         let has_l1_ref = is_b_frame && self.has_backward_reference;
 
         if has_l0_ref {
-            for ref_info in &self.l0_references {
+            for ref_info in used_references {
                 ref_resources.push(
                     vk::VideoPictureResourceInfoKHR::default()
                         .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -379,7 +386,7 @@ impl H265 {
         let mut stored_indices_count = 0;
         let mut slot_infos_iter = h265_slot_infos.iter_mut();
         if has_l0_ref {
-            for ref_info in &self.l0_references {
+            for ref_info in used_references {
                 if let Some(h265_slot_info) = slot_infos_iter.next() {
                     let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
                         .slot_index(ref_info.dpb_slot as i32)

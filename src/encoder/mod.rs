@@ -413,7 +413,11 @@ pub struct EncodeConfig {
     /// Number of consecutive B-frames. Always 0: no codec encodes B-frames
     /// yet, so there is no setter.
     pub(crate) b_frame_count: u32,
-    /// Maximum number of reference frames.
+    /// Maximum number of reference frames kept in the DPB: the window that
+    /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
+    /// can recover from. Each frame predicts from only as many of the newest
+    /// as the device allows, which can be fewer. The device's DPB size can
+    /// also lower it.
     pub max_reference_frames: u32,
     /// VBV/HRD virtual buffer size in milliseconds, for
     /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
@@ -558,7 +562,8 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the maximum reference frames.
+    /// Set the maximum reference frames kept in the DPB (see
+    /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
         self

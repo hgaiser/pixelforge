@@ -430,6 +430,10 @@ impl Encoder {
     /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
     /// re-anchors prediction to the most recent survivor, falling back to an
     /// IDR (AV1: key frame) only when the loss covers the entire window.
+    ///
+    /// The window does not depend on how many references the device can
+    /// predict from per frame. A device that predicts from one or two still
+    /// keeps the whole window, and recovers from the older frames in it.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         let local = first_lost_display_order.saturating_sub(self.pts_offset);
         self.inner.invalidate_reference_frames(local)

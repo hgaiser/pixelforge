@@ -84,7 +84,10 @@ impl H264 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        let ref_dpb_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+        // Only the references this frame predicts from go to the encode. The
+        // rest of the window stays in its DPB slots, untouched.
+        let used_references = self.used_references();
+        let ref_dpb_slots: Vec<u8> = used_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
                 common.context.sync2(),
@@ -277,10 +280,10 @@ impl H264 {
         };
 
         // Vectors hold the data so pointers into them stay stable.
-        let mut l0_resources = Vec::with_capacity(self.l0_references.len());
-        let mut l0_std_infos = Vec::with_capacity(self.l0_references.len());
+        let mut l0_resources = Vec::with_capacity(used_references.len());
+        let mut l0_std_infos = Vec::with_capacity(used_references.len());
 
-        for ref_info in &self.l0_references {
+        for ref_info in used_references {
             l0_resources.push(
                 vk::VideoPictureResourceInfoKHR::default()
                     .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -312,7 +315,7 @@ impl H264 {
             .zip(l0_dpb_slot_infos.iter_mut())
             .enumerate()
         {
-            let ref_info = &self.l0_references[i];
+            let ref_info = &used_references[i];
             l0_slots.push(
                 vk::VideoReferenceSlotInfoKHR::default()
                     .slot_index(ref_info.dpb_slot as i32)

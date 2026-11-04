@@ -36,9 +36,27 @@ pub(crate) struct H265 {
     has_backward_reference: bool,
     backward_reference_poc: i32,
     backward_reference_dpb_slot: u8,
+    /// References held in the DPB, most-recent first. Each frame predicts
+    /// from the first `active_reference_count`; the rest stay in its
+    /// reference picture set, unused, for reference frame invalidation to fall
+    /// back on.
     l0_references: Vec<ReferenceInfo>,
+    /// How many references stay in the DPB.
+    reference_window: u32,
+    /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
     profile_idc: u32,
+}
+
+impl H265 {
+    /// The references this frame predicts from: the newest held ones.
+    fn used_references(&self) -> &[ReferenceInfo] {
+        let n = self
+            .l0_references
+            .len()
+            .min(self.active_reference_count as usize);
+        &self.l0_references[..n]
+    }
 }
 
 impl VideoCodec for H265 {
@@ -50,7 +68,7 @@ impl VideoCodec for H265 {
         if plan.is_idr() {
             let dpb_config = DpbConfig {
                 dpb_size: common.dpb_slot_count as u32,
-                max_num_ref_frames: common.config.max_reference_frames,
+                max_num_ref_frames: self.reference_window,
                 use_multiple_references: common.config.b_frame_count > 0,
                 log2_max_frame_num_minus4: 0,
                 log2_max_pic_order_cnt_lsb_minus4: 4,
@@ -117,7 +135,7 @@ impl VideoCodec for H265 {
                 display_order: plan.display_order,
             },
         );
-        while self.l0_references.len() > self.active_reference_count as usize {
+        while self.l0_references.len() > self.reference_window as usize {
             self.l0_references.pop();
         }
 

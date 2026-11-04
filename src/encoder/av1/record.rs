@@ -47,7 +47,9 @@ impl Av1 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        let ref_dpb_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
+        // Only the references this frame predicts from go to the encode. The
+        // rest of the window stays in its DPB slots, untouched.
+        let ref_dpb_slots: Vec<u8> = self.used_references().iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
                 common.context.sync2(),
@@ -115,15 +117,15 @@ impl Av1 {
             .picture_resource(&setup_picture_resource)
             .push(&mut setup_av1_dpb_info_ref0);
 
-        // Reference frames for inter frames: declare each distinct DPB slot we
-        // still hold, most-recent first. The vectors hold the data so the
+        // Reference frames for inter frames: declare each distinct DPB slot
+        // this frame predicts from, most-recent first. The vectors hold the data so the
         // pointers the slot infos take into them stay stable.
         //
         // `distinct_refs` dedups by DPB slot (a reference can be mapped to more
         // than one AV1 reference name below, but each slot is declared once).
         let mut distinct_refs: Vec<&super::ReferenceInfo> = Vec::new();
         if !is_key_frame {
-            for r in &self.references {
+            for r in self.used_references() {
                 if !distinct_refs.iter().any(|d| d.dpb_slot == r.dpb_slot) {
                     distinct_refs.push(r);
                 }
@@ -245,18 +247,14 @@ impl Av1 {
             pBufferRemovalTimes: std::ptr::null(),
         };
 
-        // Map the 7 AV1 reference names to DPB slots. The N most-recent
-        // references take the first N forward names (LAST, LAST2, LAST3,
-        // GOLDEN, ...); any remaining names reuse the oldest surviving
-        // reference so every name resolves to a valid, decodable DPB slot. This
+        // Map the AV1 reference names this frame predicts from to DPB slots
+        // (see `reference_names`); the others stay -1. The names that are set
         // must mirror `ref_frame_idx` from `calculate_reference_frame_mapping`.
-        let mut reference_name_slot_indices = [-1i32; 7];
-        if !is_key_frame && !self.references.is_empty() {
-            let n = self.references.len();
-            for (name, idx) in reference_name_slot_indices.iter_mut().enumerate() {
-                *idx = self.references[name.min(n - 1)].dpb_slot as i32;
-            }
-        }
+        let reference_name_slot_indices = if !is_key_frame && !self.references.is_empty() {
+            self.reference_names()
+        } else {
+            [-1i32; 7]
+        };
 
         let (prediction_mode, rate_control_group) = if is_key_frame {
             (
@@ -464,19 +462,31 @@ impl Av1 {
 
         let mut ref_frame_idx = [0i8; 7];
         let mut ref_order_hint = [0u8; 8];
-        let n = self.references.len();
-        // Most-recent references take the first forward names; surplus names
-        // reuse the oldest survivor. Matches `reference_name_slot_indices`.
-        for (name, idx) in ref_frame_idx.iter_mut().enumerate() {
-            *idx = self.references[name.min(n - 1)].dpb_slot as i8;
+        // The names this frame predicts from match `reference_name_slot_indices`.
+        // The bitstream needs a slot for every name, so the others point at
+        // the most recent reference, which no block then uses.
+        let names = self.reference_names();
+        let newest = self.references[0].dpb_slot as i8;
+        for (idx, &slot) in ref_frame_idx.iter_mut().zip(&names) {
+            *idx = if slot >= 0 { slot as i8 } else { newest };
         }
-        // Order hints keyed by DPB slot.
+        // Order hints keyed by DPB slot, for every reference still held.
         for r in &self.references {
             ref_order_hint[r.dpb_slot as usize] = r.order_hint as u8;
         }
-        // Load the frame context from the most recent (LAST) reference, and
-        // refresh only the current slot so this frame becomes the new LAST.
+        // Load the frame context from the most recent reference, under the
+        // first name it took, and refresh only the current slot so this frame
+        // becomes the newest reference.
+        let primary_ref_frame = names
+            .iter()
+            .position(|&slot| slot >= 0)
+            .map_or(PRIMARY_REF_NONE, |name| name as u8);
         let refresh_flags = 1u8 << current_dpb_slot;
-        (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
+        (
+            ref_frame_idx,
+            ref_order_hint,
+            primary_ref_frame,
+            refresh_flags,
+        )
     }
 }

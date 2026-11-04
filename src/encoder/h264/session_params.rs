@@ -69,6 +69,9 @@ impl H264 {
         };
 
         let max_active = self.active_reference_count() as u8;
+        // The decoder's sliding window holds as many frames as the encoder
+        // keeps, so older ones survive for reference frame invalidation.
+        let window = self.reference_window() as u8;
 
         let mut vui_flags: ash::vk::native::StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
         vui_flags.set_aspect_ratio_info_present_flag(1);
@@ -98,7 +101,7 @@ impl H264 {
             num_units_in_tick: 0,
             time_scale: 0,
             max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },
-            max_dec_frame_buffering: max_active + 1,
+            max_dec_frame_buffering: window + 1,
             chroma_sample_loc_type_top_field: 0,
             chroma_sample_loc_type_bottom_field: 0,
             reserved1: 0,
@@ -123,7 +126,7 @@ impl H264 {
             offset_for_top_to_bottom_field: 0,
             log2_max_pic_order_cnt_lsb_minus4: 4,
             num_ref_frames_in_pic_order_cnt_cycle: 0,
-            max_num_ref_frames: max_active,
+            max_num_ref_frames: window,
             reserved1: 0,
             pic_width_in_mbs_minus1: pic_width_in_mbs - 1,
             pic_height_in_map_units_minus1: pic_height_in_map_units - 1,

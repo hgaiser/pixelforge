@@ -143,6 +143,19 @@ direct read and the unaligned-size test are skipped, and only RADV can check
 them. `PIXELFORGE_NO_DMABUF_QUIRKS=1` turns the quirks off, which makes two of
 those tests fail on that driver.
 
+Reference frame invalidation (`tests/rfi.rs`) recovers from the frames the
+encoder keeps in the DPB (the window, `max_reference_frames`), which can be
+more than each frame predicts from. A device that allows many references per
+frame never exercises that. `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` limits the
+references per frame without changing the window, to test it:
+
+```bash
+PIXELFORGE_MAX_ACTIVE_REFERENCES=1 cargo test --test rfi -- --ignored --nocapture
+```
+
+`RUST_LOG=pixelforge::encoder::codec=debug` reports the negotiated window and
+per-frame count, on the `Reference window` line.
+
 Tests run one at a time (`RUST_TEST_THREADS=1` in `.cargo/config.toml`): the
 NVIDIA driver can deadlock when one thread destroys a device while another
 creates objects on a different one.

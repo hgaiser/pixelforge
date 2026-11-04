@@ -1,4 +1,4 @@
-use super::{H264, MB_SIZE};
+use super::{H264, MB_SIZE, ReferenceInfo};
 
 use crate::converter::InputFormat;
 use crate::encoder::EncodeConfig;
@@ -65,11 +65,13 @@ impl H264 {
             rgb_input,
             caps: &caps,
             align_unit: MB_SIZE,
-            max_active_refs_cap: 32,
+            max_reference_window: 32,
+            max_frame_references: h264_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
             allow_layered_dpb: true,
             rgb_caps,
         })?;
+        let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
@@ -94,6 +96,7 @@ impl H264 {
             backward_reference_poc: 0,
             backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
+            reference_window,
             active_reference_count,
             pending_unmark_frame_nums: Vec::new(),
             profile_idc,
@@ -120,9 +123,23 @@ impl H264 {
         self.preferred_entropy_cabac
     }
 
-    /// Negotiated active reference count.
+    /// How many of the newest references one frame predicts from.
     pub(super) fn active_reference_count(&self) -> u32 {
         self.active_reference_count
+    }
+
+    /// How many references stay in the DPB.
+    pub(super) fn reference_window(&self) -> u32 {
+        self.reference_window
+    }
+
+    /// The references this frame predicts from: the newest held ones.
+    pub(super) fn used_references(&self) -> &[ReferenceInfo] {
+        let n = self
+            .l0_references
+            .len()
+            .min(self.active_reference_count as usize);
+        &self.l0_references[..n]
     }
 }
 

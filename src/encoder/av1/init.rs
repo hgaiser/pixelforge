@@ -54,10 +54,14 @@ impl Av1 {
             align_unit: SUPERBLOCK_SIZE,
             // AV1 has NUM_REF_FRAMES = 8 DPB slots, and `refresh_frame_flags`
             // is an 8-bit syntax element. `build_encoder_common` adds one setup
-            // slot on top of the active count, so cap active refs at 7 to keep
-            // every DPB slot index in 0..=7 (the range the [u8; 8] order-hint
-            // array and `1 << slot` refresh mask can represent).
-            max_active_refs_cap: 7,
+            // slot on top of the window, so cap the window at 7 to keep every
+            // DPB slot index in 0..=7 (the range the [u8; 8] order-hint array
+            // and `1 << slot` refresh mask can represent).
+            max_reference_window: 7,
+            // Inter frames use single-reference prediction, so each may name
+            // at most this many references, and only names in the mask.
+            max_frame_references: (av1_caps.max_single_reference_count as usize)
+                .min(av1_caps.single_reference_name_mask.count_ones() as usize),
             bitstream_buffer_size,
             // Allow the shared infrastructure to fall back to a layered DPB
             // when the driver does not support separate reference images
@@ -65,6 +69,7 @@ impl Av1 {
             allow_layered_dpb: true,
             rgb_caps,
         })?;
+        let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
@@ -73,7 +78,9 @@ impl Av1 {
             order_hint: 0,
             header_data: None,
             references: Vec::new(),
+            reference_window,
             active_reference_count,
+            single_reference_name_mask: av1_caps.single_reference_name_mask,
         };
 
         let mut encoder = CodecEncoder { common, codec };
