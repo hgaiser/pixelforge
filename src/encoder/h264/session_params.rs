@@ -75,6 +75,12 @@ impl H264 {
         vui_flags.set_video_signal_type_present_flag(1);
         vui_flags.set_video_full_range_flag(if desc.full_range { 1 } else { 0 });
         vui_flags.set_color_description_present_flag(1);
+        // 4:2:0 chroma sits on the left luma sample, midway between the two
+        // rows (chroma_sample_loc_type 0), and the stream says so.
+        vui_flags
+            .set_chroma_loc_info_present_flag(
+                matches!(config.pixel_format, PixelFormat::Yuv420) as u32
+            );
         // Avoid HRD with zeroed bitrates (device loss on some drivers).
         vui_flags.set_nal_hrd_parameters_present_flag(0);
         vui_flags.set_bitstream_restriction_flag(1);

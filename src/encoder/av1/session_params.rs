@@ -69,7 +69,13 @@ impl Av1 {
             color_primaries: av1_color_primaries,
             transfer_characteristics: av1_transfer,
             matrix_coefficients: av1_matrix,
-            chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
+            // 4:2:0 chroma sits on the left luma sample, midway between the
+            // two rows. Only 4:2:0 writes a position at all.
+            chroma_sample_position: if subsampling_x == 1 && subsampling_y == 1 {
+                ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_VERTICAL
+            } else {
+                ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN
+            },
         };
 
         let profile = match config.pixel_format {
