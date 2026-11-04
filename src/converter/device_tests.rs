@@ -642,3 +642,48 @@ fn pipelined_shader_frames_do_not_overwrite_each_other() -> Result<(), Box<dyn s
     }
     Ok(())
 }
+
+/// Whether the encoder gives the same stream twice from the same input.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn encode_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = VideoContextBuilder::new().require_encode(codec).build() else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let encode = || -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+            let mut encoder = Encoder::new(context.clone(), encode_config(codec))?;
+            let mut converter = ColorConverter::new(
+                context.clone(),
+                ColorConverterConfig::new(
+                    ENCODE_WIDTH,
+                    ENCODE_HEIGHT,
+                    InputFormat::BGRA,
+                    OutputFormat::NV12,
+                    ColorSpec::Srgb,
+                    ColorSpec::Srgb,
+                    ColorRange::Limited,
+                ),
+            )?;
+            let mut packets = Vec::new();
+            for n in 0..8 {
+                let src = unsafe {
+                    create_src_image(&context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))?
+                };
+                let slot = encoder.input_slot()?;
+                convert_into(&mut converter, src.image, slot.image())?;
+                packets.push(pollster::block_on(encoder.submit(Frame::input(slot))?)?.data);
+            }
+            Ok(packets)
+        };
+        let first = encode()?;
+        for run in 1..5 {
+            let other = encode()?;
+            let differ: Vec<usize> = (0..first.len()).filter(|&i| first[i] != other[i]).collect();
+            println!("{codec:?} run {run}: frames that differ from run 0: {differ:?}");
+        }
+    }
+    Ok(())
+}
