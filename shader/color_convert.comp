@@ -169,6 +169,23 @@ uint q10_c(float c) {
     return (val << 6u) & 0xFFC0u;
 }
 
+// 4:2:0 chroma for the block whose top-left sample is (x, y), sited where a
+// player puts it when the stream says nothing else: on the left luma column,
+// midway between the two rows (chroma_sample_loc_type 0). That is a [1 2 1]
+// filter centred on column x, averaged over both rows. A sample past an edge
+// repeats the edge. `yuv` is the sample at (x, y), already converted.
+vec2 chroma_420(uint x, uint y, vec3 yuv) {
+    uint xl = x > 0u ? x - 1u : x;
+    uint xr = min(x + 1u, params.width - 1u);
+    uint yb = min(y + 1u, params.height - 1u);
+    vec2 top = rgb_to_yuv(read_rgb(ivec2(xl, y))).yz + 2.0 * yuv.yz
+        + rgb_to_yuv(read_rgb(ivec2(xr, y))).yz;
+    vec2 bottom = rgb_to_yuv(read_rgb(ivec2(xl, yb))).yz
+        + 2.0 * rgb_to_yuv(read_rgb(ivec2(x, yb))).yz
+        + rgb_to_yuv(read_rgb(ivec2(xr, yb))).yz;
+    return (top + bottom) / 8.0;
+}
+
 void main() {
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
@@ -222,16 +239,9 @@ void main() {
             uint uv_width = params.width / 2u;
             uint uv_idx = uv_y * uv_width + uv_x;
 
-            vec3 yuv00 = yuv;
-            vec3 yuv10 = (x + 1u < params.width) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
-            vec3 yuv01 = (y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
-            vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
-
-            float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
-            float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
+            vec2 uv = chroma_420(x, y, yuv);
+            float avg_u = uv.x;
+            float avg_v = uv.y;
 
             uint uv_base_words = pixel_count / 2u;
             uint uv_word_idx = uv_base_words + uv_idx;
@@ -251,16 +261,9 @@ void main() {
             uint uv_width = params.width / 2u;
             uint uv_idx = uv_y * uv_width + uv_x;
 
-            vec3 yuv00 = yuv;
-            vec3 yuv10 = (x + 1u < params.width) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
-            vec3 yuv01 = (y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
-            vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
-
-            float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
-            float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
+            vec2 uv = chroma_420(x, y, yuv);
+            float avg_u = uv.x;
+            float avg_v = uv.y;
 
             if (params.output_format == 0u) {
                 // NV12: Interleaved UV after Y plane.
