@@ -683,14 +683,14 @@ impl ColorConverter {
         unsafe {
             device
                 .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
             device
                 .begin_command_buffer(self.command_buffer, &begin_info)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
             // --- Phase 1: Transition source image for shader read ---
 
@@ -899,7 +899,7 @@ impl ColorConverter {
 
             device
                 .end_command_buffer(self.command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
         }
 
         let (semaphore, value) = self.timeline.pending_signal();
@@ -920,11 +920,11 @@ impl ColorConverter {
         unsafe {
             device
                 .reset_fences(&[self.fence])
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetFences"))?;
             self.context
                 .sync2()
                 .queue_submit2(self.context.compute_queue(), &[submit_info], self.fence)
-                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
+                .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
         self.timeline.commit();
         self.in_flight = true;
@@ -942,7 +942,7 @@ impl ColorConverter {
                     .device()
                     .wait_for_fences(&[self.fence], true, u64::MAX)
             }
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
+            .map_err(PixelForgeError::vk("vkWaitForFences"))?;
             self.in_flight = false;
         }
         self.destroy_src_view();
@@ -965,7 +965,7 @@ impl ColorConverter {
             });
 
         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateImageView"))?;
 
         self.src_view = Some(view);
         Ok(view)

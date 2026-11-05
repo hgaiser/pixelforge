@@ -900,10 +900,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::VideoSessionCreation(format!(
-            "{:?}",
-            result
-        )));
+        return Err(PixelForgeError::vulkan("vkCreateVideoSessionKHR", result));
     }
     let session_memory = allocate_session_memory(context, session, &video_queue_fn)?;
 

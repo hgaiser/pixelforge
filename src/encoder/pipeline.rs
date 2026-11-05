@@ -108,12 +108,7 @@ impl Future for EncodeFuture {
             })),
             // The sender was dropped without sending. The completion thread only
             // drops a sender after sending, so this indicates encoder teardown.
-            Poll::Ready(Err(oneshot::Canceled)) => {
-                Poll::Ready(Err(PixelForgeError::CommandBuffer(
-                    "encode cancelled: encoder shut down before the frame was read back"
-                        .to_string(),
-                )))
-            }
+            Poll::Ready(Err(oneshot::Canceled)) => Poll::Ready(Err(PixelForgeError::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -344,7 +339,10 @@ impl EncodePipeline {
             .spawn(move || {
                 run_completion_thread(thread_device, work_rx, thread_sync);
             })
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn readback thread: {e}")))?;
+            .map_err(|source| PixelForgeError::Io {
+                what: "spawning the readback thread",
+                source,
+            })?;
 
         Ok(Self {
             slots,
@@ -423,7 +421,7 @@ impl EncodePipeline {
         ) = {
             let slot = &mut self.slots[slot_index];
             let metadata = slot.pending_metadata.take().ok_or_else(|| {
-                PixelForgeError::CommandBuffer(
+                PixelForgeError::InvalidInput(
                     "submit_current called without pending packet metadata".to_string(),
                 )
             })?;

@@ -167,12 +167,7 @@ impl Av1 {
             common
                 .video_queue_fn
                 .create_video_session_parameters(&session_params_create_info, None)
-                .map_err(|e| {
-                    PixelForgeError::SessionParametersCreation(format!(
-                        "Failed to create AV1 session parameters: {:?}",
-                        e
-                    ))
-                })
+                .map_err(PixelForgeError::vk("vkCreateVideoSessionParametersKHR"))
         }
     }
 

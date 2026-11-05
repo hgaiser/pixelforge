@@ -402,7 +402,7 @@ impl H264Decoder {
             .or_else(|| supported.first())
             .copied()
             .ok_or_else(|| {
-                PixelForgeError::CodecNotSupported(
+                PixelForgeError::NoSuitableDevice(
                     "H.264 decode: no supported picture format for this profile".to_string(),
                 )
             })?;
@@ -598,12 +598,7 @@ impl H264Decoder {
                 .video_queue_fn
                 .create_video_session_parameters(&create_info, None)
         }
-        .map_err(|e| {
-            PixelForgeError::SessionParametersCreation(format!(
-                "H.264 decode session parameters: {:?}",
-                e
-            ))
-        })
+        .map_err(PixelForgeError::vk("vkCreateVideoSessionParametersKHR"))
     }
 
     /// Split `data` into pictures, absorbing any parameter sets encountered.

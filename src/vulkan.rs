@@ -488,7 +488,7 @@ fn find_decode_queue_families(
     let available = query_decode_codecs(entry, instance, physical_device);
     for codec in decode_codecs {
         if !available.contains(codec) {
-            return Err(PixelForgeError::CodecNotSupported(format!(
+            return Err(PixelForgeError::NoSuitableDevice(format!(
                 "Physical device does not support decoding {:?}",
                 codec
             )));
@@ -769,7 +769,7 @@ impl VideoContext {
             .semaphores(&semaphores)
             .values(&values);
         unsafe { self.inner.timeline.wait_semaphores(&info, u64::MAX) }
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))
+            .map_err(PixelForgeError::vk("vkWaitSemaphores"))
     }
 
     /// Hand over a semaphore to be destroyed with the context rather than now.
@@ -1441,7 +1441,7 @@ impl VideoContext {
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkCreateDevice"))?;
 
         // Get queues.
         let video_encode_queue =

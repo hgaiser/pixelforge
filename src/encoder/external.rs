@@ -243,7 +243,7 @@ impl ExternalImage {
             .memory(self.memory)
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let fd = unsafe { memory_fd.get_memory_fd(&info) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("DMA-BUF export: {e}")))?;
+            .map_err(PixelForgeError::vk("vkGetMemoryFdKHR"))?;
         // SAFETY: vkGetMemoryFdKHR hands over a new fd the caller owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let planes = (0..self.plane_count)
@@ -737,7 +737,7 @@ impl Encoder {
             info = info.push(&mut profile_list);
         }
         let image = unsafe { device.create_image(&info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("DMA-BUF image: {e}")))?;
+            .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
         let memory = match self.bind_external_memory(image, import) {
             Ok(memory) => memory,
@@ -823,14 +823,14 @@ impl Encoder {
                 unsafe {
                     memory_fd.get_memory_fd_properties(handle, buffer.fd.as_raw_fd(), &mut fd_props)
                 }
-                .map_err(|e| PixelForgeError::ResourceCreation(format!("DMA-BUF fd: {e}")))?;
+                .map_err(PixelForgeError::vk("vkGetMemoryFdPropertiesKHR"))?;
                 let type_index = context
                     .find_memory_type(
                         requirements.memory_type_bits & fd_props.memory_type_bits,
                         vk::MemoryPropertyFlags::empty(),
                     )
                     .ok_or_else(|| {
-                        PixelForgeError::ResourceCreation(
+                        PixelForgeError::NoSuitableDevice(
                             "DMA-BUF import: no memory type fits".to_string(),
                         )
                     })?;
@@ -842,7 +842,10 @@ impl Encoder {
                 let fd = buffer
                     .fd
                     .try_clone()
-                    .map_err(|e| PixelForgeError::ResourceCreation(format!("DMA-BUF fd: {e}")))?;
+                    .map_err(|source| PixelForgeError::Io {
+                        what: "duplicating the DMA-BUF fd",
+                        source,
+                    })?;
                 let raw = fd.into_raw_fd();
                 let mut import_info = vk::ImportMemoryFdInfoKHR::default()
                     .handle_type(handle)
@@ -852,9 +855,8 @@ impl Encoder {
                     .memory_type_index(type_index)
                     .push(&mut import_info)
                     .push(&mut dedicated);
-                unsafe { device.allocate_memory(&info, None) }.map_err(|e| {
-                    PixelForgeError::ResourceCreation(format!("DMA-BUF import: {e}"))
-                })?
+                unsafe { device.allocate_memory(&info, None) }
+                    .map_err(PixelForgeError::vk("vkAllocateMemory"))?
             }
             None => {
                 let type_index = context
@@ -869,7 +871,7 @@ impl Encoder {
                         )
                     })
                     .ok_or_else(|| {
-                        PixelForgeError::ResourceCreation(
+                        PixelForgeError::NoSuitableDevice(
                             "DMA-BUF allocation: no memory type fits".to_string(),
                         )
                     })?;
@@ -879,16 +881,13 @@ impl Encoder {
                     .memory_type_index(type_index)
                     .push(&mut export)
                     .push(&mut dedicated);
-                unsafe { device.allocate_memory(&info, None) }.map_err(|e| {
-                    PixelForgeError::ResourceCreation(format!("DMA-BUF allocation: {e}"))
-                })?
+                unsafe { device.allocate_memory(&info, None) }
+                    .map_err(PixelForgeError::vk("vkAllocateMemory"))?
             }
         };
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
             unsafe { device.free_memory(memory, None) };
-            return Err(PixelForgeError::ResourceCreation(format!(
-                "DMA-BUF bind: {e}"
-            )));
+            return Err(PixelForgeError::vulkan("vkBindImageMemory", e));
         }
         Ok(memory)
     }
@@ -964,14 +963,14 @@ impl SyncFiles {
         for _ in 0..slots {
             let semaphore =
                 unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                    .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+                    .map_err(PixelForgeError::vk("vkCreateSemaphore"))?;
             files.acquire.push(semaphore);
             let mut export = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
             let semaphore = unsafe {
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default().push(&mut export), None)
             }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkCreateSemaphore"))?;
             files.release.push(semaphore);
         }
         Ok(files)
@@ -993,9 +992,7 @@ impl SyncFiles {
             .fd(raw);
         // Never closed here on failure, as for memory imports.
         if let Err(e) = unsafe { self.fd_fn.import_semaphore_fd(&info) } {
-            return Err(PixelForgeError::Synchronization(format!(
-                "sync_file import: {e}"
-            )));
+            return Err(PixelForgeError::vulkan("vkImportSemaphoreFdKHR", e));
         }
         Ok(vk::SemaphoreSubmitInfo::default()
             .semaphore(semaphore)
@@ -1017,7 +1014,7 @@ impl SyncFiles {
             .semaphore(self.release[slot])
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let fd = unsafe { self.fd_fn.get_semaphore_fd(&info) }
-            .map_err(|e| PixelForgeError::Synchronization(format!("sync_file export: {e}")))?;
+            .map_err(PixelForgeError::vk("vkGetSemaphoreFdKHR"))?;
         if fd < 0 {
             return Ok(None);
         }

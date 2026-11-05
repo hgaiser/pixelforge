@@ -62,7 +62,7 @@ pub(crate) fn query_decode_caps(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::CodecNotSupported(format!(
+        return Err(PixelForgeError::NoSuitableDevice(format!(
             "decode profile not supported: {:?}",
             result
         )));
@@ -301,9 +301,8 @@ impl DecoderCommon {
         let video_decode_fn =
             ash::khr::video_decode_queue::Device::load(context.instance(), context.device());
 
-        let command_pool = create_command_pool(&context, decode_queue_family, "decode")?;
-        let transfer_pool =
-            create_command_pool(&context, context.transfer_queue_family(), "decode transfer")?;
+        let command_pool = create_command_pool(&context, decode_queue_family)?;
+        let transfer_pool = create_command_pool(&context, context.transfer_queue_family())?;
         let (pipeline, frames_rx) = DecodePipeline::new(&context, command_pool, transfer_pool)?;
 
         Ok(Self {
@@ -407,7 +406,7 @@ impl DecoderCommon {
             self.video_queue_fn
                 .create_video_session(&session_create_info, None)
         }
-        .map_err(|e| PixelForgeError::VideoSessionCreation(format!("{:?}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateVideoSessionKHR"))?;
 
         let session_memory = allocate_session_memory(&self.context, session, &self.video_queue_fn)?;
 
@@ -657,12 +656,12 @@ impl DecoderCommon {
         unsafe {
             device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device
                 .begin_command_buffer(command_buffer, &begin_info)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
         }
         Ok(())
     }

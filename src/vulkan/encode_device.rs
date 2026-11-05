@@ -127,7 +127,7 @@ impl EncodePlan {
         } else {
             for codec in required {
                 if !available.contains(codec) {
-                    return Err(PixelForgeError::CodecNotSupported(format!(
+                    return Err(PixelForgeError::NoSuitableDevice(format!(
                         "Queue family {} does not support encoding {:?}",
                         family, codec
                     )));

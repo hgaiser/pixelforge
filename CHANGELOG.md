@@ -81,6 +81,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root.
 - **Breaking:** the `DEFAULT_*` encoder constants are no longer public.
   `EncodeConfig::new` and `RateControl::default_for` apply them.
+- **Breaking:** `PixelForgeError` has fewer, typed variants. A failed
+  Vulkan call is `Vulkan { call, result }`, with the function's name and its
+  `vk::Result`, in place of `DeviceCreation`, `VideoSessionCreation`,
+  `SessionParametersCreation`, `MemoryAllocation`, `ResourceCreation`,
+  `CommandBuffer`, `Synchronization`, `QueryPool` and `Vulkan(vk::Result)`.
+  A codec or memory type the device lacks is `NoSuitableDevice`, which
+  replaces `CodecNotSupported`. New are `Driver`, for a driver that reports
+  success with no usable result, `Io`, for a failed OS call, and
+  `Cancelled`, for a frame whose encoder shut down. `From<vk::Result>` is
+  removed.
+- Every failed Vulkan call on a lost device is `PixelForgeError::DeviceLost`.
+  Some were reported as another variant.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and

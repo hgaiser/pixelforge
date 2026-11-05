@@ -199,10 +199,10 @@ impl H264 {
             )
         };
         if result != vk::Result::SUCCESS {
-            return Err(PixelForgeError::SessionParametersCreation(format!(
-                "{:?}",
-                result
-            )));
+            return Err(PixelForgeError::vulkan(
+                "vkCreateVideoSessionParametersKHR",
+                result,
+            ));
         }
         Ok(session_params)
     }

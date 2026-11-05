@@ -86,7 +86,7 @@ fn allocate_and_bind_image_memory(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for image".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -94,13 +94,13 @@ fn allocate_and_bind_image_memory(
         .memory_type_index(memory_type_index);
 
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     match unsafe { context.device().bind_image_memory(image, memory, 0) } {
         Ok(()) => Ok(memory),
         Err(e) => {
             unsafe { context.device().free_memory(memory, None) };
-            Err(PixelForgeError::MemoryAllocation(e.to_string()))
+            Err(PixelForgeError::vulkan("vkBindImageMemory", e))
         }
     }
 }
@@ -142,7 +142,7 @@ fn create_video_image_raw(
     }
 
     let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
     match allocate_and_bind_image_memory(context, image) {
         Ok(memory) => Ok((image, memory)),
@@ -186,7 +186,7 @@ pub(crate) fn create_video_image_view(
         });
 
     unsafe { context.device().create_image_view(&view_create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))
+        .map_err(PixelForgeError::vk("vkCreateImageView"))
 }
 
 /// The single-plane formats a multi-planar picture format's planes can be
@@ -343,7 +343,7 @@ pub(crate) fn create_bitstream_buffer(
         .push(&mut profile_list);
 
     let buffer = unsafe { context.device().create_buffer(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
     let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
 
@@ -353,7 +353,7 @@ pub(crate) fn create_bitstream_buffer(
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for buffer".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for buffer".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -361,10 +361,10 @@ pub(crate) fn create_bitstream_buffer(
         .memory_type_index(memory_type_index);
 
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     unsafe { context.device().bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
     Ok((buffer, memory))
 }
@@ -376,7 +376,7 @@ pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Se
     let create_info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
 
     unsafe { context.device().create_semaphore(&create_info, None) }
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+        .map_err(PixelForgeError::vk("vkCreateSemaphore"))
 }
 
 /// Create an image for video encoding (input or DPB).
@@ -428,7 +428,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkGetVideoSessionMemoryRequirementsKHR",
+            result,
+        ));
     }
 
     // Query actual requirements.
@@ -445,7 +448,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkGetVideoSessionMemoryRequirementsKHR",
+            result,
+        ));
     }
 
     // Allocate and bind memory for each requirement.
@@ -466,7 +472,7 @@ pub(crate) fn allocate_session_memory(
             )
         })
         .ok_or_else(|| {
-            PixelForgeError::MemoryAllocation(format!(
+            PixelForgeError::NoSuitableDevice(format!(
                 "No suitable memory type for video session (type_bits: 0x{:x})",
                 req.memory_requirements.memory_type_bits
             ))
@@ -477,7 +483,7 @@ pub(crate) fn allocate_session_memory(
             .memory_type_index(memory_type_index);
 
         let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         bind_infos.push(
             vk::BindVideoSessionMemoryInfoKHR::default()
@@ -500,7 +506,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkBindVideoSessionMemoryKHR",
+            result,
+        ));
     }
 
     Ok(session_memory)
@@ -520,9 +529,7 @@ pub(crate) fn map_bitstream_buffer(
             vk::MemoryMapFlags::empty(),
         )
     }
-    .map_err(|e| {
-        PixelForgeError::MemoryAllocation(format!("Failed to map bitstream buffer: {}", e))
-    })? as *mut u8;
+    .map_err(PixelForgeError::vk("vkMapMemory"))? as *mut u8;
 
     Ok(ptr)
 }
@@ -598,19 +605,12 @@ pub(crate) fn create_dpb_images(
 }
 
 /// A command pool for `family`, with per-buffer reset.
-///
-/// `label` names the pool in the error message, since a decoder holds several
-/// for different queue families.
-pub(crate) fn create_command_pool(
-    context: &VideoContext,
-    family: u32,
-    label: &str,
-) -> Result<vk::CommandPool> {
+pub(crate) fn create_command_pool(context: &VideoContext, family: u32) -> Result<vk::CommandPool> {
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(family)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     unsafe { context.device().create_command_pool(&pool_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("{} command pool: {}", label, e)))
+        .map_err(PixelForgeError::vk("vkCreateCommandPool"))
 }
 
 /// Allocate `count` primary command buffers from `pool`.
@@ -624,7 +624,7 @@ pub(crate) fn allocate_command_buffers(
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(count);
     unsafe { context.device().allocate_command_buffers(&info) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))
+        .map_err(PixelForgeError::vk("vkAllocateCommandBuffers"))
 }
 
 /// A fence, created signaled when it will be waited on before its first submit.
@@ -634,7 +634,7 @@ pub(crate) fn create_fence(context: &VideoContext, signaled: bool) -> Result<vk:
         info = info.flags(vk::FenceCreateFlags::SIGNALED);
     }
     unsafe { context.device().create_fence(&info, None) }
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+        .map_err(PixelForgeError::vk("vkCreateFence"))
 }
 
 /// A chain of submissions ordered by one timeline semaphore.

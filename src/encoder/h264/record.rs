@@ -466,7 +466,7 @@ impl H264 {
 
             device
                 .end_command_buffer(command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
         }
 
         let future = common.submit_frame()?;

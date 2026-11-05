@@ -161,7 +161,7 @@ impl InputImage {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         let image = unsafe { device.create_image(&image_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
         // Get memory requirements and allocate.
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -172,7 +172,7 @@ impl InputImage {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .ok_or_else(|| {
-                PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
+                PixelForgeError::NoSuitableDevice("No suitable memory type for image".to_string())
             })?;
 
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -180,10 +180,10 @@ impl InputImage {
             .memory_type_index(memory_type_index);
 
         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         unsafe { device.bind_image_memory(image, memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBindImageMemory"))?;
 
         // Create staging buffer for uploads.
         // Size depends on pixel format, bit depth, and alignment padding between planes.
@@ -206,7 +206,7 @@ impl InputImage {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
         let staging_mem_requirements =
             unsafe { device.get_buffer_memory_requirements(staging_buffer) };
@@ -217,7 +217,7 @@ impl InputImage {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
             .ok_or_else(|| {
-                PixelForgeError::MemoryAllocation(
+                PixelForgeError::NoSuitableDevice(
                     "No suitable memory type for staging buffer".to_string(),
                 )
             })?;
@@ -227,10 +227,10 @@ impl InputImage {
             .memory_type_index(staging_memory_type);
 
         let staging_memory = unsafe { device.allocate_memory(&staging_alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
         // Create command pool and buffer for transfers.
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -238,7 +238,7 @@ impl InputImage {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkCreateCommandPool"))?;
 
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
@@ -246,13 +246,13 @@ impl InputImage {
             .command_buffer_count(1);
 
         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateCommandBuffers"))?;
         let command_buffer = command_buffers[0];
 
         // Create fence for synchronization.
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("fence creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateFence"))?;
 
         let source = SourceImage::new(
             &context,
@@ -289,7 +289,7 @@ impl InputImage {
                     staging_size as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
-                .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkMapMemory"))?;
             std::ptr::write_bytes(ptr as *mut u8, 0, staging_size);
             device.unmap_memory(staging_memory);
         }
@@ -366,7 +366,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkMapMemory"))?;
         // SAFETY: the mapping covers `staging_size` bytes and nothing else
         // uses it until it is unmapped below.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, self.staging_size) };
@@ -457,12 +457,12 @@ impl InputImage {
         unsafe {
             device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
         }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
         // Transition image to transfer destination.
         let barrier = vk::ImageMemoryBarrier::default()
@@ -621,24 +621,20 @@ impl InputImage {
         }
 
         unsafe { device.end_command_buffer(self.command_buffer) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
         // Submit and wait.
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(|e| {
-            PixelForgeError::vk(e, |e| {
-                PixelForgeError::CommandBuffer(format!("Queue submit failed: {e}"))
-            })
-        })?;
+            .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
+            .map_err(PixelForgeError::vk("vkWaitForFences"))?;
 
         unsafe { device.reset_fences(&[self.fence]) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkResetFences"))?;
 
         Ok(())
     }

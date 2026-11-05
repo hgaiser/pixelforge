@@ -393,7 +393,7 @@ impl Decoder {
     /// and [`VideoContext::supports_decode`]).
     pub fn new(context: VideoContext, config: DecodeConfig) -> Result<Self> {
         if !context.supports_decode(config.codec) {
-            return Err(PixelForgeError::CodecNotSupported(format!(
+            return Err(PixelForgeError::NoSuitableDevice(format!(
                 "{:?} decode is not supported by the selected device",
                 config.codec
             )));
@@ -401,7 +401,7 @@ impl Decoder {
         let mut inner: Box<dyn DecoderApi> = match config.codec {
             Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
             other => {
-                return Err(PixelForgeError::CodecNotSupported(format!(
+                return Err(PixelForgeError::InvalidInput(format!(
                     "{:?} decoding is not implemented yet",
                     other
                 )));

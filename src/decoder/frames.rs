@@ -589,7 +589,7 @@ fn create_pool_image(
         create_info.push(&mut format_list)
     };
     let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("reorder pool image: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
     let reqs = unsafe { context.device().get_image_memory_requirements(image) };
     let memory_type_index = find_memory_type(
@@ -598,15 +598,15 @@ fn create_pool_image(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No device-local memory for reorder pool".to_string())
+        PixelForgeError::NoSuitableDevice("No device-local memory for reorder pool".to_string())
     })?;
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
         .memory_type_index(memory_type_index);
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
     unsafe { context.device().bind_image_memory(image, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBindImageMemory"))?;
 
     Ok((image, memory))
 }
