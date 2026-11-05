@@ -79,9 +79,6 @@ impl H264 {
         let mut dpb = DecodedPictureBuffer::new();
         dpb.h264.sequence_start(DpbConfig {
             dpb_size: common.dpb_slot_count as u32,
-            max_num_ref_frames: if config.b_frame_count > 0 { 2 } else { 1 },
-            use_multiple_references: config.b_frame_count > 0,
-            max_long_term_refs: 0,
             log2_max_frame_num_minus4: 4,
             log2_max_pic_order_cnt_lsb_minus4: 4,
             num_temporal_layers: 1,
@@ -91,10 +88,6 @@ impl H264 {
             dpb,
             frame_num_syntax: 0,
             idr_pic_id: 0,
-            has_backward_reference: false,
-            backward_reference_frame_num: 0,
-            backward_reference_poc: 0,
-            backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
             reference_window,
             active_reference_count,

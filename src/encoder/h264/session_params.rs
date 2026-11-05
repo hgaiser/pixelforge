@@ -100,7 +100,7 @@ impl H264 {
             matrix_coefficients: desc.matrix_coefficients,
             num_units_in_tick: 0,
             time_scale: 0,
-            max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },
+            max_num_reorder_frames: 0,
             max_dec_frame_buffering: window + 1,
             chroma_sample_loc_type_top_field: 0,
             chroma_sample_loc_type_bottom_field: 0,
@@ -117,11 +117,7 @@ impl H264 {
             bit_depth_luma_minus8,
             bit_depth_chroma_minus8,
             log2_max_frame_num_minus4: 4,
-            pic_order_cnt_type: if config.b_frame_count > 0 {
-                ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_0
-            } else {
-                ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_2
-            },
+            pic_order_cnt_type: ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_2,
             offset_for_non_ref_pic: 0,
             offset_for_top_to_bottom_field: 0,
             log2_max_pic_order_cnt_lsb_minus4: 4,

@@ -3,24 +3,21 @@
 //! This module provides:
 //! - Core encoder types and configuration (`EncodeConfig`, `EncodedPacket`, etc.)
 //! - GOP structure management (`gop` module) - reusable for H.264/H.265.
-//! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
 
 mod api;
-pub mod av1;
-pub mod bitwriter;
+pub(crate) mod av1;
 pub(crate) mod codec;
-pub mod dpb;
+pub(crate) mod dpb;
 #[cfg(feature = "dmabuf")]
 pub mod external;
 mod frame;
-pub mod gop;
-pub mod h264;
-pub mod h265;
+pub(crate) mod gop;
+pub(crate) mod h264;
+pub(crate) mod h265;
 pub(crate) mod input;
 pub(crate) mod pipeline;
 pub(crate) mod profile;
-pub mod reorder;
-pub mod resources;
+pub(crate) mod resources;
 pub(crate) mod rgb;
 mod source;
 mod source_image;
@@ -410,9 +407,6 @@ pub struct EncodeConfig {
     pub frame_rate_denominator: u32,
     /// GOP size (distance between IDR frames).
     pub gop_size: u32,
-    /// Number of consecutive B-frames. Always 0: no codec encodes B-frames
-    /// yet, so there is no setter.
-    pub(crate) b_frame_count: u32,
     /// Maximum number of reference frames kept in the DPB: the window that
     /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
     /// can recover from. Each frame predicts from only as many of the newest
@@ -464,7 +458,6 @@ impl EncodeConfig {
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -491,7 +484,6 @@ impl EncodeConfig {
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -518,7 +510,6 @@ impl EncodeConfig {
             frame_rate_numerator: DEFAULT_FRAME_RATE,
             frame_rate_denominator: 1,
             gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
@@ -806,7 +797,6 @@ mod tests {
             assert_eq!(config.bit_depth, BitDepth::Eight);
             assert_eq!(config.rate_control, RateControl::Cqp { qp: 26 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.b_frame_count, 0);
             assert_eq!(config.frame_rate_numerator, 30);
             assert_eq!(config.frame_rate_denominator, 1);
         }
@@ -878,7 +868,6 @@ mod tests {
             // AV1 uses a 0-255 quantizer index.
             assert_eq!(config.rate_control, RateControl::Cqp { qp: 128 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.b_frame_count, 0);
             assert_eq!(config.frame_rate_numerator, 30);
             assert_eq!(config.frame_rate_denominator, 1);
         }

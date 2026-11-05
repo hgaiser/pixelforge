@@ -84,18 +84,8 @@ pub struct DpbEntry {
     pub temporal_id: i32,
     /// Timestamp of this picture.
     pub timestamp: u64,
-    /// Reference frame timestamp (for error recovery).
-    pub ref_frame_timestamp: u64,
     /// Picture type.
     pub pic_type: PictureType,
-    /// Dirty intra-refresh regions (for intra-refresh encoding).
-    pub dirty_intra_refresh_regions: u32,
-    /// View ID (for MVC support).
-    pub view_id: u32,
-    /// Whether top field was decoded first.
-    pub top_decoded_first: bool,
-    /// Whether this is a complementary field pair.
-    pub complementary_field_pair: bool,
     /// Whether this entry represents a non-existing frame (gap handling).
     pub not_existing: bool,
 }
@@ -130,12 +120,7 @@ impl DpbEntry {
             frame_id: 0,
             temporal_id: 0,
             timestamp: 0,
-            ref_frame_timestamp: 0,
             pic_type: PictureType::I,
-            dirty_intra_refresh_regions: 0,
-            view_id: 0,
-            top_decoded_first: true,
-            complementary_field_pair: false,
             not_existing: false,
         }
     }
@@ -143,11 +128,6 @@ impl DpbEntry {
     /// Reset this entry to empty state.
     pub fn reset(&mut self) {
         *self = Self::new();
-    }
-
-    /// Check if this entry is in use.
-    pub fn is_in_use(&self) -> bool {
-        self.state == DpbState::InUse
     }
 
     /// Check if this entry is a reference picture.
@@ -170,19 +150,6 @@ impl DpbEntry {
         self.marking = MarkingState::Unused;
         self.bottom_field_marking = MarkingState::Unused;
     }
-
-    /// Mark as short-term reference.
-    pub fn mark_short_term(&mut self) {
-        self.marking = MarkingState::ShortTerm;
-        self.bottom_field_marking = MarkingState::ShortTerm;
-    }
-
-    /// Mark as long-term reference.
-    pub fn mark_long_term(&mut self, long_term_frame_idx: i32) {
-        self.marking = MarkingState::LongTerm;
-        self.bottom_field_marking = MarkingState::LongTerm;
-        self.long_term_frame_idx = long_term_frame_idx;
-    }
 }
 
 #[cfg(test)]
@@ -194,7 +161,6 @@ mod tests {
         let entry = DpbEntry::new();
         assert_eq!(entry.state, DpbState::Empty);
         assert_eq!(entry.marking, MarkingState::Unused);
-        assert!(!entry.is_in_use());
         assert!(!entry.is_reference());
     }
 
@@ -202,12 +168,14 @@ mod tests {
     fn test_marking_state() {
         let mut entry = DpbEntry::new();
 
-        entry.mark_short_term();
+        entry.marking = MarkingState::ShortTerm;
+        entry.bottom_field_marking = MarkingState::ShortTerm;
         assert!(entry.is_short_term_reference());
         assert!(entry.is_reference());
         assert!(!entry.is_long_term_reference());
 
-        entry.mark_long_term(0);
+        entry.marking = MarkingState::LongTerm;
+        entry.bottom_field_marking = MarkingState::LongTerm;
         assert!(entry.is_long_term_reference());
         assert!(entry.is_reference());
         assert!(!entry.is_short_term_reference());

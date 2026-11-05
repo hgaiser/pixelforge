@@ -77,9 +77,6 @@ impl H265 {
         let mut dpb = DecodedPictureBuffer::new();
         dpb.h265.sequence_start(DpbConfig {
             dpb_size: common.dpb_slot_count as u32,
-            max_num_ref_frames: if config.b_frame_count > 0 { 2 } else { 1 },
-            use_multiple_references: config.b_frame_count > 0,
-            max_long_term_refs: 0,
             log2_max_frame_num_minus4: 0,
             log2_max_pic_order_cnt_lsb_minus4: 4,
             num_temporal_layers: 1,
@@ -88,9 +85,6 @@ impl H265 {
         let codec = H265 {
             dpb,
             header_data: None,
-            has_backward_reference: false,
-            backward_reference_poc: 0,
-            backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
             reference_window,
             active_reference_count,

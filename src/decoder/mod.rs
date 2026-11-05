@@ -44,7 +44,7 @@ pub(crate) mod common;
 /// Frame ownership: pool images, DPB slot pins, display-order reordering.
 pub(crate) mod frames;
 /// H.264 decoding.
-pub mod h264;
+pub(crate) mod h264;
 pub(crate) mod pipeline;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;

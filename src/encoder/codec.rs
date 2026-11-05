@@ -353,9 +353,6 @@ impl FramePlan {
     pub fn is_reference(&self) -> bool {
         self.gop.is_reference
     }
-    pub fn is_b_frame(&self) -> bool {
-        self.gop.frame_type == GopFrameType::B
-    }
     pub fn is_first_frame(&self) -> bool {
         self.encode_index == 0
     }
@@ -365,9 +362,8 @@ impl FramePlan {
     /// The stream-level frame type for packet metadata.
     pub fn frame_type(&self) -> FrameType {
         match self.gop.frame_type {
-            GopFrameType::Idr | GopFrameType::I => FrameType::I,
+            GopFrameType::Idr => FrameType::I,
             GopFrameType::P => FrameType::P,
-            GopFrameType::B => FrameType::B,
         }
     }
 }
@@ -951,7 +947,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
 
     // B-frames are not yet supported, so an I-P GOP. Set the SPS-matching
     // counters (no-ops for AV1, which keys off order hints).
-    let mut gop = GopStructure::new_ip_only(config.gop_size);
+    let mut gop = GopStructure::new(config.gop_size);
     gop.set_max_frame_num(4);
     gop.set_max_poc_lsb(4);
 

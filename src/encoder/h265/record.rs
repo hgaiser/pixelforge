@@ -22,7 +22,6 @@ impl H265 {
     ) -> Result<EncodeFuture> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
-        let is_b_frame = plan.is_b_frame();
         let pic_order_cnt = plan.pic_order_cnt();
 
         let slot = common.pipeline.current();
@@ -55,15 +54,11 @@ impl H265 {
 
         let slice_type = if is_idr {
             ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
-        } else if is_b_frame {
-            ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_B
         } else {
             ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
         };
         let picture_type = if is_idr {
             ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else if is_b_frame {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
         } else {
             ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
         };
@@ -107,11 +102,8 @@ impl H265 {
         // Short-term reference picture set: negative (past) refs for P, plus a
         // positive (future) ref for B.
         let mut delta_poc_s0_minus1 = [0u16; 16];
-        let mut delta_poc_s1_minus1 = [0u16; 16];
         let mut num_negative_pics: u8 = 0;
-        let mut num_positive_pics: u8 = 0;
         let mut used_by_curr_pic_s0_flag: u16 = 0;
-        let mut used_by_curr_pic_s1_flag: u16 = 0;
 
         if !is_idr && !self.l0_references.is_empty() {
             // max_poc = 2^(log2_max_pic_order_cnt_lsb_minus4 + 4) * 2 = 512.
@@ -137,12 +129,6 @@ impl H265 {
                 }
                 num_negative_pics += 1;
             }
-            if is_b_frame && self.has_backward_reference {
-                let delta_poc_l1 = self.backward_reference_poc - pic_order_cnt;
-                delta_poc_s1_minus1[0] = (delta_poc_l1 - 1).max(0) as u16;
-                num_positive_pics = 1;
-                used_by_curr_pic_s1_flag = 1;
-            }
         }
 
         let frame_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
@@ -158,14 +144,14 @@ impl H265 {
             abs_delta_rps_minus1: 0,
             used_by_curr_pic_flag: 0,
             used_by_curr_pic_s0_flag,
-            used_by_curr_pic_s1_flag,
+            used_by_curr_pic_s1_flag: 0,
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
             num_negative_pics,
-            num_positive_pics,
+            num_positive_pics: 0,
             delta_poc_s0_minus1,
-            delta_poc_s1_minus1,
+            delta_poc_s1_minus1: [0; 16],
         };
 
         let empty_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
@@ -209,26 +195,18 @@ impl H265 {
 
         const NO_REFERENCE_PICTURE: u8 = 0xFF;
         let mut ref_list0: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
-        let mut ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
+        let ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
 
-        let (num_ref_l0, num_ref_l1) = if is_b_frame && self.has_backward_reference {
-            if let Some(first_ref) = self.l0_references.first() {
-                ref_list0[0] = first_ref.dpb_slot;
-                ref_list1[0] = self.backward_reference_dpb_slot;
-                (1, 1)
-            } else {
-                (0, 0)
-            }
-        } else if !is_idr && !self.l0_references.is_empty() {
+        let num_ref_l0 = if !is_idr && !self.l0_references.is_empty() {
             let count = used_references.len();
             for (i, ref_info) in used_references.iter().enumerate() {
                 if i < 15 {
                     ref_list0[i] = ref_info.dpb_slot;
                 }
             }
-            (count.min(15), 0)
+            count.min(15)
         } else {
-            (0, 0)
+            0
         };
 
         let ref_lists_info = ash::vk::native::StdVideoEncodeH265ReferenceListsInfo {
@@ -244,11 +222,7 @@ impl H265 {
             } else {
                 0
             },
-            num_ref_idx_l1_active_minus1: if num_ref_l1 > 0 {
-                (num_ref_l1 - 1) as u8
-            } else {
-                0
-            },
+            num_ref_idx_l1_active_minus1: 0,
             RefPicList0: ref_list0,
             RefPicList1: ref_list1,
             list_entry_l0: [0; 15],
@@ -343,7 +317,6 @@ impl H265 {
         reference_slots_for_begin.push(setup_slot_for_begin);
 
         let has_l0_ref = !is_idr && !self.l0_references.is_empty();
-        let has_l1_ref = is_b_frame && self.has_backward_reference;
 
         if has_l0_ref {
             for ref_info in used_references {
@@ -360,22 +333,6 @@ impl H265 {
                     ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
                 std_ref_infos.push(std_info);
             }
-        }
-        if has_l1_ref {
-            ref_resources.push(
-                vk::VideoPictureResourceInfoKHR::default()
-                    .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                    .coded_extent(coded_extent)
-                    .base_array_layer(0)
-                    .image_view_binding(
-                        common.dpb_image_views[self.backward_reference_dpb_slot as usize],
-                    ),
-            );
-            let mut std_info = std_reference_info;
-            std_info.PicOrderCntVal = self.backward_reference_poc;
-            std_info.pic_type =
-                ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
-            std_ref_infos.push(std_info);
         }
 
         for std_info in &std_ref_infos {
@@ -397,14 +354,6 @@ impl H265 {
                     stored_indices_count += 1;
                 }
             }
-        }
-        if has_l1_ref && let Some(h265_slot_info) = slot_infos_iter.next() {
-            let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.backward_reference_dpb_slot as i32)
-                .picture_resource(&ref_resources[stored_indices_count])
-                .push(h265_slot_info);
-            reference_slots.push(ref_slot);
-            reference_slots_for_begin.push(ref_slot);
         }
 
         // Rate control.
@@ -433,8 +382,7 @@ impl H265 {
 
         let mut h265_rc_info = vk::VideoEncodeH265RateControlInfoKHR::default()
             .gop_frame_count(common.config.gop_size)
-            .idr_period(common.config.gop_size)
-            .consecutive_b_frame_count(common.config.b_frame_count);
+            .idr_period(common.config.gop_size);
         let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
         if !rc.is_disabled() {
             rc_info = rc_info

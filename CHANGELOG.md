@@ -94,6 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wall_latency_ns` starts before the encode submit. It started after it, so
   a submit that blocked in the driver made it shorter than the GPU time.
 
+### Removed
+
+- The encoder's internal modules are no longer public:
+  `encoder::{av1, bitwriter, dpb, gop, h264, h265, reorder, resources}` and
+  `decoder::h264`. Nothing in them was needed to encode or decode.
+
 ## [0.10.0] - 19-10-2026
 
 ### Added
