@@ -16,7 +16,6 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 
 use crate::converter::InputFormat;
-use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
 use crate::encoder::pipeline::{
@@ -35,6 +34,9 @@ use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{TimelineChain, allocate_command_buffers};
 use crate::vulkan::VideoContext;
+
+/// The most DPB slots an encoder uses, for any codec.
+pub(crate) const MAX_DPB_SLOTS: usize = 16;
 
 /// Per-encoder state shared by every codec.
 ///
@@ -1074,10 +1076,9 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         upload_fence: cmd.upload_fence,
     })?;
 
-    // B-frames are not yet supported, so an I-P GOP. Set the SPS-matching
-    // counters (no-ops for AV1, which keys off order hints).
+    // B-frames are not yet supported, so an I-P GOP. Match the SPS's POC
+    // wrap (no-op for AV1, which keys off order hints).
     let mut gop = GopStructure::new(config.gop_size);
-    gop.set_max_frame_num(4);
     gop.set_max_poc_lsb(4);
 
     let common = EncoderCommon {

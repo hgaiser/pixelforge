@@ -38,14 +38,10 @@ pub struct GopPosition {
 pub struct GopStructure {
     /// Current frame index.
     frame_index: u64,
-    /// Current frame number.
-    frame_num: u32,
     /// Current POC.
     poc: i32,
     /// IDR period.
     idr_period: u32,
-    /// Max frame_num value (log2_max_frame_num_minus4 + 4).
-    max_frame_num: u32,
     /// Max POC LSB value (log2_max_pic_order_cnt_lsb_minus4 + 4).
     max_poc_lsb: u32,
     /// Flag to force next frame to be an IDR.
@@ -58,17 +54,10 @@ impl GopStructure {
         Self {
             idr_period: gop_size,
             frame_index: 0,
-            frame_num: 0,
             poc: 0,
-            max_frame_num: 16, // log2_max_frame_num_minus4=0 -> 2^4 = 16
-            max_poc_lsb: 16,   // log2_max_pic_order_cnt_lsb_minus4=0 -> 2^4 = 16
+            max_poc_lsb: 16, // log2_max_pic_order_cnt_lsb_minus4=0 -> 2^4 = 16
             force_idr: false,
         }
-    }
-
-    /// Set max frame_num (2^(log2_max_frame_num_minus4+4)).
-    pub fn set_max_frame_num(&mut self, log2_max_frame_num_minus4: u8) {
-        self.max_frame_num = 1 << (log2_max_frame_num_minus4 + 4);
     }
 
     /// Set max POC LSB (2^(log2_max_pic_order_cnt_lsb_minus4+4)).
@@ -87,7 +76,6 @@ impl GopStructure {
 
         // If IDR, reset counters.
         if is_idr {
-            self.frame_num = 0;
             self.poc = 0;
         }
 
@@ -104,7 +92,6 @@ impl GopStructure {
         };
 
         // Update counters for next frame.
-        self.frame_num = (self.frame_num + 1) % self.max_frame_num;
         self.poc = (self.poc + 2) % (self.max_poc_lsb as i32 * 2);
         self.frame_index += 1;
 

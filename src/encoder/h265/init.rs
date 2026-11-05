@@ -5,7 +5,6 @@ use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
-use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h265_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
@@ -74,16 +73,7 @@ impl H265 {
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
-        let mut dpb = DecodedPictureBuffer::new();
-        dpb.h265.sequence_start(DpbConfig {
-            dpb_size: common.dpb_slot_count as u32,
-            log2_max_frame_num_minus4: 0,
-            log2_max_pic_order_cnt_lsb_minus4: 4,
-            num_temporal_layers: 1,
-        });
-
         let codec = H265 {
-            dpb,
             header_data: None,
             l0_references: Vec::new(),
             reference_window,

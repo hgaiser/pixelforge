@@ -7,7 +7,6 @@
 mod api;
 pub(crate) mod av1;
 pub(crate) mod codec;
-pub(crate) mod dpb;
 #[cfg(feature = "dmabuf")]
 pub mod external;
 mod frame;

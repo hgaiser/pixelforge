@@ -10,9 +10,6 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::dpb::{
-    DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType,
-};
 use crate::encoder::pipeline::EncodeFuture;
 use crate::error::Result;
 use ash::vk;
@@ -30,7 +27,6 @@ pub(crate) struct ReferenceInfo {
 
 /// H.265-specific encoder state.
 pub(crate) struct H265 {
-    dpb: DecodedPictureBuffer,
     /// Cached VPS/SPS/PPS header (invalidated when session params change).
     header_data: Option<Vec<u8>>,
     /// References held in the DPB, most-recent first. Each frame predicts
@@ -63,13 +59,6 @@ impl VideoCodec for H265 {
         plan: &FramePlan,
     ) -> Result<PictureSetup> {
         if plan.is_idr() {
-            let dpb_config = DpbConfig {
-                dpb_size: common.dpb_slot_count as u32,
-                log2_max_frame_num_minus4: 0,
-                log2_max_pic_order_cnt_lsb_minus4: 4,
-                ..Default::default()
-            };
-            self.dpb.h265.sequence_start(dpb_config);
             self.l0_references.clear();
             // All DPB slots become inactive at the start of a coded video sequence.
             common.dpb_slot_active.fill(false);
@@ -100,21 +89,6 @@ impl VideoCodec for H265 {
             return;
         }
         let pic_order_cnt = plan.pic_order_cnt();
-        let pic_type = if plan.is_idr() {
-            PictureType::Idr
-        } else {
-            PictureType::P
-        };
-        let pic_info = PictureStartInfo {
-            frame_id: plan.display_order,
-            pic_order_cnt,
-            frame_num: 0,
-            pic_type,
-            is_reference: true,
-            ..Default::default()
-        };
-        self.dpb.h265.picture_start(pic_info);
-        self.dpb.h265.picture_end(true);
 
         self.l0_references.insert(
             0,
