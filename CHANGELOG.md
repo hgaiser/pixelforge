@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add H.265 decoding: `DecodeConfig::new(Codec::H265)`. Main and Main 10, open
+  and closed GOPs, joining a stream at a CRA, scaling lists, temporal layers.
+- Add AV1 decoding: `DecodeConfig::new(Codec::AV1)`, for low-overhead OBU
+  streams. Hidden frames and `show_existing_frame`, tiles, superres, frame
+  size changes, 10-bit and film grain.
 - Add `EncodeConfig::new(codec, width, height)`, for a codec chosen at
   runtime.
 - Add RGB input: `EncodeConfig::with_source(Source::Rgb(..))`. The encoder

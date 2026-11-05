@@ -29,14 +29,22 @@
 //!   image is valid for exactly as long as the frame is; see [`DecodedFrame`]
 //!   for what holding one costs.
 //!
-//! # Limitations (H.264)
+//! # Limitations
 //!
-//! - Progressive streams only (no interlaced/field coding).
-//! - Streams using explicit scaling matrices are rejected.
-//!
-//! Reference management is complete (IDR, sliding-window, and MMCO), so any
-//! stream this crate's encoder produces — and typical output from x264, NVENC
-//! and friends, including B-pyramid — decodes correctly.
+//! - **H.264**: progressive streams only (no interlaced/field coding), and no
+//!   explicit scaling matrices. Reference management is complete (IDR,
+//!   sliding-window, and MMCO), so any stream this crate's encoder produces,
+//!   and typical output from x264, NVENC and friends, including B-pyramid,
+//!   decodes correctly.
+//! - **H.265**: the base layer only; Main and Main 10 (and 4:2:2 or 4:4:4 where
+//!   the device has the profile), progressive. The screen content and
+//!   multi-layer extensions are rejected. RASL pictures after the CRA that
+//!   decoding starts at are skipped, as the standard allows.
+//! - **AV1**: low-overhead OBU streams (the format of `.obu` files, IVF and
+//!   MP4), not Annex B; operating point 0. Monochrome streams and 12-bit are
+//!   rejected. Film grain is applied, which takes a second image for every DPB
+//!   slot. A device whose DPB and output images do not coincide is not
+//!   supported.
 
 /// Annex B start-code framing, shared by H.264 and H.265.
 pub(crate) mod annexb;

@@ -1,10 +1,10 @@
 //! A Vulkan-based video encoding and decoding library for Rust, supporting H.264,
-//! H.265 and AV1 encode, and H.264 decode.
+//! H.265 and AV1, for both encode and decode.
 //!
 //! # Features
 //!
 //! - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
-//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC and AV1, encode and decode.
 //! - **Asynchronous pipelines**: both directions submit without waiting.
 //!   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
 //!   [`DecodeSource`] as the GPU finishes with them.
@@ -31,11 +31,12 @@
 //! | Codec | Encode | Decode |
 //! |-------|--------|--------|
 //! | H.264/AVC | ✓ | ✓ |
-//! | H.265/HEVC | ✓ | |
-//! | AV1 | ✓ | |
+//! | H.265/HEVC | ✓ | ✓ |
+//! | AV1 | ✓ | ✓ |
 //!
 //! H.264 decoding is verified byte-identical to `ffmpeg -pix_fmt nv12` on AMD
-//! (RADV), NVIDIA and Intel (ANV).
+//! (RADV), NVIDIA and Intel (ANV). H.265 decoding is verified byte-identical to
+//! ffmpeg, and AV1 decoding (film grain included) to dav1d, on NVIDIA so far.
 //!
 //! # Requirements
 //!
