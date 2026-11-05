@@ -5,13 +5,12 @@ use ash::vk;
 /// A point on a timeline semaphore: reached once the semaphore's value is at
 /// least `value`.
 ///
-/// Returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
-/// for the work it submitted, and accepted by it and by
-/// [`Encoder::encode_after`](crate::Encoder::encode_after) as work to wait
-/// for. On a device shared with the caller this is how a frame moves from the
-/// caller's rendering to the converter to the encoder with every step ordered
-/// on the GPU: each submission waits on the point the previous one signals,
-/// and nothing waits on the CPU.
+/// Given by [`SourceImage::released`](crate::SourceImage::released) for the
+/// frames that read an image, and accepted by
+/// [`Frame::wait`](crate::Frame::wait) as work to wait for. On a device shared
+/// with the caller this is how a frame moves from the caller's rendering to
+/// the encoder and back with every step ordered on the GPU: each submission
+/// waits on the point the previous one signals, and nothing waits on the CPU.
 ///
 /// The semaphore must be a timeline semaphore on the same device as the
 /// context. A point pixelforge hands out stays valid for as long as the

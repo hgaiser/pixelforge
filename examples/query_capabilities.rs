@@ -195,6 +195,26 @@ fn query_detailed_capabilities(
             caps.max_active_reference_pictures
         );
         println!("      Max DPB Slots: {}", caps.max_dpb_slots);
+        // The references one frame may predict from, which can be fewer than
+        // the active reference pictures.
+        match codec {
+            Codec::H264 => println!(
+                "      Max L0 References (P / B), L1: {} / {}, {}",
+                h264_caps.max_p_picture_l0_reference_count,
+                h264_caps.max_b_picture_l0_reference_count,
+                h264_caps.max_l1_reference_count
+            ),
+            Codec::H265 => println!(
+                "      Max L0 References (P / B), L1: {} / {}, {}",
+                h265_caps.max_p_picture_l0_reference_count,
+                h265_caps.max_b_picture_l0_reference_count,
+                h265_caps.max_l1_reference_count
+            ),
+            Codec::AV1 => println!(
+                "      Max Single References: {} (names {:#09b})",
+                av1_caps.max_single_reference_count, av1_caps.single_reference_name_mask
+            ),
+        }
 
         // 2. Query Supported Formats
         let mut format_props_count = 0;

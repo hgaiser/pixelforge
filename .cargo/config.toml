@@ -1,0 +1,6 @@
+[env]
+# The device tests each build their own VkDevice. The NVIDIA driver (seen on
+# 615.78.08) can deadlock when one thread destroys a device while another
+# creates objects on a different one, so run tests one at a time. An explicit
+# `--test-threads` still overrides this.
+RUST_TEST_THREADS = "1"

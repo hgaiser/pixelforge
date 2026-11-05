@@ -48,7 +48,7 @@ impl VideoContext {
     /// hand the profile to `then` for any further query about it.
     ///
     /// With `rgb_caps`, the profile is the RGB input one an encoder built with
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder)
     /// requests, and the driver fills in what its conversion supports.
     ///
     /// The encoders build their profiles themselves, since theirs also carry

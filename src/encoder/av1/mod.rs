@@ -5,8 +5,9 @@
 //! and its sequence-header generation (`session_params`).
 //!
 //! Inter frames predict from up to `Av1::active_reference_count` recent
-//! references, mapped onto the forward AV1 reference names. Keeping a window of
-//! references (rather than just the previous frame) is what lets reference frame
+//! references, mapped onto the forward AV1 reference names the device allows.
+//! A window of `Av1::reference_window` references stays in the DPB (rather than
+//! just the ones predicted from), which is what lets reference frame
 //! invalidation recover from loss by re-anchoring to an older surviving frame
 //! instead of forcing a key frame.
 
@@ -41,10 +42,41 @@ pub(crate) struct Av1 {
     order_hint: u32,
     /// Cached sequence-header OBU (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-    /// Active references, most-recent first.
+    /// References held in the DPB, most-recent first. Each frame predicts
+    /// from the first `active_reference_count`; the rest are kept for
+    /// reference frame invalidation to fall back on.
     references: Vec<ReferenceInfo>,
-    /// Negotiated number of active references kept for prediction.
+    /// How many references stay in the DPB.
+    reference_window: u32,
+    /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
+    /// The reference names single-reference prediction may use (bit 0 is
+    /// LAST), from `VkVideoEncodeAV1CapabilitiesKHR`.
+    single_reference_name_mask: u32,
+}
+
+impl Av1 {
+    /// The references this frame predicts from: the newest held ones.
+    fn used_references(&self) -> &[ReferenceInfo] {
+        let n = self
+            .references
+            .len()
+            .min(self.active_reference_count as usize);
+        &self.references[..n]
+    }
+
+    /// The DPB slot each of the 7 AV1 reference names predicts from, or -1.
+    ///
+    /// The used references take the names the device allows, most recent
+    /// first. A name left at -1 is not predicted from.
+    fn reference_names(&self) -> [i32; 7] {
+        let mut names = [-1i32; 7];
+        let allowed = (0..7).filter(|name| self.single_reference_name_mask & (1 << name) != 0);
+        for (name, r) in allowed.zip(self.used_references()) {
+            names[name] = r.dpb_slot as i32;
+        }
+        names
+    }
 }
 
 impl VideoCodec for Av1 {
@@ -110,7 +142,7 @@ impl VideoCodec for Av1 {
         self.references.insert(0, ref_info);
         // Keep a sliding window of the most recent references for prediction and
         // loss recovery.
-        while self.references.len() > self.active_reference_count.max(1) as usize {
+        while self.references.len() > self.reference_window.max(1) as usize {
             self.references.pop();
         }
 

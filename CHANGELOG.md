@@ -9,20 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add RGB input converted by the encoder itself through
-  `VK_VALVE_video_encode_rgb_conversion`: `EncodeConfig::with_rgb_input`.
-- Add `VideoContext::supports_rgb_encode_input` and
-  `ColorConverterConfig::rgb_encode_input`, which say when a conversion can be
-  left to the encoder.
-- Add `VideoContext::has_video_encode_rgb_conversion` and
+- Add RGB input: `EncodeConfig::with_source(Source::Rgb(..))`. The encoder
+  converts RGB frames to the YUV its colour description describes, through
+  `VK_VALVE_video_encode_rgb_conversion` where the device can and the colour
+  converter's shader otherwise (`Encoder::conversion`,
+  `EncodeConfig::with_conversion`).
+- Add `Encoder::submit` and `Frame`: the one way to hand over a frame,
+  whatever the conversion, with its GPU waits.
+- Add `SourceImage` and `Handoff`: a caller's image to encode from. It keeps
+  track of the frames that read it (`SourceImage::released`), and its drop
+  waits for them.
+- Add `Encoder::input_slot` and `InputSlot`: the encoder's own input image,
+  to write a frame in place and submit with `Frame::input`.
+- Add `InputImage::source`.
+- Add `Encoder::repeat`: encode the last frame again from the encoder's own
+  input image, for a key frame while no new frame arrives. The caller's
+  source does not have to stay alive for it.
+- Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
+  `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
+  `Frame::external`. The encoder reads a buffer directly where the device
+  can, and copies it otherwise.
+- Add sync_file fences (feature `dmabuf`): `Frame::wait_sync_file`,
+  `Frame::signal_sync_file` and `EncodeFuture::take_release_sync_file`.
+- Add `PixelForgeError::DeviceLost`: a submit or wait that finds the device
+  lost reports it as such, so a caller knows to make a new context.
+- Add `VideoContext::supports_rgb_encode_input`,
+  `VideoContext::has_video_encode_rgb_conversion` and
   `DeviceFeatures::video_encode_rgb_conversion`.
 
 ### Changed
 
-- `Encoder::encode_after` takes the source image's layout, as
-  `ColorConverter::convert_async` does: for `UNDEFINED`, a first-time
-  external-memory import, the copy into the input image acquires it from
-  `VK_QUEUE_FAMILY_EXTERNAL`.
+- The copy of a frame into the encoder's input image no longer waits on the
+  CPU: the encode waits for it on the GPU. `Encoder::submit` returns before
+  the source is read.
+- **Breaking:** `Encoder::encode`, `Encoder::encode_after` and
+  `Encoder::input_image` are removed. Submit a `Frame` with `Encoder::submit`:
+  `Frame::image(&source_image)` for an image of the caller's,
+  `Frame::input(encoder.input_slot()?)` for the input image written in place.
+  An imported image that `UNDEFINED` used to mark is `Handoff::External`.
+- **Breaking:** `ColorConverter`, `ColorConverterConfig` and `OutputFormat`
+  are no longer public. Describe an RGB source with `Source::Rgb` instead, and
+  the encoder runs the converter itself, with the right target and range.
+- **Breaking:** `RateControl` replaces `RateControlMode`, `quality_level`,
+  `target_bitrate` and `max_bitrate`: `Cqp { qp }`, `Cbr { bitrate }` or
+  `Vbr { target, max }`, so each mode carries exactly the values it uses.
+  `Encoder::new` refuses a quantizer out of the codec's range, a bitrate of 0,
+  and a peak below the target. `RateControlMode::Disabled` was the same as
+  `Cqp` and is gone. `DEFAULT_TARGET_BITRATE` and `DEFAULT_MAX_BITRATE` are
+  removed; `DEFAULT_AV1_Q_INDEX` is added.
+- An RGB conversion the device cannot do is `PixelForgeError::NoSuitableDevice`,
+  as other missing device support is, rather than `InvalidInput`.
+- **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
+  field are removed. No codec encodes B-frames yet, and every encoder refused
+  a count above 0 at runtime.
+- **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
+  `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
+  frames that read the image are done with it.
+- **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
+  encode API: `EncodeConfig::with_color` replaces `with_color_description`,
+  `Encoder::reconfigure` replaces `set_color_description`, and
+  `VideoContext::supports_rgb_encode_input` takes a `StreamColor`. `Sdr` and
+  `Hdr10` name the two colours an RGB source converts to, with their range;
+  `Other` carries any H.273 description, for a YUV source only.
+- `Encoder::reconfigure(source, color)` changes the source and the stream
+  colour together, so the conversion follows both: the colour converter
+  switches in place, and where the encoder converts it is made again. Packet
+  timestamps carry on.
+- The `dmabuf` feature enables its extensions only where the device has them,
+  rather than failing device creation where it does not.
+- `EncodedPacket::stats` is always there, and only its `gpu_time_ns` is
+  optional. Without encode queue timestamps, a packet still has its wall
+  times.
+
+### Fixed
+
+- The source image barrier of the input copy now waits for earlier work on
+  the image, rather than starting at `TOP_OF_PIPE`.
+- The GPU encode time is correct when the timestamp counter wraps between
+  the two timestamps.
+- The shaders are SPIR-V 1.3, which a Vulkan 1.1 device must accept. They
+  were SPIR-V 1.6, which only a Vulkan 1.3 device must accept.
+- An H.264 encoder for a profile the device does not support no longer asks
+  for its quality level properties before it fails.
+- `wall_latency_ns` starts before the encode submit. It started after it, so
+  a submit that blocked in the driver made it shorter than the GPU time.
 
 ## [0.10.0] - 19-10-2026
 

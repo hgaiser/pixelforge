@@ -9,8 +9,8 @@
 //!   cargo bench --bench encode
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, InputImage, PixelFormat,
-    RateControlMode, VideoContextBuilder,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, Frame, InputImage,
+    PixelFormat, RateControl, VideoContextBuilder,
 };
 use std::fs::File;
 use std::io::Read;
@@ -122,23 +122,17 @@ fn run_encode_test(
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     }
     .with_rate_control(if matches!(tuning_mode, EncoderTuningMode::Lossless) {
-        RateControlMode::Cqp
+        RateControl::default_for(codec)
     } else {
-        RateControlMode::Cbr
+        RateControl::Cbr { bitrate: 8_000_000 }
     })
-    .with_target_bitrate(8_000_000)
-    .with_max_bitrate(12_000_000)
     .with_frame_rate(60, 1)
     .with_gop_size(120)
-    .with_b_frames(0)
     .with_encode_content_hint(pixelforge::EncodeContentHint::Rendered)
     .with_encode_usage_hint(pixelforge::EncodeUsageHint::Streaming)
     .with_encoder_tuning_mode(tuning_mode);
 
-    println!(
-        "Config: {:?}, bitrate={}, GOP={}, B-frames={}",
-        config.rate_control_mode, config.target_bitrate, config.gop_size, config.b_frame_count
-    );
+    println!("Config: {:?}, GOP={}", config.rate_control, config.gop_size);
 
     // Create input image for uploading frames.
     let mut input_image = InputImage::new(
@@ -161,11 +155,12 @@ fn run_encode_test(
 
     let mut write_packet = |packet: pixelforge::EncodedPacket| {
         total_bytes += packet.data.len();
-        if let Some(stats) = packet.stats {
-            gpu_durations.push(Duration::from_nanos(stats.gpu_time_ns));
-            frame_latency_durations.push(Duration::from_nanos(stats.frame_latency_ns));
-            wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
+        let stats = packet.stats;
+        if let Some(gpu_time_ns) = stats.gpu_time_ns {
+            gpu_durations.push(Duration::from_nanos(gpu_time_ns));
         }
+        frame_latency_durations.push(Duration::from_nanos(stats.frame_latency_ns));
+        wall_latency_durations.push(Duration::from_nanos(stats.wall_latency_ns));
         Ok::<(), Box<dyn std::error::Error>>(())
     };
 
@@ -176,7 +171,7 @@ fn run_encode_test(
         // Upload YUV420 data to the input image
         input_image.upload_yuv420(frame)?;
 
-        pending.push_back(encoder.encode(input_image.image())?);
+        pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         // drain before submitting when at capacity
         while pending.len() >= 2 {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;

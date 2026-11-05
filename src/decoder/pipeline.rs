@@ -288,7 +288,7 @@ impl DecodePipeline {
         unsafe {
             sync2
                 .queue_submit2(decode_queue, &[submit], slot.decode_fence)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
         }
 
         self.decodes.commit();
@@ -344,7 +344,7 @@ impl DecodePipeline {
         unsafe {
             sync2
                 .queue_submit2(transfer_queue, &[submit], slot.transfer_fence)
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
         }
 
         self.copies.commit();
@@ -451,7 +451,10 @@ fn run_completion_thread(
             if let Err(e) = wait
                 && let Some(tx) = &frames_tx
             {
-                let _ = tx.unbounded_send(Err(PixelForgeError::Synchronization(e.to_string())));
+                let _ = tx.unbounded_send(Err(PixelForgeError::vk(
+                    e,
+                    PixelForgeError::Synchronization,
+                )));
             }
         }
 

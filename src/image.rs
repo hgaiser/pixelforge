@@ -3,13 +3,13 @@
 //! This module provides [`InputImage`], a helper for uploading YUV data from the CPU
 //! to the GPU. The image it creates is a transfer-only staging image (not a Vulkan Video
 //! image) and must be copied into an encoder's input image before encoding.
-//! Use [`InputImage::upload_yuv420`] to upload to the internal image, then pass
-//! `input_image.image()` to [`Encoder::encode`](crate::encoder::Encoder::encode).
+//! Use [`InputImage::upload_yuv420`] to upload to the internal image, then submit
+//! [`InputImage::source`] with [`Frame::image`](crate::Frame::image).
 //! Alternatively, use [`InputImage::upload_yuv420_to`] / [`InputImage::upload_yuv444_to`]
-//! to upload directly into the encoder's input image (obtained via
-//! [`Encoder::input_image`](crate::encoder::Encoder::input_image)).
+//! to upload directly into an encoder's [`InputSlot`] (from
+//! [`Encoder::input_slot`](crate::encoder::Encoder::input_slot)).
 
-use crate::encoder::{BitDepth, Codec, PixelFormat};
+use crate::encoder::{BitDepth, Codec, Handoff, InputSlot, PixelFormat, SourceImage};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -23,12 +23,15 @@ use ash::vk;
 ///
 /// The image is **not** directly usable as a Vulkan Video encode source. To
 /// encode, either:
-/// - Upload to this image and pass `self.image()` to [`Encoder::encode`](crate::encoder::Encoder::encode), which
-///   will copy it into the encoder's internal input image, or
+/// - Upload to this image and submit [`Self::source`] with
+///   [`Frame::image`](crate::Frame::image), which copies it into the encoder's
+///   input image, or
 /// - Use [`upload_yuv420_to`](Self::upload_yuv420_to) /
 ///   [`upload_yuv444_to`](Self::upload_yuv444_to) to upload directly into the
-///   encoder's input image.
+///   encoder's input image, through an [`InputSlot`].
 pub struct InputImage {
+    /// Keeps track of the frames that read `image`.
+    source: SourceImage,
     context: VideoContext,
     image: vk::Image,
     /// Current layout of `self.image`.
@@ -204,7 +207,15 @@ impl InputImage {
         let fence = unsafe { device.create_fence(&fence_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("fence creation: {}", e)))?;
 
-        Ok(Self {
+        let source = SourceImage::new(
+            &context,
+            image,
+            Handoff::Device {
+                layout: vk::ImageLayout::GENERAL,
+            },
+        )?;
+        let mut input = Self {
+            source,
             context,
             image,
             image_layout: vk::ImageLayout::UNDEFINED,
@@ -219,7 +230,24 @@ impl InputImage {
             height,
             bit_depth,
             pixel_format,
-        })
+        };
+        // Start from zeroed planes in GENERAL, so the image is a valid source
+        // before the first upload.
+        unsafe {
+            let device = input.context.device();
+            let ptr = device
+                .map_memory(
+                    staging_memory,
+                    0,
+                    staging_size as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            std::ptr::write_bytes(ptr as *mut u8, 0, staging_size);
+            device.unmap_memory(staging_memory);
+        }
+        input.copy_staging_to_image()?;
+        Ok(input)
     }
 
     /// Upload YUV420 (I420) data to this image.
@@ -435,10 +463,11 @@ impl InputImage {
 
     /// Upload YUV420 (I420) data to an external image.
     ///
-    /// Same as `upload_yuv420()` but copies the data to the specified target image
-    /// instead of this InputImage's own image. Useful for uploading directly to an
-    /// encoder's input image to avoid cross-queue copy issues.
-    pub fn upload_yuv420_to(&mut self, target_image: vk::Image, yuv_data: &[u8]) -> Result<()> {
+    /// Same as `upload_yuv420()` but copies the data into an encoder's input
+    /// image instead of this InputImage's own image, so the encode reads it
+    /// with no further copy. Submit the slot with
+    /// [`Frame::input`](crate::Frame::input) afterwards.
+    pub fn upload_yuv420_to(&mut self, slot: &InputSlot, yuv_data: &[u8]) -> Result<()> {
         if self.pixel_format != PixelFormat::Yuv420 {
             return Err(PixelForgeError::InvalidInput(
                 "upload_yuv420_to can only be used with YUV420 InputImage".to_string(),
@@ -506,7 +535,7 @@ impl InputImage {
 
         // Record and submit copy commands to the target image.
         self.copy_staging_to_image_internal(
-            target_image,
+            slot.image(),
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
         )?;
@@ -514,8 +543,9 @@ impl InputImage {
         Ok(())
     }
 
-    /// Upload YUV444 (planar) data to an external image.
-    pub fn upload_yuv444_to(&mut self, target_image: vk::Image, yuv_data: &[u8]) -> Result<()> {
+    /// Upload YUV444 (planar) data into an encoder's input image, like
+    /// [`Self::upload_yuv420_to`].
+    pub fn upload_yuv444_to(&mut self, slot: &InputSlot, yuv_data: &[u8]) -> Result<()> {
         if self.pixel_format != PixelFormat::Yuv444 {
             return Err(PixelForgeError::InvalidInput(
                 "upload_yuv444_to can only be used with YUV444 InputImage".to_string(),
@@ -594,7 +624,7 @@ impl InputImage {
 
         // Record and submit copy commands.
         self.copy_staging_to_image_internal(
-            target_image,
+            slot.image(),
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
         )?;
@@ -603,6 +633,8 @@ impl InputImage {
     }
 
     fn copy_staging_to_image(&mut self) -> Result<()> {
+        // A frame submitted before may still be reading the image.
+        self.source.wait_released()?;
         let old_layout = self.image_layout;
         self.copy_staging_to_image_internal(self.image, old_layout, vk::ImageLayout::GENERAL)?;
         self.image_layout = vk::ImageLayout::GENERAL;
@@ -810,10 +842,14 @@ impl InputImage {
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("Queue submit failed: {}", e)))?;
+            .map_err(|e| {
+            PixelForgeError::vk(e, |e| {
+                PixelForgeError::CommandBuffer(format!("Queue submit failed: {e}"))
+            })
+        })?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
 
         unsafe { device.reset_fences(&[self.fence]) }
             .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
@@ -824,6 +860,13 @@ impl InputImage {
     /// Get the underlying Vulkan image handle.
     pub fn image(&self) -> vk::Image {
         self.image
+    }
+
+    /// The image as a source to encode from, see
+    /// [`Frame::image`](crate::Frame::image). The uploads wait until the
+    /// frames that read it are done with it.
+    pub fn source(&self) -> &SourceImage {
+        &self.source
     }
 
     /// Get the image dimensions.

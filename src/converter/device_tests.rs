@@ -18,19 +18,29 @@
 //! muddy the comparison. The test frame is deliberately not grey: grey converts
 //! to exact values and would hide the very errors being looked for.
 //!
-//! Ignored by default: requires a Vulkan Video device. Run with
-//! `cargo test -- --ignored`.
+//! The last test checks the converter inside the encoder: an RGB source
+//! converted by the shader must encode to the same stream as converting by
+//! hand and encoding the result.
+//!
+//! These live in the crate, not in `tests/`, because the converter is not
+//! public. Ignored by default: requires a Vulkan Video device. Run with
+//! `cargo test --lib -- --ignored`.
 
 #[allow(dead_code)]
-mod common;
-use common::source::{SrcImage, create_src_image, host_buffer, one_shot};
+#[path = "../../tests/common/source.rs"]
+mod source;
+use source::{SrcImage, create_src_image, host_buffer, one_shot};
 
-use ash::vk;
-use pixelforge::{
-    Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec,
-    EncodeBitDepth, EncodeConfig, Encoder, InputFormat, OutputFormat, RateControlMode,
-    VideoContext, VideoContextBuilder,
+use super::{
+    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, InputFormat, OutputFormat,
 };
+use crate::encoder::input::SourceOwnership;
+use crate::{
+    Codec, ColorDescription, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame,
+    Handoff, RateControl, RgbSource, Source, SourceImage, StreamColor, VideoContext,
+    VideoContextBuilder,
+};
+use ash::vk;
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 64;
@@ -179,18 +189,13 @@ fn encoders(
 ) -> Result<(Encoder, Option<Encoder>), Box<dyn std::error::Error>> {
     let eight = Encoder::new(
         context.clone(),
-        EncodeConfig::h264(WIDTH, HEIGHT)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
+        EncodeConfig::h264(WIDTH, HEIGHT).with_frame_rate(30, 1),
     )?;
     let ten = Encoder::new(
         context.clone(),
         EncodeConfig::h265(WIDTH, HEIGHT)
             .with_bit_depth(EncodeBitDepth::Ten)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_frame_rate(30, 1)
-            .with_b_frames(0),
+            .with_frame_rate(30, 1),
     )
     .ok();
     if ten.is_none() {
@@ -200,12 +205,42 @@ fn encoders(
 }
 
 fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
-    common::init_logging();
+    init_logging();
     Ok(VideoContextBuilder::new()
         .app_name("pixelforge-color-conversion")
         .require_encode(Codec::H264)
         .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
         .build()?)
+}
+
+/// Route the validation layer's messages to the test output, as
+/// `tests/common` does.
+fn init_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+/// Convert `src`, in `GENERAL`, into `target`, and wait for it.
+fn convert_into(
+    converter: &mut ColorConverter,
+    src: vk::Image,
+    target: vk::Image,
+) -> crate::error::Result<()> {
+    let general = SourceOwnership {
+        old_layout: vk::ImageLayout::GENERAL,
+        acquire_from: None,
+        release_to: None,
+        final_layout: vk::ImageLayout::GENERAL,
+    };
+    converter.convert_with(src, general, target, &[], &[])?;
+    converter.wait_idle()
 }
 
 /// Convert one frame and read its luma plane back as code values.
@@ -229,7 +264,7 @@ fn convert(
     );
     let mut converter = ColorConverter::new(context.clone(), config)?;
     let description = converter.color_description();
-    converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
+    convert_into(&mut converter, src.image, encoder.input_slot()?.image())?;
     Ok((read_luma(context, &converter, output_format)?, description))
 }
 
@@ -443,7 +478,7 @@ fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Er
     );
     let convert_with = |converter: &mut ColorConverter, pixels: &[u8]| {
         let src = unsafe { create_src_image(&context, WIDTH, HEIGHT, pixels)? };
-        converter.convert(src.image, vk::ImageLayout::GENERAL, encoder.input_image())?;
+        convert_into(converter, src.image, encoder.input_slot()?.image())?;
         let luma = read_luma(&context, converter, OutputFormat::NV12)?;
         drop(src);
         Ok::<_, Box<dyn std::error::Error>>(luma)
@@ -460,5 +495,195 @@ fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Er
         actual == expected,
         "the second frame came out as something other than the second frame"
     );
+    Ok(())
+}
+
+/// The size of the encode test: big enough for every codec's minimum.
+const ENCODE_WIDTH: u32 = 320;
+const ENCODE_HEIGHT: u32 = 240;
+
+/// A BGRA frame that moves with `n`.
+fn moving_frame(n: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((ENCODE_WIDTH * ENCODE_HEIGHT * 4) as usize);
+    for y in 0..ENCODE_HEIGHT {
+        for x in 0..ENCODE_WIDTH {
+            let (sx, sy) = (x + n * 3, y + n);
+            data.extend_from_slice(&[(sy * 3) as u8, (sx * 2 + sy) as u8, (sx ^ sy) as u8, 255]);
+        }
+    }
+    data
+}
+
+fn encode_config(codec: Codec) -> EncodeConfig {
+    match codec {
+        Codec::H264 => EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT),
+        Codec::H265 => EncodeConfig::h265(ENCODE_WIDTH, ENCODE_HEIGHT),
+        Codec::AV1 => EncodeConfig::av1(ENCODE_WIDTH, ENCODE_HEIGHT),
+    }
+    .with_rate_control(RateControl::Cqp { qp: 22 })
+    .with_frame_rate(30, 1)
+    .with_color(StreamColor::default())
+}
+
+/// The streams of 8 moving frames, converted by hand and by an encoder with
+/// an RGB source and the shader conversion. `pipelined` submits the encoder's
+/// frames without waiting for each packet, so up to every slot is in flight.
+fn by_hand_and_by_encoder(
+    context: &VideoContext,
+    codec: Codec,
+    pipelined: bool,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut by_hand = Encoder::new(context.clone(), encode_config(codec))?;
+    let mut converter = ColorConverter::new(
+        context.clone(),
+        ColorConverterConfig::new(
+            ENCODE_WIDTH,
+            ENCODE_HEIGHT,
+            InputFormat::BGRA,
+            OutputFormat::NV12,
+            ColorSpec::Srgb,
+            ColorSpec::Srgb,
+            ColorRange::Limited,
+        ),
+    )?;
+    let mut by_encoder = Encoder::new(
+        context.clone(),
+        encode_config(codec)
+            .with_source(Source::Rgb(RgbSource::new(
+                InputFormat::BGRA,
+                ColorSpec::Srgb,
+            )))
+            .with_conversion(ConversionPreference::Shader),
+    )?;
+    // All sources first, so that nothing else runs between the encoder's
+    // submits. Each `SourceImage` drops (and waits) before the image it reads.
+    let mut sources: Vec<(SourceImage, SrcImage)> = Vec::new();
+    for n in 0..8 {
+        let src =
+            unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
+        let image = SourceImage::new(
+            context,
+            src.image,
+            Handoff::Device {
+                layout: vk::ImageLayout::GENERAL,
+            },
+        )?;
+        sources.push((image, src));
+    }
+
+    let mut a = Vec::new();
+    for (_, src) in &sources {
+        let slot = by_hand.input_slot()?;
+        convert_into(&mut converter, src.image, slot.image())?;
+        a.extend(pollster::block_on(by_hand.submit(Frame::input(slot))?)?.data);
+    }
+
+    let mut b = Vec::new();
+    let mut pending = Vec::new();
+    for (image, _) in &sources {
+        let packet = by_encoder.submit(Frame::image(image))?;
+        if pipelined {
+            pending.push(packet);
+        } else {
+            b.extend(pollster::block_on(packet)?.data);
+        }
+    }
+    for packet in pending {
+        b.extend(pollster::block_on(packet)?.data);
+    }
+    drop(sources);
+    Ok((a, b))
+}
+
+/// The shader path inside the encoder does exactly what converting by hand
+/// does, so the streams match byte for byte.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn shader_source_matches_converting_by_hand() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = VideoContextBuilder::new()
+            .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+            .require_encode(codec)
+            .build()
+        else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let (by_hand, by_encoder) = by_hand_and_by_encoder(&context, codec, false)?;
+        assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
+        assert!(by_hand == by_encoder, "{codec:?}: the streams differ");
+    }
+    Ok(())
+}
+
+/// With every slot in flight, the shader still converts each frame into an
+/// input image only once the encode that last read it is done. This is how a
+/// streaming caller submits: without waiting for each packet.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn pipelined_shader_frames_do_not_overwrite_each_other() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = VideoContextBuilder::new()
+            .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+            .require_encode(codec)
+            .build()
+        else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let (by_hand, by_encoder) = by_hand_and_by_encoder(&context, codec, true)?;
+        assert!(!by_hand.is_empty(), "{codec:?}: empty stream");
+        assert!(
+            by_hand == by_encoder,
+            "{codec:?}: a pipelined frame was overwritten"
+        );
+    }
+    Ok(())
+}
+
+/// Whether the encoder gives the same stream twice from the same input.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn encode_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let Ok(context) = VideoContextBuilder::new().require_encode(codec).build() else {
+            eprintln!("{codec:?}: no encoder on this device");
+            continue;
+        };
+        let encode = || -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+            let mut encoder = Encoder::new(context.clone(), encode_config(codec))?;
+            let mut converter = ColorConverter::new(
+                context.clone(),
+                ColorConverterConfig::new(
+                    ENCODE_WIDTH,
+                    ENCODE_HEIGHT,
+                    InputFormat::BGRA,
+                    OutputFormat::NV12,
+                    ColorSpec::Srgb,
+                    ColorSpec::Srgb,
+                    ColorRange::Limited,
+                ),
+            )?;
+            let mut packets = Vec::new();
+            for n in 0..8 {
+                let src = unsafe {
+                    create_src_image(&context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))?
+                };
+                let slot = encoder.input_slot()?;
+                convert_into(&mut converter, src.image, slot.image())?;
+                packets.push(pollster::block_on(encoder.submit(Frame::input(slot))?)?.data);
+            }
+            Ok(packets)
+        };
+        let first = encode()?;
+        for run in 1..5 {
+            let other = encode()?;
+            let differ: Vec<usize> = (0..first.len()).filter(|&i| first[i] != other[i]).collect();
+            println!("{codec:?} run {run}: frames that differ from run 0: {differ:?}");
+        }
+    }
     Ok(())
 }

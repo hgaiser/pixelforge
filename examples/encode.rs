@@ -10,7 +10,7 @@
 //! The codec defaults to `h264`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 use std::fs::File;
@@ -92,15 +92,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure encoder.
     let config = config
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(26)
+        .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
-        .with_gop_size(30)
-        .with_b_frames(0);
+        .with_gop_size(30);
 
     println!(
-        "Config: {:?}, QP={}, GOP={}, B-frames={}\n",
-        config.rate_control_mode, config.quality_level, config.gop_size, config.b_frame_count
+        "Config: {:?}, GOP={}\n",
+        config.rate_control, config.gop_size
     );
 
     // Create input image for uploading frames.
@@ -144,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input_image.upload_yuv420(frame)?;
 
         // Submit the frame (async) and keep the pipeline at most ~2 deep.
-        pending.push_back(encoder.encode(input_image.image())?);
+        pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         while pending.len() > 2 {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;
             write_packet(packet, &mut total_bytes)?;

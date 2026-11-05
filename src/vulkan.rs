@@ -524,6 +524,66 @@ impl DeviceExtensions {
     }
 }
 
+/// Which of the extensions behind DMA-BUF and sync_file input a context has
+/// enabled. All off without the `dmabuf` feature.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExternalSupport {
+    /// Import and export of DMA-BUF images with DRM format modifiers.
+    pub dmabuf: bool,
+    /// Import and export of sync_file fences.
+    pub sync_file: bool,
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT`, the right owner for memory shared with
+    /// another process or API.
+    pub foreign_queue: bool,
+}
+
+impl ExternalSupport {
+    const DMABUF: [&'static CStr; 4] = [
+        ash::khr::external_memory_fd::NAME,
+        ash::ext::external_memory_dma_buf::NAME,
+        ash::ext::image_drm_format_modifier::NAME,
+        // Required by the modifier extension; core since 1.2.
+        ash::khr::image_format_list::NAME,
+    ];
+
+    /// What a device offering the extensions `has` says it has can enable.
+    pub(crate) fn detect(has: impl Fn(&CStr) -> bool) -> Self {
+        if !cfg!(feature = "dmabuf") {
+            return Self::default();
+        }
+        Self {
+            dmabuf: Self::DMABUF.iter().all(|name| has(name)),
+            sync_file: has(ash::khr::external_semaphore_fd::NAME),
+            foreign_queue: has(ash::ext::queue_family_foreign::NAME),
+        }
+    }
+
+    /// The extensions to enable for this.
+    pub(crate) fn extension_names(&self) -> Vec<&'static CStr> {
+        let mut names = Vec::new();
+        if self.dmabuf {
+            names.extend(Self::DMABUF);
+        }
+        if self.sync_file {
+            names.push(ash::khr::external_semaphore_fd::NAME);
+        }
+        if self.foreign_queue {
+            names.push(ash::ext::queue_family_foreign::NAME);
+        }
+        names
+    }
+
+    /// The queue family to acquire shared memory from and release it to.
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    pub(crate) fn foreign_family(&self) -> u32 {
+        if self.foreign_queue {
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        } else {
+            vk::QUEUE_FAMILY_EXTERNAL
+        }
+    }
+}
+
 /// Whether `physical_device` can support unified image layouts *for video*.
 ///
 /// Both the extension and both of its feature bits are needed:
@@ -612,6 +672,9 @@ struct VideoContextInner {
     /// calling them crashes. The KHR names are valid on any device with
     /// `VK_KHR_synchronization2` enabled, which pixelforge requires either way.
     sync2: ash::khr::synchronization2::Device,
+    /// `VK_KHR_timeline_semaphore` entry points, for the same reason as
+    /// `sync2`.
+    timeline: ash::khr::timeline_semaphore::Device,
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
@@ -628,6 +691,8 @@ struct VideoContextInner {
     has_push_descriptor: bool,
     has_video_encode_rgb_conversion: bool,
     has_unified_image_layouts: bool,
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    external: ExternalSupport,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
@@ -690,11 +755,28 @@ impl VideoContext {
         &self.inner.sync2
     }
 
+    /// The DMA-BUF and sync_file extensions this context enabled.
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    pub(crate) fn external(&self) -> ExternalSupport {
+        self.inner.external
+    }
+
+    /// Wait on the CPU until `point` is reached.
+    pub(crate) fn wait_point(&self, point: crate::sync::TimelinePoint) -> crate::error::Result<()> {
+        let semaphores = [point.semaphore];
+        let values = [point.value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        unsafe { self.inner.timeline.wait_semaphores(&info, u64::MAX) }
+            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))
+    }
+
     /// Hand over a semaphore to be destroyed with the context rather than now.
     ///
     /// For a semaphore whose owner is being dropped while a submission from
     /// elsewhere may still wait on it: the colour converter's timeline, which
-    /// an encode submitted with [`crate::Encoder::encode_after`] can still be
+    /// an encode that waits on it with [`crate::Frame::wait`] can still be
     /// waiting on when the converter goes. Every encoder holds the context and
     /// waits for its queues when dropped, so by the time the context goes,
     /// nothing of pixelforge's waits on these any more.
@@ -720,6 +802,11 @@ impl VideoContext {
     /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
     pub(crate) fn encode_timestamps_supported(&self) -> bool {
         self.inner.video_encode_timestamp_valid_bits > 0
+    }
+
+    /// The selected video encode queue family's `timestampValidBits`.
+    pub(crate) fn encode_timestamp_valid_bits(&self) -> u32 {
+        self.inner.video_encode_timestamp_valid_bits
     }
 
     pub(crate) fn video_decode_queue_family(&self) -> Option<u32> {
@@ -777,7 +864,7 @@ impl VideoContext {
     /// Whether `VK_VALVE_video_encode_rgb_conversion` is enabled, extension
     /// and feature both: encoders can then take RGB input and convert it
     /// themselves, see
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input).
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder).
     pub fn has_video_encode_rgb_conversion(&self) -> bool {
         self.inner.has_video_encode_rgb_conversion
     }
@@ -1161,16 +1248,17 @@ impl VideoContext {
         let mut extension_names = vec![
             ash::khr::video_queue::NAME.as_ptr(),
             ash::khr::synchronization2::NAME.as_ptr(),
+            ash::khr::timeline_semaphore::NAME.as_ptr(),
         ];
 
-        // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
-        #[cfg(feature = "dmabuf")]
-        {
-            extension_names.push(ash::khr::external_memory::NAME.as_ptr());
-            extension_names.push(ash::khr::external_memory_fd::NAME.as_ptr());
-            extension_names.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
-            extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
-        }
+        // DMA-BUF and sync_file input, with the `dmabuf` feature, wherever the
+        // device offers them.
+        let external = ExternalSupport::detect(|name| {
+            selected_device_exts
+                .as_ref()
+                .is_some_and(|exts| has_extension(exts, name))
+        });
+        extension_names.extend(external.extension_names().iter().map(|name| name.as_ptr()));
 
         let mut push_ext = |name: *const std::ffi::c_char| {
             if !extension_names.contains(&name) {
@@ -1377,6 +1465,7 @@ impl VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
+                timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
@@ -1396,6 +1485,7 @@ impl VideoContext {
                 has_push_descriptor,
                 has_video_encode_rgb_conversion: has_rgb_conversion,
                 has_unified_image_layouts: has_unified_layouts,
+                external,
                 owns_device: true,
                 retired_semaphores: Default::default(),
                 debug_messenger,
@@ -1482,6 +1572,7 @@ impl VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
+                timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
@@ -1501,6 +1592,7 @@ impl VideoContext {
                 has_push_descriptor: false,
                 has_video_encode_rgb_conversion: false,
                 has_unified_image_layouts: declared_unified_image_layouts,
+                external: ExternalSupport::default(),
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.

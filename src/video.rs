@@ -162,7 +162,7 @@ fn create_video_image_raw(
 /// must carry a `VkSamplerYcbcrConversion`, and a video picture resource must
 /// not have one. Declaring the narrower usage says what this view is actually
 /// for and keeps both requirements satisfiable at once.
-fn create_video_image_view(
+pub(crate) fn create_video_image_view(
     context: &VideoContext,
     image: vk::Image,
     format: vk::Format,

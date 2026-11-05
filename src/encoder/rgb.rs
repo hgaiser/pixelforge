@@ -8,7 +8,7 @@
 //! matrix, range and chroma siting to convert with.
 
 use super::support::report;
-use super::{BitDepth, Codec, ColorDescription, EncodeConfig, PixelFormat};
+use super::{BitDepth, Codec, ColorDescription, EncodeConfig, PixelFormat, StreamColor};
 use crate::converter::InputFormat;
 use crate::error::{PixelForgeError, Result};
 use crate::video::query_supported_video_formats;
@@ -151,28 +151,29 @@ impl RgbConversionCaps {
 
 impl VideoContext {
     /// Whether an [`Encoder`](crate::Encoder) for `codec` can take `format`
-    /// RGB input and convert it to the YUV that `desc` describes itself,
+    /// RGB input and convert it to the YUV that `color` says itself,
     /// through `VK_VALVE_video_encode_rgb_conversion`.
     ///
     /// Asks the driver everything [`Encoder::new`](crate::Encoder::new) will
     /// need: that the device has the extension, that the codec's RGB input
-    /// profile exists, that its conversion does `desc`'s matrix and range,
+    /// profile exists, that its conversion does `color`'s matrix and range,
     /// and that it accepts `format` as an input image. The output is always
     /// 4:2:0, at 8 bits for 8-bit RGB and 10 bits for
     /// [`InputFormat::ABGR2101010`]. Resolution and rate control are not
     /// considered.
     ///
-    /// When this is true, build the encoder with
-    /// [`EncodeConfig::with_rgb_input`](crate::EncodeConfig::with_rgb_input)
-    /// and [`EncodeConfig::with_color_description`](crate::EncodeConfig::with_color_description)
-    /// set to `desc`. [`ColorConverterConfig::rgb_encode_input`](crate::ColorConverterConfig::rgb_encode_input)
-    /// asks this for a conversion it would otherwise run.
+    /// When this is true, an encoder for an RGB [`Source`](crate::Source) in
+    /// `format`, with `color` as its stream colour, picks
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder) by itself.
     pub fn supports_rgb_encode_input(
         &self,
         codec: Codec,
         format: InputFormat,
-        desc: &ColorDescription,
+        color: StreamColor,
     ) -> bool {
+        if matches!(color, StreamColor::Other(_)) {
+            return false;
+        }
         if !self.has_video_encode_rgb_conversion() || !self.supports_encode(codec) {
             return false;
         }
@@ -213,7 +214,7 @@ impl VideoContext {
             );
             return false;
         }
-        if let Err(e) = RgbConversionCaps::from(&caps).session_info(desc) {
+        if let Err(e) = RgbConversionCaps::from(&caps).session_info(&color.description()) {
             tracing::debug!("{what}: {e}");
             return false;
         }

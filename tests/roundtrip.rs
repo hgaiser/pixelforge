@@ -22,14 +22,12 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder,
 };
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
-/// The encoder does not support B-frames yet, so this is an I-P GOP.
-const B_FRAMES: u32 = 0;
 const GOP: u32 = 30;
 
 #[test]
@@ -57,11 +55,9 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
     let frame_count = yuv.len() / frame_size;
 
     let config = EncodeConfig::h264(WIDTH, HEIGHT)
-        .with_rate_control(RateControlMode::Cqp)
-        .with_quality_level(26)
+        .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
-        .with_gop_size(GOP)
-        .with_b_frames(B_FRAMES);
+        .with_gop_size(GOP);
 
     let mut input_image = InputImage::new(
         context.clone(),
@@ -77,7 +73,7 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
     for i in 0..frame_count {
         input_image.upload_yuv420(&yuv[i * frame_size..(i + 1) * frame_size])?;
-        pending.push_back(encoder.encode(input_image.image())?);
+        pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         while pending.len() > 2 {
             let packet = pollster::block_on(pending.pop_front().expect("non-empty"))?;
             bitstream.extend_from_slice(&packet.data);
@@ -90,7 +86,7 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
     }
     File::create(&bitstream_path)?.write_all(&bitstream)?;
     println!(
-        "Encoded {} frames -> {} bytes (b_frames={B_FRAMES}, gop={GOP})",
+        "Encoded {} frames -> {} bytes (gop={GOP})",
         frame_count,
         bitstream.len()
     );

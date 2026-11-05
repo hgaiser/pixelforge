@@ -117,16 +117,48 @@ checks the output against a context pixelforge created itself. It needs no
 ffmpeg. Anything that reaches a core 1.2 or 1.3 entry point panics there, so
 run it after touching submission or barrier code.
 
-The RGB input path (`EncodeConfig::with_rgb_input`) needs
-`VK_VALVE_video_encode_rgb_conversion`, which today only RADV has.
-`tests/rgb_encode.rs` compares it against the colour converter, checks that
-`supports_rgb_encode_input` agrees with encoder creation, and skips what the
-device cannot do, so a green run elsewhere says little about it. Under
-validation it draws two messages that are the layer's, not pixelforge's: the
-layer does not model that extension, so it rejects the RGB profile struct in a
-query pool's profile chain (the spec requires that chain to match the
-session's) and checks the RGB input view against the plain format features
-rather than the video profile's.
+An RGB source (`Source::Rgb`) is converted by the encoder itself
+(`Conversion::Encoder`) only with `VK_VALVE_video_encode_rgb_conversion`,
+which today only RADV has. The colour converter is crate-private, so its
+device tests are in the crate (`src/converter/device_tests.rs`, run with
+`cargo test --lib -- --ignored`): they check the shader against the same maths
+on the CPU, and the shader path inside the encoder against converting by hand
+(byte-identical). `tests/rgb_encode.rs` on RADV compares the encoder's
+conversion against the shader's and checks that `supports_rgb_encode_input`
+agrees with encoder creation, so a green run elsewhere says little about the
+encoder path. Under validation that path draws two messages that are the
+layer's, not pixelforge's: the layer does not model that extension, so it
+rejects the RGB profile struct in a query pool's profile chain (the spec
+requires that chain to match the session's) and checks the RGB input view
+against the plain format features rather than the video profile's.
+
+DMA-BUF input (`--features dmabuf`, `tests/dmabuf.rs`) has three ways to read a
+buffer: the encode itself, a copy into the input image, and the colour
+converter's shader. The tests play the producer by importing the same buffer
+into an image of their own. On NVIDIA (615.78.08) the driver reports more than
+works, and `quirks_allow` in `src/encoder/external.rs` holds it back: the encode
+never reads a DMA-BUF directly (it reads black), and two-plane YUV buffers are
+LINEAR only (block-linear ones lose their chroma plane). So on NVIDIA the
+direct read and the unaligned-size test are skipped, and only RADV can check
+them. `PIXELFORGE_NO_DMABUF_QUIRKS=1` turns the quirks off, which makes two of
+those tests fail on that driver.
+
+Reference frame invalidation (`tests/rfi.rs`) recovers from the frames the
+encoder keeps in the DPB (the window, `max_reference_frames`), which can be
+more than each frame predicts from. A device that allows many references per
+frame never exercises that. `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` limits the
+references per frame without changing the window, to test it:
+
+```bash
+PIXELFORGE_MAX_ACTIVE_REFERENCES=1 cargo test --test rfi -- --ignored --nocapture
+```
+
+`RUST_LOG=pixelforge::encoder::codec=debug` reports the negotiated window and
+per-frame count, on the `Reference window` line.
+
+Tests run one at a time (`RUST_TEST_THREADS=1` in `.cargo/config.toml`): the
+NVIDIA driver can deadlock when one thread destroys a device while another
+creates objects on a different one.
 
 Make sure there are no Vulkan validation layer errors during execution. Enable
 them with `PIXELFORGE_VALIDATION=1`; the layer's messages are routed through
@@ -138,6 +170,13 @@ nowhere. They are captured like any test output, so run with `--nocapture` to
 see a passing test's. Without `VK_LAYER_KHRONOS_validation` installed,
 pixelforge logs a warning and carries on with validation disabled, so absence
 of errors means nothing if the layer is missing.
+
+On NVIDIA (615.78.08) a decode submit under validation crashes inside the
+driver (`vkQueueSubmit2` from `DecodePipeline::submit_decode`), so every test
+that decodes (`roundtrip`, `adopted`, `submit`'s repeat test, and the
+`rgb_encode` tests that compare decoded frames) segfaults there with `PIXELFORGE_VALIDATION=1`. Run those
+without validation on that driver, and check their encode half under
+validation separately.
 
 Run the ignored tests once without validation as well. The layer gives every
 object a unique handle, while drivers reuse the handles of destroyed objects
