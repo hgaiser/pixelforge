@@ -375,8 +375,8 @@ impl H265 {
         let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(rc.average_bitrate as u64)
             .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate_numerator)
-            .frame_rate_denominator(common.config.frame_rate_denominator)
+            .frame_rate_numerator(common.config.frame_rate.numerator)
+            .frame_rate_denominator(common.config.frame_rate.denominator)
             .push(&mut h265_rc_layer_info);
         let rc_layers = [rc_layer_info];
 

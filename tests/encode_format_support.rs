@@ -4,9 +4,9 @@
 #[allow(dead_code)]
 mod common;
 
-use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, VideoContextBuilder};
+use pixelforge::{BitDepth, Codec, EncodeConfig, Encoder, PixelFormat, VideoContextBuilder};
 
-fn config(codec: Codec, pixel_format: PixelFormat, bit_depth: EncodeBitDepth) -> EncodeConfig {
+fn config(codec: Codec, pixel_format: PixelFormat, bit_depth: BitDepth) -> EncodeConfig {
     match codec {
         Codec::H264 => EncodeConfig::h264(1280, 720),
         Codec::H265 => EncodeConfig::h265(1280, 720),
@@ -27,7 +27,7 @@ fn query_matches_encoder_creation() {
 
     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
         for pixel_format in [PixelFormat::Yuv420, PixelFormat::Yuv444] {
-            for bit_depth in [EncodeBitDepth::Eight, EncodeBitDepth::Ten] {
+            for bit_depth in [BitDepth::Eight, BitDepth::Ten] {
                 let supported = context.supports_encode_format(codec, pixel_format, bit_depth);
                 let created =
                     Encoder::new(context.clone(), config(codec, pixel_format, bit_depth)).is_ok();
@@ -53,7 +53,7 @@ fn eight_bit_420_matches_supports_encode() {
         .expect("no Vulkan video device");
     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
         assert_eq!(
-            context.supports_encode_format(codec, PixelFormat::Yuv420, EncodeBitDepth::Eight),
+            context.supports_encode_format(codec, PixelFormat::Yuv420, BitDepth::Eight),
             context.supports_encode(codec),
             "{codec:?}"
         );
@@ -69,18 +69,10 @@ fn unsupported_codec_or_format_is_false() {
         .build()
         .expect("no Vulkan video device");
     // The encoder has no 4:2:2 H.265 profile.
-    assert!(!context.supports_encode_format(
-        Codec::H265,
-        PixelFormat::Yuv422,
-        EncodeBitDepth::Eight
-    ));
+    assert!(!context.supports_encode_format(Codec::H265, PixelFormat::Yuv422, BitDepth::Eight));
     for codec in [Codec::H264, Codec::H265, Codec::AV1] {
         if !context.supports_encode(codec) {
-            assert!(!context.supports_encode_format(
-                codec,
-                PixelFormat::Yuv420,
-                EncodeBitDepth::Eight
-            ));
+            assert!(!context.supports_encode_format(codec, PixelFormat::Yuv420, BitDepth::Eight));
         }
     }
 }

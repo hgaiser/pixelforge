@@ -30,22 +30,22 @@ use crate::converter::ColorRange;
 // Default encoder configuration constants.
 
 /// Default frame rate (frames per second).
-pub const DEFAULT_FRAME_RATE: u32 = 30;
+pub(crate) const DEFAULT_FRAME_RATE: u32 = 30;
 
 /// Default GOP (Group of Pictures) size.
-pub const DEFAULT_GOP_SIZE: u32 = 30;
+pub(crate) const DEFAULT_GOP_SIZE: u32 = 30;
 
 /// Default QP (quantization parameter) for H.264.
-pub const DEFAULT_H264_QP: u32 = 26;
+pub(crate) const DEFAULT_H264_QP: u32 = 26;
 
 /// Default QP (quantization parameter) for H.265.
-pub const DEFAULT_H265_QP: u32 = 28;
+pub(crate) const DEFAULT_H265_QP: u32 = 28;
 
 /// Default quantizer index for AV1.
-pub const DEFAULT_AV1_Q_INDEX: u32 = 128;
+pub(crate) const DEFAULT_AV1_Q_INDEX: u32 = 128;
 
 /// Default maximum number of reference frames.
-pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
+pub(crate) const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
 
 /// Video codec types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,10 +280,21 @@ pub enum FrameType {
 }
 
 /// Video dimensions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimensions {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+}
+
+/// Frames per second, as a fraction: 30000/1001 for 29.97.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRate {
+    /// Frames.
+    pub numerator: u32,
+    /// Seconds.
+    pub denominator: u32,
 }
 
 /// What the stream says about its colours: for an RGB source, also what the
@@ -401,10 +412,8 @@ pub struct EncodeConfig {
     pub bit_depth: BitDepth,
     /// How the encoder spends bits. Checked by [`Encoder::new`].
     pub rate_control: RateControl,
-    /// Frame rate numerator.
-    pub frame_rate_numerator: u32,
-    /// Frame rate denominator.
-    pub frame_rate_denominator: u32,
+    /// Frames per second.
+    pub frame_rate: FrameRate,
     /// GOP size (distance between IDR frames).
     pub gop_size: u32,
     /// Maximum number of reference frames kept in the DPB: the window that
@@ -444,19 +453,21 @@ pub struct EncodeConfig {
 }
 
 impl EncodeConfig {
-    /// Create a new H.264 encode configuration with default settings.
-    pub fn h264(width: u32, height: u32) -> Self {
+    /// Create a new `codec` encode configuration with default settings.
+    pub fn new(codec: Codec, width: u32, height: u32) -> Self {
         assert!(width > 0, "width must be non-zero");
         assert!(height > 0, "height must be non-zero");
 
         Self {
-            codec: Codec::H264,
+            codec,
             dimensions: Dimensions { width, height },
             pixel_format: PixelFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            rate_control: RateControl::default_for(Codec::H264),
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
+            rate_control: RateControl::default_for(codec),
+            frame_rate: FrameRate {
+                numerator: DEFAULT_FRAME_RATE,
+                denominator: 1,
+            },
             gop_size: DEFAULT_GOP_SIZE,
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
@@ -468,58 +479,21 @@ impl EncodeConfig {
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
         }
+    }
+
+    /// Create a new H.264 encode configuration with default settings.
+    pub fn h264(width: u32, height: u32) -> Self {
+        Self::new(Codec::H264, width, height)
     }
 
     /// Create a new H.265/HEVC encode configuration with default settings.
     pub fn h265(width: u32, height: u32) -> Self {
-        assert!(width > 0, "width must be non-zero");
-        assert!(height > 0, "height must be non-zero");
-
-        Self {
-            codec: Codec::H265,
-            dimensions: Dimensions { width, height },
-            pixel_format: PixelFormat::Yuv420,
-            bit_depth: BitDepth::Eight,
-            rate_control: RateControl::default_for(Codec::H265),
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
-            gop_size: DEFAULT_GOP_SIZE,
-            max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
-            color: StreamColor::default(),
-            source: Source::Yuv,
-            conversion: ConversionPreference::Auto,
-            encode_usage_hint: EncodeUsageHint::Default,
-            encode_content_hint: EncodeContentHint::Default,
-            encoder_tuning_mode: EncoderTuningMode::Default,
-        }
+        Self::new(Codec::H265, width, height)
     }
 
     /// Create a new AV1 encode configuration with default settings.
     pub fn av1(width: u32, height: u32) -> Self {
-        assert!(width > 0, "width must be non-zero");
-        assert!(height > 0, "height must be non-zero");
-
-        Self {
-            codec: Codec::AV1,
-            dimensions: Dimensions { width, height },
-            pixel_format: PixelFormat::Yuv420,
-            bit_depth: BitDepth::Eight,
-            rate_control: RateControl::default_for(Codec::AV1),
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
-            gop_size: DEFAULT_GOP_SIZE,
-            max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
-            color: StreamColor::default(),
-            source: Source::Yuv,
-            conversion: ConversionPreference::Auto,
-            encode_usage_hint: EncodeUsageHint::Default,
-            encode_content_hint: EncodeContentHint::Default,
-            encoder_tuning_mode: EncoderTuningMode::Default,
-        }
+        Self::new(Codec::AV1, width, height)
     }
 
     /// Set how the encoder spends bits.
@@ -542,8 +516,10 @@ impl EncodeConfig {
 
     /// Set the frame rate.
     pub fn with_frame_rate(mut self, numerator: u32, denominator: u32) -> Self {
-        self.frame_rate_numerator = numerator;
-        self.frame_rate_denominator = denominator;
+        self.frame_rate = FrameRate {
+            numerator,
+            denominator,
+        };
         self
     }
 
@@ -797,8 +773,8 @@ mod tests {
             assert_eq!(config.bit_depth, BitDepth::Eight);
             assert_eq!(config.rate_control, RateControl::Cqp { qp: 26 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.frame_rate_numerator, 30);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 30);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
@@ -838,8 +814,8 @@ mod tests {
         fn test_with_frame_rate() {
             let config = EncodeConfig::h264(1920, 1080).with_frame_rate(60, 1);
 
-            assert_eq!(config.frame_rate_numerator, 60);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 60);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
@@ -868,8 +844,8 @@ mod tests {
             // AV1 uses a 0-255 quantizer index.
             assert_eq!(config.rate_control, RateControl::Cqp { qp: 128 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.frame_rate_numerator, 30);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 30);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
@@ -883,7 +859,7 @@ mod tests {
             assert_eq!(config.codec, Codec::AV1);
             assert_eq!(config.rate_control, RateControl::Cqp { qp: 100 });
             assert_eq!(config.gop_size, 60);
-            assert_eq!(config.frame_rate_numerator, 60);
+            assert_eq!(config.frame_rate.numerator, 60);
             assert_eq!(config.max_reference_frames, 2);
         }
 
@@ -907,7 +883,7 @@ mod tests {
                 }
             );
             assert_eq!(config.gop_size, 120);
-            assert_eq!(config.frame_rate_numerator, 60);
+            assert_eq!(config.frame_rate.numerator, 60);
         }
     }
 

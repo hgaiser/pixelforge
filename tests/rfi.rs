@@ -20,7 +20,7 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
+    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder, YuvLayout,
 };
 use std::collections::VecDeque;
@@ -105,7 +105,7 @@ fn run_codec(
     }
     .with_rate_control(RateControl::Cqp { qp: 10 })
     .with_pixel_format(PixelFormat::Yuv420)
-    .with_bit_depth(EncodeBitDepth::Eight)
+    .with_bit_depth(BitDepth::Eight)
     // Infinite GOP so the recovery can only come from RFI, never a periodic IDR.
     .with_gop_size(0);
 

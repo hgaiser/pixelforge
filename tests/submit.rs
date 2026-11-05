@@ -8,7 +8,7 @@ mod common;
 
 use ash::vk;
 use pixelforge::{
-    Codec, ColorSpec, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, Handoff,
+    BitDepth, Codec, ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff,
     InputFormat, InputImage, PixelFormat, RgbSource, Source, SourceImage, VideoContext,
     VideoContextBuilder, YuvLayout,
 };
@@ -56,7 +56,7 @@ fn a_source_image_needs_pixels() -> Result<(), Box<dyn std::error::Error>> {
         context.clone(),
         WIDTH,
         HEIGHT,
-        EncodeBitDepth::Eight,
+        BitDepth::Eight,
         PixelFormat::Yuv420,
     )?;
     for layout in [vk::ImageLayout::UNDEFINED, vk::ImageLayout::PREINITIALIZED] {

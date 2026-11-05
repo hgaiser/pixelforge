@@ -16,7 +16,7 @@ use common::{Readback, decode_stream};
 use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, ColorRange, ColorSpec, Conversion, ConversionPreference, EncodeBitDepth, EncodeConfig,
+    BitDepth, Codec, ColorRange, ColorSpec, Conversion, ConversionPreference, EncodeConfig,
     Encoder, Frame, Handoff, InputFormat, RateControl, RgbSource, Source, SourceImage, StreamColor,
     VideoContext, VideoContextBuilder,
 };
@@ -273,9 +273,9 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
             InputFormat::RGBA16F,
         ] {
             let bit_depth = if format == InputFormat::ABGR2101010 {
-                EncodeBitDepth::Ten
+                BitDepth::Ten
             } else {
-                EncodeBitDepth::Eight
+                BitDepth::Eight
             };
             for &(name, stream) in &colors {
                 let color = if matches!(stream, StreamColor::Hdr10 { .. }) {

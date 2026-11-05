@@ -205,7 +205,7 @@ let context = VideoContextBuilder::new()
 
 // SDR desktop content, encoded as HDR10 for an HDR streaming session.
 let config = EncodeConfig::h265(1920, 1080)
-    .with_bit_depth(pixelforge::EncodeBitDepth::Ten)
+    .with_bit_depth(pixelforge::BitDepth::Ten)
     .with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, ColorSpec::Srgb)))
     .with_color(StreamColor::Hdr10 {
         range: ColorRange::Full,

@@ -11,7 +11,7 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
+    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
     VideoContextBuilder, YuvLayout,
 };
 use std::fs::File;
@@ -49,18 +49,18 @@ fn verify_all() -> Result<(), Box<dyn std::error::Error>> {
     let dir = common::scratch_dir("verify_all");
 
     let combinations = [
-        (Codec::H264, EncodeBitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::H264, EncodeBitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::H264, EncodeBitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::H264, EncodeBitDepth::Ten, PixelFormat::Yuv444),
-        (Codec::H265, EncodeBitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::H265, EncodeBitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::H265, EncodeBitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::H265, EncodeBitDepth::Ten, PixelFormat::Yuv444),
-        (Codec::AV1, EncodeBitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::AV1, EncodeBitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::AV1, EncodeBitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::AV1, EncodeBitDepth::Ten, PixelFormat::Yuv444),
+        (Codec::H264, BitDepth::Eight, PixelFormat::Yuv420),
+        (Codec::H264, BitDepth::Eight, PixelFormat::Yuv444),
+        (Codec::H264, BitDepth::Ten, PixelFormat::Yuv420),
+        (Codec::H264, BitDepth::Ten, PixelFormat::Yuv444),
+        (Codec::H265, BitDepth::Eight, PixelFormat::Yuv420),
+        (Codec::H265, BitDepth::Eight, PixelFormat::Yuv444),
+        (Codec::H265, BitDepth::Ten, PixelFormat::Yuv420),
+        (Codec::H265, BitDepth::Ten, PixelFormat::Yuv444),
+        (Codec::AV1, BitDepth::Eight, PixelFormat::Yuv420),
+        (Codec::AV1, BitDepth::Eight, PixelFormat::Yuv444),
+        (Codec::AV1, BitDepth::Ten, PixelFormat::Yuv420),
+        (Codec::AV1, BitDepth::Ten, PixelFormat::Yuv444),
     ];
 
     let context = VideoContextBuilder::new()
@@ -105,7 +105,7 @@ fn run_test(
     context: &pixelforge::VideoContext,
     dir: &std::path::Path,
     codec: Codec,
-    depth: EncodeBitDepth,
+    depth: BitDepth,
     format: PixelFormat,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     // AV1 uses .obu extension for raw OBU streams (with temporal delimiters).

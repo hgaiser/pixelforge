@@ -200,7 +200,7 @@
 //!
 //! // SDR desktop content, encoded as HDR10 for an HDR streaming session.
 //! let config = EncodeConfig::h265(1920, 1080)
-//!     .with_bit_depth(pixelforge::EncodeBitDepth::Ten)
+//!     .with_bit_depth(pixelforge::BitDepth::Ten)
 //!     .with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, ColorSpec::Srgb)))
 //!     .with_color(StreamColor::Hdr10 {
 //!         range: ColorRange::Full,
@@ -397,10 +397,9 @@ pub use decoder::{
 #[cfg(feature = "dmabuf")]
 pub use encoder::external::{DmaBuf, DmaBufPlane, ExternalImage, InputFormats, InputModifier};
 pub use encoder::{
-    BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_AV1_Q_INDEX, DEFAULT_FRAME_RATE,
-    DEFAULT_GOP_SIZE, DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_REFERENCE_FRAMES, EncodeConfig,
-    EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode,
-    Frame, FrameType, PixelFormat, RateControl,
+    BitDepth, Codec, ColorDescription, Dimensions, EncodeConfig, EncodeContentHint, EncodeFuture,
+    EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode, Frame, FrameRate, FrameType,
+    PixelFormat, RateControl,
 };
 pub use encoder::{
     Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,

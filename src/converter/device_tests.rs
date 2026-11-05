@@ -36,9 +36,8 @@ use super::{
 };
 use crate::encoder::input::SourceOwnership;
 use crate::{
-    Codec, ColorDescription, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame,
-    Handoff, RateControl, RgbSource, Source, SourceImage, StreamColor, VideoContext,
-    VideoContextBuilder,
+    BitDepth, Codec, ColorDescription, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff,
+    RateControl, RgbSource, Source, SourceImage, StreamColor, VideoContext, VideoContextBuilder,
 };
 use ash::vk;
 
@@ -194,7 +193,7 @@ fn encoders(
     let ten = Encoder::new(
         context.clone(),
         EncodeConfig::h265(WIDTH, HEIGHT)
-            .with_bit_depth(EncodeBitDepth::Ten)
+            .with_bit_depth(BitDepth::Ten)
             .with_frame_rate(30, 1),
     )
     .ok();

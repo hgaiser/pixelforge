@@ -7,8 +7,8 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, VideoContext,
-    VideoContextBuilder, YuvLayout,
+    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, VideoContext, VideoContextBuilder,
+    YuvLayout,
 };
 
 const WIDTH: u32 = 320;
@@ -59,7 +59,7 @@ fn frame(layout: YuvLayout, index: usize) -> Vec<u8> {
 /// image and half straight into a slot.
 fn encode(
     context: &VideoContext,
-    depth: EncodeBitDepth,
+    depth: BitDepth,
     layout: YuvLayout,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let config = EncodeConfig::h265(WIDTH, HEIGHT).with_bit_depth(depth);
@@ -85,8 +85,8 @@ fn encode(
 #[ignore = "requires a Vulkan Video device"]
 fn nv12_and_i420_upload_the_same_frame() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
-    let i420 = encode(&context, EncodeBitDepth::Eight, YuvLayout::I420)?;
-    let nv12 = encode(&context, EncodeBitDepth::Eight, YuvLayout::Nv12)?;
+    let i420 = encode(&context, BitDepth::Eight, YuvLayout::I420)?;
+    let nv12 = encode(&context, BitDepth::Eight, YuvLayout::Nv12)?;
     assert!(!i420.is_empty());
     assert_eq!(
         i420, nv12,
@@ -99,14 +99,14 @@ fn nv12_and_i420_upload_the_same_frame() -> Result<(), Box<dyn std::error::Error
 #[ignore = "requires a Vulkan Video device"]
 fn ten_bit_and_eight_bit_upload_the_same_frame() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
-    let i420 = match encode(&context, EncodeBitDepth::Ten, YuvLayout::I420) {
+    let i420 = match encode(&context, BitDepth::Ten, YuvLayout::I420) {
         Ok(stream) => stream,
         Err(e) => {
             eprintln!("skipping: no 10-bit H.265 encoder ({e})");
             return Ok(());
         }
     };
-    let i420p10 = encode(&context, EncodeBitDepth::Ten, YuvLayout::I420P10)?;
+    let i420p10 = encode(&context, BitDepth::Ten, YuvLayout::I420P10)?;
     assert!(!i420.is_empty());
     assert_eq!(
         i420, i420p10,

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `EncodeConfig::new(codec, width, height)`, for a codec chosen at
+  runtime.
 - Add RGB input: `EncodeConfig::with_source(Source::Rgb(..))`. The encoder
   converts RGB frames to the YUV its colour description describes, through
   `VK_VALVE_video_encode_rgb_conversion` where the device can and the colour
@@ -71,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait until the frames that read the image are done with it.
 - **Breaking:** `InputImage::new` no longer takes a `Codec`, which it did not
   use. `InputImage::for_encoder` makes one for an encoder's frames.
+- **Breaking:** `EncodeConfig::frame_rate` (a `FrameRate`) replaces
+  `frame_rate_numerator` and `frame_rate_denominator`. `with_frame_rate` is
+  unchanged.
+- **Breaking:** the encoder's `BitDepth` is exported as `BitDepth`, not
+  `EncodeBitDepth`. `Dimensions` and `FrameRate` are exported from the crate
+  root.
+- **Breaking:** the `DEFAULT_*` encoder constants are no longer public.
+  `EncodeConfig::new` and `RateControl::default_for` apply them.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and
