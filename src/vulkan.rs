@@ -1,4 +1,5 @@
 //! Vulkan context and initialization for video encoding.
+use crate::decoder::profile::DecodeProfile;
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -564,11 +565,23 @@ fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CSt
         ash::khr::synchronization2::NAME,
         ash::khr::timeline_semaphore::NAME,
     ];
-    if decode_codecs.contains(&Codec::H264) {
-        names.push(ash::khr::video_decode_h264::NAME);
+    for codec in decode_codecs {
+        names.push(decode_extension_name(*codec));
     }
     names
 }
+
+/// The device extension that decodes `codec`.
+fn decode_extension_name(codec: Codec) -> &'static std::ffi::CStr {
+    match codec {
+        Codec::H264 => ash::khr::video_decode_h264::NAME,
+        Codec::H265 => ash::khr::video_decode_h265::NAME,
+        Codec::AV1 => ash::khr::video_decode_av1::NAME,
+    }
+}
+
+/// The codecs pixelforge can decode, on a device that supports them.
+const DECODE_CODECS: &[Codec] = &[Codec::H264];
 
 /// The decode codecs `physical_device` supports.
 fn query_decode_codecs(
@@ -576,11 +589,76 @@ fn query_decode_codecs(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<Codec> {
-    let mut codecs = Vec::new();
-    if VideoContext::check_h264_decode_support(entry, instance, physical_device) {
-        codecs.push(Codec::H264);
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .unwrap_or_default();
+    let has_extension = |name: &std::ffi::CStr| {
+        extensions
+            .iter()
+            .any(|ext| ext.extension_name_as_c_str() == Ok(name))
+    };
+    DECODE_CODECS
+        .iter()
+        .copied()
+        .filter(|&codec| {
+            has_extension(decode_extension_name(codec))
+                && check_decode_support(entry, instance, physical_device, codec)
+        })
+        .collect()
+}
+
+/// Whether `physical_device` decodes `codec` in its base profile: 8-bit
+/// 4:2:0, H.264 High, H.265 Main or AV1 Main.
+fn check_decode_support(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    codec: Codec,
+) -> bool {
+    let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
+    let profile = DecodeProfile::base(codec);
+
+    let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
+    let mut h265_capabilities = vk::VideoDecodeH265CapabilitiesKHR::default();
+    let mut av1_capabilities = vk::VideoDecodeAV1CapabilitiesKHR::default();
+    let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
+    let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut decode_capabilities);
+    let mut capabilities = match codec {
+        Codec::H264 => capabilities.push(&mut h264_capabilities),
+        Codec::H265 => capabilities.push(&mut h265_capabilities),
+        Codec::AV1 => capabilities.push(&mut av1_capabilities),
+    };
+
+    let result = unsafe {
+        (video_queue.fp().get_physical_device_video_capabilities_khr)(
+            physical_device,
+            profile.info(),
+            &mut capabilities,
+        )
+    };
+
+    match result {
+        vk::Result::SUCCESS => {
+            debug!(
+                "{:?} decode supported: max {}x{}, {} DPB slots",
+                codec,
+                capabilities.max_coded_extent.width,
+                capabilities.max_coded_extent.height,
+                capabilities.max_dpb_slots
+            );
+            true
+        }
+        vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
+            debug!("{:?} decode not supported on this device", codec);
+            false
+        }
+        _ => {
+            warn!(
+                "Failed to query {:?} decode capabilities: {:?}",
+                codec, result
+            );
+            false
+        }
     }
-    codecs
 }
 
 /// Inner struct holding the actual Vulkan resources.
@@ -1049,25 +1127,13 @@ impl VideoContext {
             }
 
             // Check codec support for decoding.
-            let mut decode_codecs = Vec::new();
-            if decode_queue.is_some() {
-                let available_extensions =
-                    unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                        .unwrap_or_default();
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
-                if has_extension(ash::khr::video_decode_h264::NAME)
-                    && Self::check_h264_decode_support(&entry, &instance, physical_device)
-                {
-                    decode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 decode", device_name);
-                }
+            let decode_codecs = if decode_queue.is_some() {
+                query_decode_codecs(&entry, &instance, physical_device)
+            } else {
+                Vec::new()
+            };
+            for codec in &decode_codecs {
+                debug!("Device {} supports {:?} decode", device_name, codec);
             }
 
             // Check if all required encode/decode codecs are supported.
@@ -1589,63 +1655,6 @@ impl VideoContext {
             }
             err => {
                 warn!("Failed to query AV1 encode capabilities: {:?}", err);
-                false
-            }
-        }
-    }
-
-    /// Check if a codec is supported for encoding.
-    fn check_h264_decode_support(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> bool {
-        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
-
-        // H.264 decode profile: High profile, progressive, 8-bit 4:2:0.
-        let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default()
-            .std_profile_idc(
-                ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
-            )
-            .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
-
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut h264_profile);
-
-        let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
-        let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut h264_capabilities)
-            .push(&mut decode_capabilities);
-
-        let result = unsafe {
-            (video_queue.fp().get_physical_device_video_capabilities_khr)(
-                physical_device,
-                &profile_info,
-                &mut capabilities,
-            )
-        };
-
-        match result {
-            vk::Result::SUCCESS => {
-                debug!(
-                    "H.264 decode supported: max {}x{}, {} DPB slots",
-                    capabilities.max_coded_extent.width,
-                    capabilities.max_coded_extent.height,
-                    capabilities.max_dpb_slots
-                );
-                true
-            }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("H.264 decode not supported on this device");
-                false
-            }
-            _ => {
-                warn!("Failed to query H.264 decode capabilities: {:?}", result);
                 false
             }
         }
