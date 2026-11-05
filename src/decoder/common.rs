@@ -22,6 +22,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::decoder::DecodedFrame;
+use crate::decoder::annexb::START_CODE;
 use crate::decoder::frames::SlotPins;
 use crate::decoder::pipeline::DecodePipeline;
 use crate::encoder::{BitDepth, ChromaFormat};
@@ -31,15 +32,6 @@ use crate::video::{
     create_video_image,
 };
 use crate::vulkan::VideoContext;
-
-/// Annex B start code prefixed to each slice handed to the driver.
-///
-/// Three bytes, not four. The leading zero byte of a 4-byte start code is legal
-/// Annex B, and RADV decodes either form, but Intel's ANV decodes almost nothing
-/// when a slice offset points at that extra zero: it reports no error and
-/// returns a picture with a handful of macroblocks in it. ffmpeg's Vulkan
-/// decoder uses three bytes for the same reason.
-pub(crate) const START_CODE: [u8; 3] = [0, 0, 1];
 
 /// Query decode capabilities for a profile.
 ///
