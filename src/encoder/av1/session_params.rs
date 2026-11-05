@@ -4,7 +4,7 @@ use super::Av1;
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -54,9 +54,9 @@ impl Av1 {
             BitDepth::Ten => 10,
         };
 
-        let (subsampling_x, subsampling_y) = match config.pixel_format {
-            PixelFormat::Yuv420 => (1u8, 1u8),
-            PixelFormat::Yuv444 => (0u8, 0u8),
+        let (subsampling_x, subsampling_y) = match config.chroma_format {
+            ChromaFormat::Yuv420 => (1u8, 1u8),
+            ChromaFormat::Yuv444 => (0u8, 0u8),
             _ => (1u8, 1u8),
         };
 
@@ -78,8 +78,8 @@ impl Av1 {
             },
         };
 
-        let profile = match config.pixel_format {
-            PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+        let profile = match config.chroma_format {
+            ChromaFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
             _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
         };
 

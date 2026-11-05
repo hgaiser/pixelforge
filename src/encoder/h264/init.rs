@@ -1,6 +1,6 @@
 use super::{H264, MB_SIZE, ReferenceInfo};
 
-use crate::converter::InputFormat;
+use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
@@ -20,15 +20,15 @@ impl H264 {
     pub(crate) fn create(
         context: VideoContext,
         config: EncodeConfig,
-        rgb_input: Option<InputFormat>,
+        rgb_input: Option<RgbFormat>,
     ) -> Result<CodecEncoder<Self>> {
         info!(
-            "Creating H.264 encoder: {}x{}, pixel_format={:?}",
-            config.dimensions.width, config.dimensions.height, config.pixel_format
+            "Creating H.264 encoder: {}x{}, chroma_format={:?}",
+            config.dimensions.width, config.dimensions.height, config.chroma_format
         );
 
         // Select the profile based on chroma subsampling.
-        let profile_idc = h264_profile_idc(config.pixel_format);
+        let profile_idc = h264_profile_idc(config.chroma_format);
 
         let profile = EncodeProfile::new(&config, rgb_input.is_some())?;
         let profile_info = profile.info();

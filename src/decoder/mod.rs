@@ -56,7 +56,7 @@ use std::task::{Context, Poll};
 use ash::vk;
 use futures_core::Stream;
 
-use crate::encoder::{BitDepth, Codec, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, Codec};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 
@@ -224,8 +224,8 @@ pub struct DecodedFrame {
     /// non-layered DPB or a distinct output image; the DPB slot's layer
     /// when the DPB is layered and the driver decoded straight into it.
     pub array_layer: u32,
-    /// The pixel format of this frame.
-    pub pixel_format: PixelFormat,
+    /// The chroma format of this frame.
+    pub chroma_format: ChromaFormat,
     /// Bit depth of the samples: eight for NV12, ten for P010.
     pub bit_depth: BitDepth,
     /// Which set of decoder images [`image`](Self::image) belongs to.

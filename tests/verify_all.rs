@@ -11,8 +11,8 @@
 mod common;
 
 use pixelforge::{
-    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder, YuvLayout,
+    BitDepth, ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -49,18 +49,18 @@ fn verify_all() -> Result<(), Box<dyn std::error::Error>> {
     let dir = common::scratch_dir("verify_all");
 
     let combinations = [
-        (Codec::H264, BitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::H264, BitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::H264, BitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::H264, BitDepth::Ten, PixelFormat::Yuv444),
-        (Codec::H265, BitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::H265, BitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::H265, BitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::H265, BitDepth::Ten, PixelFormat::Yuv444),
-        (Codec::AV1, BitDepth::Eight, PixelFormat::Yuv420),
-        (Codec::AV1, BitDepth::Eight, PixelFormat::Yuv444),
-        (Codec::AV1, BitDepth::Ten, PixelFormat::Yuv420),
-        (Codec::AV1, BitDepth::Ten, PixelFormat::Yuv444),
+        (Codec::H264, BitDepth::Eight, ChromaFormat::Yuv420),
+        (Codec::H264, BitDepth::Eight, ChromaFormat::Yuv444),
+        (Codec::H264, BitDepth::Ten, ChromaFormat::Yuv420),
+        (Codec::H264, BitDepth::Ten, ChromaFormat::Yuv444),
+        (Codec::H265, BitDepth::Eight, ChromaFormat::Yuv420),
+        (Codec::H265, BitDepth::Eight, ChromaFormat::Yuv444),
+        (Codec::H265, BitDepth::Ten, ChromaFormat::Yuv420),
+        (Codec::H265, BitDepth::Ten, ChromaFormat::Yuv444),
+        (Codec::AV1, BitDepth::Eight, ChromaFormat::Yuv420),
+        (Codec::AV1, BitDepth::Eight, ChromaFormat::Yuv444),
+        (Codec::AV1, BitDepth::Ten, ChromaFormat::Yuv420),
+        (Codec::AV1, BitDepth::Ten, ChromaFormat::Yuv444),
     ];
 
     let context = VideoContextBuilder::new()
@@ -106,7 +106,7 @@ fn run_test(
     dir: &std::path::Path,
     codec: Codec,
     depth: BitDepth,
-    format: PixelFormat,
+    format: ChromaFormat,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     // AV1 uses .obu extension for raw OBU streams (with temporal delimiters).
     // H.264/H.265 use .bin for raw Annex B bitstreams.
@@ -130,7 +130,7 @@ fn run_test(
             Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
         }
         .with_rate_control(RateControl::Cqp { qp: 10 })
-        .with_pixel_format(format)
+        .with_chroma_format(format)
         .with_bit_depth(depth);
 
         let mut encoder = match Encoder::new(context.clone(), config) {
@@ -138,11 +138,15 @@ fn run_test(
             Err(e) => return Err(format!("Failed to create encoder: {}", e).into()),
         };
 
-        let mut input_image = InputImage::for_encoder(&encoder)?;
+        let mut input_image = YuvUploader::for_encoder(&encoder)?;
 
         let input_path = match format {
-            PixelFormat::Yuv420 => format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT),
-            PixelFormat::Yuv444 => format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT),
+            ChromaFormat::Yuv420 => {
+                format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT)
+            }
+            ChromaFormat::Yuv444 => {
+                format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT)
+            }
             _ => return Err("Unsupported format".into()),
         };
 
@@ -150,8 +154,8 @@ fn run_test(
         File::open(&input_path)?.read_to_end(&mut yuv_data)?;
 
         let frame_size = match format {
-            PixelFormat::Yuv420 => (WIDTH * HEIGHT * 3 / 2) as usize,
-            PixelFormat::Yuv444 => (WIDTH * HEIGHT * 3) as usize,
+            ChromaFormat::Yuv420 => (WIDTH * HEIGHT * 3 / 2) as usize,
+            ChromaFormat::Yuv444 => (WIDTH * HEIGHT * 3) as usize,
             _ => return Err("Unsupported format".into()),
         };
 
@@ -170,12 +174,12 @@ fn run_test(
             let frame = &yuv_data[start..end];
 
             // Upload directly to encoder's input image to avoid cross-queue
-            // copy issues (InputImage uses the transfer queue, encoder uses the
+            // copy issues (YuvUploader uses the transfer queue, encoder uses the
             // video encode queue which doesn't support transfer ops).
             let slot = encoder.input_slot()?;
             let layout = match format {
-                PixelFormat::Yuv420 => YuvLayout::I420,
-                PixelFormat::Yuv444 => YuvLayout::I444,
+                ChromaFormat::Yuv420 => YuvLayout::I420,
+                ChromaFormat::Yuv444 => YuvLayout::I444,
                 _ => return Err("Unsupported format".into()),
             };
             input_image.upload_to(&slot, layout, frame)?;
@@ -210,11 +214,11 @@ fn run_test(
 
     // Let's decode to the input format (8-bit).
     let (input_pix_fmt, input_path) = match format {
-        PixelFormat::Yuv420 => (
+        ChromaFormat::Yuv420 => (
             "yuv420p",
             format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT),
         ),
-        PixelFormat::Yuv444 => (
+        ChromaFormat::Yuv444 => (
             "yuv444p",
             format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT),
         ),

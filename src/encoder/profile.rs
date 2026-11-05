@@ -4,14 +4,14 @@
 //! both choose their profile here, so the query answers for exactly the profile an
 //! encoder would request.
 
-use super::{BitDepth, Codec, EncodeConfig, PixelFormat};
+use super::{BitDepth, ChromaFormat, Codec, EncodeConfig};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 
 /// H.264 profile for a pixel format: High 4:4:4 Predictive for 4:4:4, High otherwise.
-pub(crate) fn h264_profile_idc(pixel_format: PixelFormat) -> u32 {
-    match pixel_format {
-        PixelFormat::Yuv444 => {
+pub(crate) fn h264_profile_idc(chroma_format: ChromaFormat) -> u32 {
+    match chroma_format {
+        ChromaFormat::Yuv444 => {
             ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
         }
         _ => ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
@@ -20,15 +20,15 @@ pub(crate) fn h264_profile_idc(pixel_format: PixelFormat) -> u32 {
 
 /// H.265 profile for a pixel format and bit depth, or `None` for combinations the
 /// encoder does not support (4:2:2).
-pub(crate) fn h265_profile_idc(pixel_format: PixelFormat, bit_depth: BitDepth) -> Option<u32> {
-    match (pixel_format, bit_depth) {
-        (PixelFormat::Yuv420, BitDepth::Eight) => {
+pub(crate) fn h265_profile_idc(chroma_format: ChromaFormat, bit_depth: BitDepth) -> Option<u32> {
+    match (chroma_format, bit_depth) {
+        (ChromaFormat::Yuv420, BitDepth::Eight) => {
             Some(ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN)
         }
-        (PixelFormat::Yuv420, BitDepth::Ten) => {
+        (ChromaFormat::Yuv420, BitDepth::Ten) => {
             Some(ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10)
         }
-        (PixelFormat::Yuv444, _) => Some(
+        (ChromaFormat::Yuv444, _) => Some(
             ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS,
         ),
         _ => None,
@@ -36,9 +36,9 @@ pub(crate) fn h265_profile_idc(pixel_format: PixelFormat, bit_depth: BitDepth) -
 }
 
 /// AV1 profile for a pixel format: Main is 4:2:0, High adds 4:4:4.
-pub(crate) fn av1_profile(pixel_format: PixelFormat) -> u32 {
-    match pixel_format {
-        PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+pub(crate) fn av1_profile(chroma_format: ChromaFormat) -> u32 {
+    match chroma_format {
+        ChromaFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
         _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
     }
 }
@@ -77,10 +77,10 @@ impl EncodeProfile {
         };
         let h265_idc = match config.codec {
             Codec::H265 => {
-                h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
+                h265_profile_idc(config.chroma_format, config.bit_depth).ok_or_else(|| {
                     PixelForgeError::InvalidInput(format!(
                         "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
-                        config.pixel_format, config.bit_depth
+                        config.chroma_format, config.bit_depth
                     ))
                 })?
             }
@@ -90,14 +90,14 @@ impl EncodeProfile {
         let mut chain = Box::new(ProfileChain {
             info: vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(operation)
-                .chroma_subsampling(config.pixel_format.into())
+                .chroma_subsampling(config.chroma_format.into())
                 .luma_bit_depth(bit_depth)
                 .chroma_bit_depth(bit_depth),
             h264: vk::VideoEncodeH264ProfileInfoKHR::default()
-                .std_profile_idc(h264_profile_idc(config.pixel_format)),
+                .std_profile_idc(h264_profile_idc(config.chroma_format)),
             h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(h265_idc),
             av1: vk::VideoEncodeAV1ProfileInfoKHR::default()
-                .std_profile(av1_profile(config.pixel_format)),
+                .std_profile(av1_profile(config.chroma_format)),
             usage: vk::VideoEncodeUsageInfoKHR::default()
                 .video_usage_hints(config.encode_usage_hint.into())
                 .video_content_hints(config.encode_content_hint.into())

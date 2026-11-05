@@ -1,6 +1,6 @@
 use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 
-use crate::converter::InputFormat;
+use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
@@ -18,11 +18,11 @@ impl Av1 {
     pub(crate) fn create(
         context: VideoContext,
         config: EncodeConfig,
-        rgb_input: Option<InputFormat>,
+        rgb_input: Option<RgbFormat>,
     ) -> Result<CodecEncoder<Self>> {
         info!(
-            "Creating AV1 encoder: {}x{}, pixel_format={:?}",
-            config.dimensions.width, config.dimensions.height, config.pixel_format
+            "Creating AV1 encoder: {}x{}, chroma_format={:?}",
+            config.dimensions.width, config.dimensions.height, config.chroma_format
         );
 
         let profile = EncodeProfile::new(&config, rgb_input.is_some())?;

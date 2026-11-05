@@ -16,7 +16,7 @@ use crate::decoder::h264::parser::{
 use crate::decoder::h264::record::{DecodeRecord, LinkParams};
 use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
 use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{align_up, get_video_format, query_supported_video_formats};
 use crate::vulkan::VideoContext;
@@ -162,12 +162,12 @@ impl H264Decoder {
         sps: &Sps,
     ) -> Result<(
         vk::VideoDecodeH264ProfileInfoKHR<'static>,
-        PixelFormat,
+        ChromaFormat,
         BitDepth,
     )> {
-        let pixel_format = match sps.chroma_format_idc {
-            1 => PixelFormat::Yuv420,
-            3 => PixelFormat::Yuv444,
+        let chroma_format = match sps.chroma_format_idc {
+            1 => ChromaFormat::Yuv420,
+            3 => ChromaFormat::Yuv444,
             other => {
                 return Err(PixelForgeError::InvalidInput(format!(
                     "H.264 decode: unsupported chroma_format_idc {}",
@@ -211,7 +211,7 @@ impl H264Decoder {
             .std_profile_idc(std_profile)
             .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
 
-        Ok((profile, pixel_format, bit_depth))
+        Ok((profile, chroma_format, bit_depth))
     }
 
     /// Create (or recreate) the Vulkan session for the given parameter sets.
@@ -237,13 +237,13 @@ impl H264Decoder {
             ));
         }
 
-        let (mut profile, pixel_format, bit_depth) = Self::profile_for(sps)?;
-        let chroma_subsampling = match pixel_format {
-            PixelFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            PixelFormat::Yuv444 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
+        let (mut profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
+        let chroma_subsampling = match chroma_format {
+            ChromaFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            ChromaFormat::Yuv444 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
             other => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "H.264 decode: unsupported pixel format {:?}",
+                    "H.264 decode: unsupported chroma format {:?}",
                     other
                 )));
             }
@@ -395,7 +395,7 @@ impl H264Decoder {
         } else {
             (sampled_usage, true, sampled_formats)
         };
-        let preferred = get_video_format(pixel_format, bit_depth);
+        let preferred = get_video_format(chroma_format, bit_depth);
         let chosen = supported
             .iter()
             .find(|f| f.format == preferred)
@@ -443,7 +443,7 @@ impl H264Decoder {
             coded_height,
             picture_format,
             bit_depth,
-            pixel_format,
+            chroma_format,
             slot_count,
             spare_slots,
             max_active_references,
@@ -826,7 +826,7 @@ impl H264Decoder {
             image_view,
             layout,
             array_layer,
-            pixel_format: active.pixel_format,
+            chroma_format: active.chroma_format,
             bit_depth: active.bit_depth,
             generation,
             width,
@@ -855,9 +855,9 @@ impl H264Decoder {
     /// The copying is generic; only the profile (needed to size the buffer) is
     /// H.264's business.
     fn stage_slices(&mut self, picture: &Picture, sps: &Sps) -> Result<(u64, Vec<u32>)> {
-        let (mut profile, pixel_format, bit_depth) = Self::profile_for(sps)?;
-        let chroma_subsampling = match pixel_format {
-            PixelFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+        let (mut profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
+        let chroma_subsampling = match chroma_format {
+            ChromaFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
             _ => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
         };
         let depth_flag = match bit_depth {

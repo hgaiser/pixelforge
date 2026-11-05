@@ -10,8 +10,8 @@
 //! The codec defaults to `h264`.
 
 use pixelforge::{
-    Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl, VideoContextBuilder,
-    YuvLayout,
+    ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder, YuvLayout,
+    YuvUploader,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         "h265" => (
             Codec::H265,
-            EncodeConfig::h265(WIDTH, HEIGHT).with_pixel_format(PixelFormat::Yuv420),
+            EncodeConfig::h265(WIDTH, HEIGHT).with_chroma_format(ChromaFormat::Yuv420),
             "output.h265",
         ),
         "av1" => (Codec::AV1, EncodeConfig::av1(WIDTH, HEIGHT), "output.av1"),
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut encoder = Encoder::new(context, config)?;
     // Create input image for uploading frames.
-    let mut input_image = InputImage::for_encoder(&encoder)?;
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
     let mut output = File::create(output_name)?;
     let mut total_bytes = 0;
 

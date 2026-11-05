@@ -24,7 +24,7 @@ use ash::vk;
 use crate::decoder::DecodedFrame;
 use crate::decoder::frames::SlotPins;
 use crate::decoder::pipeline::DecodePipeline;
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
     VideoImageParams, allocate_session_memory, create_command_pool, create_dpb_images,
@@ -80,7 +80,7 @@ pub(crate) struct SessionPlan {
     pub coded_height: u32,
     pub picture_format: vk::Format,
     pub bit_depth: BitDepth,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     /// DPB slots: references, the picture being decoded, and `spare_slots`.
     pub slot_count: usize,
     /// How many of `slot_count` are spare capacity for pictures pinned past the
@@ -166,7 +166,7 @@ pub(crate) struct DecodeSession {
     pub coded_height: u32,
     pub picture_format: vk::Format,
     pub bit_depth: BitDepth,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
 
     /// DPB images. One image per slot, or a single layered image.
     /// One entry per slot, or a single shared entry when the DPB is layered.
@@ -487,7 +487,7 @@ impl DecoderCommon {
             coded_height: plan.coded_height,
             picture_format: plan.picture_format,
             bit_depth: plan.bit_depth,
-            pixel_format: plan.pixel_format,
+            chroma_format: plan.chroma_format,
             dpb,
             slot_pins: Arc::new(SlotPins::default()),
             dpb_slot_active: vec![false; plan.slot_count],

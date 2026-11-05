@@ -31,9 +31,7 @@
 mod source;
 use source::{SrcImage, create_src_image, host_buffer, one_shot};
 
-use super::{
-    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, InputFormat, OutputFormat,
-};
+use super::{ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, OutputFormat, RgbFormat};
 use crate::encoder::input::SourceOwnership;
 use crate::{
     BitDepth, Codec, ColorDescription, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff,
@@ -255,7 +253,7 @@ fn convert(
     let config = ColorConverterConfig::new(
         WIDTH,
         HEIGHT,
-        InputFormat::BGRA,
+        RgbFormat::BGRA,
         output_format,
         source,
         target,
@@ -427,7 +425,7 @@ fn unsupported_conversions_are_refused() -> Result<(), Box<dyn std::error::Error
         let config = ColorConverterConfig::new(
             WIDTH,
             HEIGHT,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             OutputFormat::NV12,
             source,
             target,
@@ -469,7 +467,7 @@ fn a_replaced_source_image_is_read_afresh() -> Result<(), Box<dyn std::error::Er
     let config = ColorConverterConfig::new(
         WIDTH,
         HEIGHT,
-        InputFormat::BGRA,
+        RgbFormat::BGRA,
         OutputFormat::NV12,
         ColorSpec::Srgb,
         ColorSpec::Srgb,
@@ -538,7 +536,7 @@ fn by_hand_and_by_encoder(
         ColorConverterConfig::new(
             ENCODE_WIDTH,
             ENCODE_HEIGHT,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             OutputFormat::NV12,
             ColorSpec::Srgb,
             ColorSpec::Srgb,
@@ -549,7 +547,7 @@ fn by_hand_and_by_encoder(
         context.clone(),
         encode_config(codec)
             .with_source(Source::Rgb(RgbSource::new(
-                InputFormat::BGRA,
+                RgbFormat::BGRA,
                 ColorSpec::Srgb,
             )))
             .with_conversion(ConversionPreference::Shader),
@@ -659,7 +657,7 @@ fn encode_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
                 ColorConverterConfig::new(
                     ENCODE_WIDTH,
                     ENCODE_HEIGHT,
-                    InputFormat::BGRA,
+                    RgbFormat::BGRA,
                     OutputFormat::NV12,
                     ColorSpec::Srgb,
                     ColorSpec::Srgb,

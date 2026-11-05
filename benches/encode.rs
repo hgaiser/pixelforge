@@ -9,8 +9,8 @@
 //!   cargo bench --bench encode
 
 use pixelforge::{
-    Codec, EncodeConfig, Encoder, EncoderTuningMode, Frame, InputImage, RateControl,
-    VideoContextBuilder, YuvLayout,
+    Codec, EncodeConfig, Encoder, EncoderTuningMode, Frame, RateControl, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 use std::fs::File;
 use std::io::Read;
@@ -136,7 +136,7 @@ fn run_encode_test(
 
     let mut encoder = Encoder::new(context.clone(), config)?;
     // Create input image for uploading frames.
-    let mut input_image = InputImage::for_encoder(&encoder)?;
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
     let mut total_bytes = 0;
 
     let mut gpu_durations: Vec<Duration> = Vec::new();

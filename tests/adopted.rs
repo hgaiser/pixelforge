@@ -19,8 +19,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, InputFormat,
-    RateControl, RgbSource, Source, SourceImage, TimelinePoint,
+    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat,
+    RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -251,7 +251,7 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
             .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
             .with_source(Source::Rgb(RgbSource::new(
-                InputFormat::BGRA,
+                RgbFormat::BGRA,
                 ColorSpec::Srgb,
             )))
             .with_conversion(ConversionPreference::Shader),

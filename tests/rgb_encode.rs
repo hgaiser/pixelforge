@@ -17,7 +17,7 @@ use ash::vk;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
     BitDepth, Codec, ColorRange, ColorSpec, Conversion, ConversionPreference, EncodeConfig,
-    Encoder, Frame, Handoff, InputFormat, RateControl, RgbSource, Source, SourceImage, StreamColor,
+    Encoder, Frame, Handoff, RateControl, RgbFormat, RgbSource, Source, SourceImage, StreamColor,
     VideoContext, VideoContextBuilder,
 };
 
@@ -65,7 +65,7 @@ fn encode_config(codec: Codec) -> EncodeConfig {
         .with_color(StreamColor::default())
 }
 
-fn rgb(format: InputFormat) -> Source {
+fn rgb(format: RgbFormat) -> Source {
     Source::Rgb(RgbSource::new(format, ColorSpec::Srgb))
 }
 
@@ -87,7 +87,7 @@ fn source_image(
 fn encode_rgb(
     context: &VideoContext,
     codec: Codec,
-    format: InputFormat,
+    format: RgbFormat,
     preference: ConversionPreference,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut encoder = Encoder::new(
@@ -137,7 +137,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// Whether the encoder can convert `format` for `codec` here; prints why a
 /// test is skipped when not.
 fn encoder_converts(context: &VideoContext, codec: Codec, test: &str) -> bool {
-    let ok = context.supports_rgb_encode_input(codec, InputFormat::BGRA, StreamColor::default());
+    let ok = context.supports_rgb_encode_input(codec, RgbFormat::BGRA, StreamColor::default());
     if !ok {
         eprintln!("skipping {test} for {codec:?}: the encoder cannot convert RGB here");
     }
@@ -151,11 +151,11 @@ fn auto_picks_the_encoder_where_it_can() -> Result<(), Box<dyn std::error::Error
     let context = context(Codec::H264)?;
     let encoder = Encoder::new(
         context.clone(),
-        encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
+        encode_config(Codec::H264).with_source(rgb(RgbFormat::BGRA)),
     )?;
     let expected = if context.supports_rgb_encode_input(
         Codec::H264,
-        InputFormat::BGRA,
+        RgbFormat::BGRA,
         StreamColor::default(),
     ) {
         Conversion::Encoder
@@ -178,7 +178,7 @@ fn rgb_input_matches_the_converter() -> Result<(), Box<dyn std::error::Error>> {
         &encode_rgb(
             &context,
             Codec::H264,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             ConversionPreference::Shader,
         )?,
     )?;
@@ -187,7 +187,7 @@ fn rgb_input_matches_the_converter() -> Result<(), Box<dyn std::error::Error>> {
         &encode_rgb(
             &context,
             Codec::H264,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             ConversionPreference::Encoder,
         )?,
     )?;
@@ -224,7 +224,7 @@ fn rgb_input_encodes_every_codec() -> Result<(), Box<dyn std::error::Error>> {
         let stream = encode_rgb(
             &context,
             codec,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             ConversionPreference::Encoder,
         )?;
         assert!(!stream.is_empty(), "{codec:?}: empty stream");
@@ -267,12 +267,12 @@ fn rgb_query_matches_encoder_creation() -> Result<(), Box<dyn std::error::Error>
             continue;
         }
         for format in [
-            InputFormat::BGRA,
-            InputFormat::RGBx,
-            InputFormat::ABGR2101010,
-            InputFormat::RGBA16F,
+            RgbFormat::BGRA,
+            RgbFormat::RGBx,
+            RgbFormat::ABGR2101010,
+            RgbFormat::RGBA16F,
         ] {
-            let bit_depth = if format == InputFormat::ABGR2101010 {
+            let bit_depth = if format == RgbFormat::ABGR2101010 {
                 BitDepth::Ten
             } else {
                 BitDepth::Eight
@@ -312,7 +312,7 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     let context = context(Codec::H264)?;
     let mut encoder = Encoder::new(
         context.clone(),
-        encode_config(Codec::H264).with_source(rgb(InputFormat::BGRA)),
+        encode_config(Codec::H264).with_source(rgb(RgbFormat::BGRA)),
     )?;
     let conversion = encoder.conversion();
     let mut pts = Vec::new();
@@ -320,7 +320,7 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
     for n in 0..FRAMES {
         if n == FRAMES / 2 {
             encoder.reconfigure(
-                rgb(InputFormat::BGRA),
+                rgb(RgbFormat::BGRA),
                 StreamColor::Sdr {
                     range: ColorRange::Full,
                 },
@@ -357,13 +357,13 @@ fn a_format_change_switches_the_shader_in_place() -> Result<(), Box<dyn std::err
     let reference = encode_rgb(
         &context,
         Codec::H264,
-        InputFormat::BGRA,
+        RgbFormat::BGRA,
         ConversionPreference::Shader,
     )?;
     let mut encoder = Encoder::new(
         context.clone(),
         encode_config(Codec::H264)
-            .with_source(rgb(InputFormat::BGRA))
+            .with_source(rgb(RgbFormat::BGRA))
             .with_conversion(ConversionPreference::Shader),
     )?;
     let mut stream = Vec::new();
@@ -372,7 +372,7 @@ fn a_format_change_switches_the_shader_in_place() -> Result<(), Box<dyn std::err
         let mut pixels = moving_frame(n);
         let mut format = vk::Format::B8G8R8A8_UNORM;
         if n >= FRAMES / 2 {
-            encoder.reconfigure(rgb(InputFormat::RGBA), StreamColor::default())?;
+            encoder.reconfigure(rgb(RgbFormat::RGBA), StreamColor::default())?;
             for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }

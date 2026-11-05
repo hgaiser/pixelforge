@@ -15,7 +15,7 @@
 use ash::vk;
 use ash::vk::TaggedStructure;
 
-use crate::converter::InputFormat;
+use crate::converter::RgbFormat;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
 use crate::encoder::pipeline::{
@@ -104,7 +104,7 @@ pub(crate) struct EncoderCommon {
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
-    pub rgb_input: Option<InputFormat>,
+    pub rgb_input: Option<RgbFormat>,
 }
 
 impl EncoderCommon {
@@ -168,7 +168,7 @@ impl EncoderCommon {
                     dst_image: slot_image,
                     width: self.config.dimensions.width,
                     height: self.config.dimensions.height,
-                    pixel_format: self.config.pixel_format,
+                    chroma_format: self.config.chroma_format,
                     input_image_layout: slot_layout,
                     rgb: self.rgb_input.is_some(),
                     upload_queue: self.context.transfer_queue(),
@@ -751,7 +751,7 @@ pub(crate) struct CommonInitRequest<'a> {
     /// later have to name it too.
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
-    pub rgb_input: Option<InputFormat>,
+    pub rgb_input: Option<RgbFormat>,
     /// Device capabilities for this profile, resolved by [`query_video_caps`].
     pub caps: &'a DeviceVideoCaps,
     /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
@@ -915,7 +915,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     };
 
     // Pick input (SRC) and reference (DPB) formats.
-    let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
+    let preferred_src_format = get_video_format(config.chroma_format, config.bit_depth);
     let supported_src_formats = query_supported_video_formats(
         context,
         profile_info,
@@ -1067,7 +1067,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         aligned_height,
         picture_format,
         rgb_input: req.rgb_input.is_some(),
-        pixel_format: config.pixel_format,
+        chroma_format: config.chroma_format,
         bit_depth: config.bit_depth,
         bitstream_buffer_size: req.bitstream_buffer_size,
         profile_info,

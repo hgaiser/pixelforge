@@ -2,11 +2,11 @@
 //!
 //! An encoder can read a DMA-BUF straight into its encode, with no copy in
 //! pixelforge, when the device takes the buffer's DRM format modifier for that.
-//! [`Encoder::input_formats`] says which modifiers those are, so a caller can
+//! [`Encoder::dmabuf_format`] says which modifiers those are, so a caller can
 //! negotiate one with its producer. [`Encoder::allocate_input`] makes such a
 //! buffer for a producer that writes into buffers the consumer gives it, and
 //! [`Encoder::import`] takes one a producer made. Either gives an
-//! [`ExternalImage`] to hand to [`Frame::external`](crate::Frame::external).
+//! [`DmaBufImage`] to hand to [`Frame::external`](crate::Frame::external).
 //!
 //! A DMA-BUF is shared with another process, so each frame acquires it from
 //! the foreign queue family before reading it and releases it back after.
@@ -21,7 +21,7 @@ use ash::vk::TaggedStructure;
 use super::api::Encoder;
 use super::input::{FrameInput, FrameSync, SourceOwnership, Uses};
 use super::source::{Conversion, Source};
-use super::{EncodeFuture, PixelFormat};
+use super::{ChromaFormat, EncodeFuture};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{create_video_image_view, get_video_format};
@@ -118,7 +118,7 @@ pub struct DmaBuf {
 
 /// What an encoder can do with buffers of one DRM format modifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InputModifier {
+pub struct DmaBufModifier {
     /// The DRM format modifier.
     pub modifier: u64,
     /// How many memory planes a buffer with it has.
@@ -134,19 +134,19 @@ pub struct InputModifier {
     pub exportable: bool,
 }
 
-/// The buffers an encoder takes, from [`Encoder::input_formats`].
+/// The buffers an encoder takes, from [`Encoder::dmabuf_format`].
 #[derive(Debug, Clone)]
-pub struct InputFormats {
+pub struct DmaBufFormat {
     /// The DRM fourcc of the pixel format, see [`drm_format`].
     pub format: u32,
     /// The same format, as Vulkan names it.
     pub vk_format: vk::Format,
     /// Every modifier the device knows for the format and the encoder can do
     /// something with. Offer the `zero_copy` ones to a producer first.
-    pub modifiers: Vec<InputModifier>,
+    pub modifiers: Vec<DmaBufModifier>,
 }
 
-/// How an [`ExternalImage`] is read.
+/// How a [`DmaBufImage`] is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
     /// By the encode, made with its video profile.
@@ -177,7 +177,7 @@ struct ModifierSupport {
 ///
 /// Only the encoder that made it can read it. Dropping it waits until its last
 /// frame is done with it.
-pub struct ExternalImage {
+pub struct DmaBufImage {
     context: VideoContext,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -193,9 +193,9 @@ pub struct ExternalImage {
     uses: Uses,
 }
 
-impl std::fmt::Debug for ExternalImage {
+impl std::fmt::Debug for DmaBufImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExternalImage")
+        f.debug_struct("DmaBufImage")
             .field("extent", &self.extent)
             .field("format", &self.format)
             .field("modifier", &self.modifier)
@@ -204,7 +204,7 @@ impl std::fmt::Debug for ExternalImage {
     }
 }
 
-impl ExternalImage {
+impl DmaBufImage {
     /// Whether the encoder reads this image directly, with no copy.
     pub fn is_zero_copy(&self) -> bool {
         self.access != Access::Copy
@@ -290,7 +290,7 @@ impl ExternalImage {
     }
 }
 
-impl Drop for ExternalImage {
+impl Drop for DmaBufImage {
     fn drop(&mut self) {
         let _ = self.uses.wait(&self.context);
         let device = self.context.device();
@@ -364,13 +364,13 @@ impl Encoder {
         };
         Ok(match self.conversion() {
             Conversion::None => {
-                if config.pixel_format == PixelFormat::Yuv422 {
+                if config.chroma_format == ChromaFormat::Yuv422 {
                     return Err(PixelForgeError::InvalidInput(
                         "DMA-BUF input: no 4:2:2 encode".to_string(),
                     ));
                 }
                 InputPlan {
-                    vk_format: get_video_format(config.pixel_format, config.bit_depth),
+                    vk_format: get_video_format(config.chroma_format, config.bit_depth),
                     zero_copy: Access::Encode,
                     fallback: Some(Access::Copy),
                 }
@@ -516,7 +516,7 @@ impl Encoder {
     /// encoder's YUV for a YUV source, the RGB format for an RGB one. A
     /// producer that can choose should be offered the `zero_copy` modifiers
     /// first.
-    pub fn input_formats(&self) -> Result<InputFormats> {
+    pub fn dmabuf_format(&self) -> Result<DmaBufFormat> {
         self.require_dmabuf()?;
         let plan = self.input_plan()?;
         let format = drm_format_of(plan.vk_format).ok_or_else(|| {
@@ -539,7 +539,7 @@ impl Encoder {
                 let zero_copy = direct_import || direct_export;
                 let importable = direct_import || plan.fallback.is_some_and(imports);
                 let exportable = direct_export || plan.fallback.is_some_and(exports);
-                (importable || exportable).then_some(InputModifier {
+                (importable || exportable).then_some(DmaBufModifier {
                     modifier,
                     plane_count,
                     zero_copy,
@@ -548,7 +548,7 @@ impl Encoder {
                 })
             })
             .collect();
-        Ok(InputFormats {
+        Ok(DmaBufFormat {
             format,
             vk_format: plan.vk_format,
             modifiers,
@@ -556,17 +556,17 @@ impl Encoder {
     }
 
     /// Make an image with one of `modifiers`, which a producer can write into
-    /// once [exported](ExternalImage::export).
+    /// once [exported](DmaBufImage::export).
     ///
     /// For producers that write into buffers the consumer supplies, such as
     /// `ext-image-copy-capture`. The image has the encoder's display size,
     /// which is what such a protocol asks for. `modifiers` are the ones the
     /// producer takes. The driver picks among those the encoder reads directly
-    /// (`zero_copy` in [`Self::input_formats`]); only if there are none, among
+    /// (`zero_copy` in [`Self::dmabuf_format`]); only if there are none, among
     /// those it can copy from, and then each frame is copied
-    /// ([`ExternalImage::is_zero_copy`] says which). It fails if none of
+    /// ([`DmaBufImage::is_zero_copy`] says which). It fails if none of
     /// `modifiers` can be allocated either way.
-    pub fn allocate_input(&self, modifiers: &[u64]) -> Result<ExternalImage> {
+    pub fn allocate_input(&self, modifiers: &[u64]) -> Result<DmaBufImage> {
         self.require_dmabuf()?;
         let plan = self.input_plan()?;
         let format = drm_format_of(plan.vk_format).ok_or_else(|| {
@@ -611,12 +611,12 @@ impl Encoder {
     /// Import a producer's DMA-BUF for this encoder to read.
     ///
     /// The buffer is checked here, once: a modifier the encoder reads directly
-    /// gives an image it does ([`ExternalImage::is_zero_copy`]); one it can only
+    /// gives an image it does ([`DmaBufImage::is_zero_copy`]); one it can only
     /// copy from gives an image each frame copies; any other fails. The format
-    /// must be the one [`Self::input_formats`] names, or an RGB format that
+    /// must be the one [`Self::dmabuf_format`] names, or an RGB format that
     /// differs from it only in whether the fourth channel is alpha. The size
     /// must be at least the encoder's.
-    pub fn import(&self, buffer: &DmaBuf) -> Result<ExternalImage> {
+    pub fn import(&self, buffer: &DmaBuf) -> Result<DmaBufImage> {
         self.require_dmabuf()?;
         let plan = self.input_plan()?;
         if vk_format_of(buffer.format) != Some(plan.vk_format) {
@@ -675,7 +675,7 @@ impl Encoder {
         access: Access,
         modifier: ModifierChoice<'_>,
         import: Option<&DmaBuf>,
-    ) -> Result<ExternalImage> {
+    ) -> Result<DmaBufImage> {
         let context = self.context();
         let device = context.device();
         let extent = match import {
@@ -787,7 +787,7 @@ impl Encoder {
             extent.width,
             extent.height,
         );
-        Ok(ExternalImage {
+        Ok(DmaBufImage {
             context: context.clone(),
             image,
             memory,
@@ -892,15 +892,15 @@ impl Encoder {
         Ok(memory)
     }
 
-    /// Encode from an [`ExternalImage`] this encoder made.
+    /// Encode from a [`DmaBufImage`] this encoder made.
     pub(crate) fn submit_external(
         &mut self,
-        external: &ExternalImage,
+        external: &DmaBufImage,
         mut sync: FrameSync,
     ) -> Result<EncodeFuture> {
         if external.owner != (self.id(), self.generation()) {
             return Err(PixelForgeError::InvalidInput(
-                "this ExternalImage was made by another encoder, or before a reconfigure \
+                "this DmaBufImage was made by another encoder, or before a reconfigure \
                  changed the source or the conversion; import or allocate it again"
                     .to_string(),
             ));

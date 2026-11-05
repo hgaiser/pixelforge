@@ -1,6 +1,6 @@
 use super::{CTB_SIZE, H265};
 
-use crate::converter::InputFormat;
+use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
@@ -20,18 +20,18 @@ impl H265 {
     pub(crate) fn create(
         context: VideoContext,
         config: EncodeConfig,
-        rgb_input: Option<InputFormat>,
+        rgb_input: Option<RgbFormat>,
     ) -> Result<CodecEncoder<Self>> {
         info!(
-            "Creating H.265 encoder: {}x{}, pixel_format={:?}",
-            config.dimensions.width, config.dimensions.height, config.pixel_format
+            "Creating H.265 encoder: {}x{}, chroma_format={:?}",
+            config.dimensions.width, config.dimensions.height, config.chroma_format
         );
 
         let profile_idc =
-            h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
+            h265_profile_idc(config.chroma_format, config.bit_depth).ok_or_else(|| {
                 PixelForgeError::InvalidInput(format!(
                     "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
-                    config.pixel_format, config.bit_depth
+                    config.chroma_format, config.bit_depth
                 ))
             })?;
 

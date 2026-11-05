@@ -45,7 +45,7 @@ use crate::encoder::resources::{
     create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
-use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, EncodedPacket, FrameType};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{SlotSync, TimelineChain};
@@ -197,7 +197,7 @@ pub(crate) struct PipelineConfig<'a> {
     pub picture_format: vk::Format,
     /// Whether the input image is RGB, for the encoder to convert.
     pub rgb_input: bool,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     pub bitstream_buffer_size: usize,
     /// Codec profile (with the codec-specific profile chained in) used for the
@@ -287,7 +287,7 @@ impl EncodePipeline {
                     image: input_image,
                     width: config.aligned_width,
                     height: config.aligned_height,
-                    pixel_format: config.pixel_format,
+                    chroma_format: config.chroma_format,
                     bit_depth: config.bit_depth,
                     rgb: config.rgb_input,
                 },

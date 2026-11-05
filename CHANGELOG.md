@@ -23,12 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for them.
 - Add `Encoder::input_slot` and `InputSlot`: the encoder's own input image,
   to write a frame in place and submit with `Frame::input`.
-- Add `InputImage::source`.
+- Add `YuvUploader::source`.
 - Add `Encoder::repeat`: encode the last frame again from the encoder's own
   input image, for a key frame while no new frame arrives. The caller's
   source does not have to stay alive for it.
-- Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
-  `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
+- Add DMA-BUF input (feature `dmabuf`): `Encoder::dmabuf_format`,
+  `Encoder::import`, `Encoder::allocate_input`, `DmaBufImage` and
   `Frame::external`. The encoder reads a buffer directly where the device
   can, and copies it otherwise.
 - Add sync_file fences (feature `dmabuf`): `Frame::wait_sync_file`,
@@ -64,15 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
   field are removed. No codec encodes B-frames yet, and every encoder refused
   a count above 0 at runtime.
-- **Breaking:** `InputImage` has two uploads, `upload` to its own image and
+- **Breaking:** `YuvUploader` has two uploads, `upload` to its own image and
   `upload_to` an encoder's `InputSlot`, which take a `YuvLayout`: `I420`,
   `Nv12`, `I420P10` or `I444`. They replace `upload_yuv420`, `upload_nv12`,
   `upload_yuv420_10bit`, `upload_yuv420_to` and `upload_yuv444_to`, which
   covered only some of the combinations. A layout the image cannot hold is
   an error; `upload_nv12` panicked for a 10-bit or 4:4:4 image. The uploads
   wait until the frames that read the image are done with it.
-- **Breaking:** `InputImage::new` no longer takes a `Codec`, which it did not
-  use. `InputImage::for_encoder` makes one for an encoder's frames.
+- **Breaking:** `YuvUploader::new` no longer takes a `Codec`, which it did not
+  use. `YuvUploader::for_encoder` makes one for an encoder's frames.
 - **Breaking:** `EncodeConfig::frame_rate` (a `FrameRate`) replaces
   `frame_rate_numerator` and `frame_rate_denominator`. `with_frame_rate` is
   unchanged.
@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `EncodedPacket::is_key_frame` is a method, not a field. An
   IDR's `frame_type` is `FrameType::Idr`; it was `FrameType::I`.
   `FrameType::Unknown`, which no packet had, is removed.
+- **Breaking:** types are renamed for what they are: `InputImage` is
+  `YuvUploader`, `InputFormat` is `RgbFormat`, `PixelFormat` is
+  `ChromaFormat` (with `EncodeConfig::chroma_format`, `with_chroma_format`
+  and `DecodedFrame::chroma_format`), and the DMA-BUF types are
+  `DmaBufImage`, `DmaBufFormat` and `DmaBufModifier`, from
+  `Encoder::dmabuf_format`. They were `ExternalImage`, `InputFormats`,
+  `InputModifier` and `Encoder::input_formats`.
 - **Breaking:** `VideoContextBuilder::device_requirements` and
   `build_from_existing` adopt a caller's device for the codecs asked for with
   `require_encode` and `require_decode`, so one adopted context can encode

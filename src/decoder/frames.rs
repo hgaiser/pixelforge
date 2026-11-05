@@ -15,7 +15,7 @@ use ash::vk::{self, TaggedStructure as _};
 
 use crate::decoder::DecodedFrame;
 use crate::decoder::common::{DecoderCommon, DpbImage};
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::find_memory_type;
 use crate::vulkan::VideoContext;
@@ -32,7 +32,7 @@ pub(crate) struct DecodedPicture {
     pub image_view: vk::ImageView,
     pub layout: vk::ImageLayout,
     pub array_layer: u32,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     pub generation: u64,
     pub width: u32,
@@ -329,7 +329,7 @@ struct ReorderEntry {
     height: u32,
     coded_width: u32,
     coded_height: u32,
-    pixel_format: PixelFormat,
+    chroma_format: ChromaFormat,
     bit_depth: BitDepth,
 }
 
@@ -405,7 +405,7 @@ impl ReorderBuffer {
             height: picture.height,
             coded_width: picture.coded_width,
             coded_height: picture.coded_height,
-            pixel_format: picture.pixel_format,
+            chroma_format: picture.chroma_format,
             bit_depth: picture.bit_depth,
         });
 
@@ -505,7 +505,7 @@ impl ReorderBuffer {
             image_view,
             layout,
             array_layer,
-            pixel_format: entry.pixel_format,
+            chroma_format: entry.chroma_format,
             bit_depth: entry.bit_depth,
             width: entry.width,
             height: entry.height,

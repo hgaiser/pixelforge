@@ -6,15 +6,15 @@
 //! RGB conversion, and always submits frames the same way.
 
 use super::rgb::rgb_input_bit_depth;
-use super::{BitDepth, EncodeConfig, PixelFormat, StreamColor};
-use crate::converter::{ColorConverterConfig, ColorRange, ColorSpec, InputFormat, OutputFormat};
+use super::{BitDepth, ChromaFormat, EncodeConfig, StreamColor};
+use crate::converter::{ColorConverterConfig, ColorRange, ColorSpec, OutputFormat, RgbFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 
 /// What the frames handed to an [`Encoder`](crate::Encoder) are.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Source {
-    /// YUV frames, already in the encoder's pixel format and bit depth.
+    /// YUV frames, already in the encoder's chroma format and bit depth.
     #[default]
     Yuv,
     /// RGB frames, which pixelforge converts to YUV.
@@ -25,7 +25,7 @@ pub enum Source {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RgbSource {
     /// How the pixels are laid out.
-    pub format: InputFormat,
+    pub format: RgbFormat,
     /// What the pixel values mean.
     pub color: ColorSpec,
     /// How bright the source's white is, in nits, overriding
@@ -36,7 +36,7 @@ pub struct RgbSource {
 
 impl RgbSource {
     /// RGB frames in `format`, holding colours in `color`.
-    pub fn new(format: InputFormat, color: ColorSpec) -> Self {
+    pub fn new(format: RgbFormat, color: ColorSpec) -> Self {
         Self {
             format,
             color,
@@ -82,7 +82,7 @@ pub enum Conversion {
 pub(crate) struct Plan {
     pub conversion: Conversion,
     /// The RGB format the encoder converts from, for [`Conversion::Encoder`].
-    pub rgb_input: Option<InputFormat>,
+    pub rgb_input: Option<RgbFormat>,
     /// The colour converter's configuration, for [`Conversion::Shader`].
     pub converter: Option<ColorConverterConfig>,
 }
@@ -98,12 +98,12 @@ pub(crate) fn target_space(color: &StreamColor) -> Option<(ColorSpec, ColorRange
 }
 
 /// The YUV the colour converter has to write for this encoder.
-fn shader_output(pixel_format: PixelFormat, bit_depth: BitDepth) -> Option<OutputFormat> {
-    match (pixel_format, bit_depth) {
-        (PixelFormat::Yuv420, BitDepth::Eight) => Some(OutputFormat::NV12),
-        (PixelFormat::Yuv420, BitDepth::Ten) => Some(OutputFormat::P010),
-        (PixelFormat::Yuv444, BitDepth::Eight) => Some(OutputFormat::YUV444),
-        (PixelFormat::Yuv444, BitDepth::Ten) => Some(OutputFormat::YUV444P10),
+fn shader_output(chroma_format: ChromaFormat, bit_depth: BitDepth) -> Option<OutputFormat> {
+    match (chroma_format, bit_depth) {
+        (ChromaFormat::Yuv420, BitDepth::Eight) => Some(OutputFormat::NV12),
+        (ChromaFormat::Yuv420, BitDepth::Ten) => Some(OutputFormat::P010),
+        (ChromaFormat::Yuv444, BitDepth::Eight) => Some(OutputFormat::YUV444),
+        (ChromaFormat::Yuv444, BitDepth::Ten) => Some(OutputFormat::YUV444P10),
         _ => None,
     }
 }
@@ -193,11 +193,12 @@ fn encoder_conversion(
         ));
     }
     match rgb_input_bit_depth(rgb.format) {
-        Some(depth) if config.pixel_format == PixelFormat::Yuv420 && config.bit_depth == depth => {}
+        Some(depth)
+            if config.chroma_format == ChromaFormat::Yuv420 && config.bit_depth == depth => {}
         Some(depth) => {
             return no(format!(
                 "{:?} converts to {depth:?} 4:2:0, the encoder is set up for {:?} {:?}",
-                rgb.format, config.bit_depth, config.pixel_format
+                rgb.format, config.bit_depth, config.chroma_format
             ));
         }
         None => return no(format!("{:?} needs tone mapping first", rgb.format)),
@@ -225,10 +226,10 @@ fn shader_conversion(
             "RGB input: the colour converter needs VK_KHR_push_descriptor".to_string(),
         ));
     }
-    let output = shader_output(config.pixel_format, config.bit_depth).ok_or_else(|| {
+    let output = shader_output(config.chroma_format, config.bit_depth).ok_or_else(|| {
         PixelForgeError::InvalidInput(format!(
             "RGB input: the colour converter does not write {:?} {:?}",
-            config.pixel_format, config.bit_depth
+            config.chroma_format, config.bit_depth
         ))
     })?;
     let mut converter = ColorConverterConfig::new(
@@ -279,9 +280,9 @@ mod tests {
     #[test]
     fn shader_output_matches_the_encoder() {
         assert_eq!(
-            shader_output(PixelFormat::Yuv420, BitDepth::Ten),
+            shader_output(ChromaFormat::Yuv420, BitDepth::Ten),
             Some(OutputFormat::P010)
         );
-        assert_eq!(shader_output(PixelFormat::Yuv422, BitDepth::Eight), None);
+        assert_eq!(shader_output(ChromaFormat::Yuv422, BitDepth::Eight), None);
     }
 }

@@ -4,7 +4,7 @@ use super::H264;
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -28,13 +28,13 @@ impl H264 {
         let pic_height_in_map_units = common.aligned_height / 16;
 
         // Crop units depend on chroma subsampling (frame_mbs_only_flag=1).
-        let (crop_unit_x, crop_unit_y) = match config.pixel_format {
-            PixelFormat::Yuv420 => (2u32, 2u32),
-            PixelFormat::Yuv444 => (1u32, 1u32),
+        let (crop_unit_x, crop_unit_y) = match config.chroma_format {
+            ChromaFormat::Yuv420 => (2u32, 2u32),
+            ChromaFormat::Yuv444 => (1u32, 1u32),
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
                     "Unsupported pixel format for H.264: {:?}",
-                    config.pixel_format
+                    config.chroma_format
                 )));
             }
         };
@@ -53,11 +53,11 @@ impl H264 {
         }
         sps_flags.set_vui_parameters_present_flag(1);
 
-        let chroma_format_idc = match config.pixel_format {
-            PixelFormat::Yuv420 => {
+        let chroma_format_idc = match config.chroma_format {
+            ChromaFormat::Yuv420 => {
                 ash::vk::native::StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420
             }
-            PixelFormat::Yuv444 => {
+            ChromaFormat::Yuv444 => {
                 ash::vk::native::StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_444
             }
             _ => unreachable!("Pixel format validated above"),
@@ -82,7 +82,7 @@ impl H264 {
         // rows (chroma_sample_loc_type 0), and the stream says so.
         vui_flags
             .set_chroma_loc_info_present_flag(
-                matches!(config.pixel_format, PixelFormat::Yuv420) as u32
+                matches!(config.chroma_format, ChromaFormat::Yuv420) as u32
             );
         // Avoid HRD with zeroed bitrates (device loss on some drivers).
         vui_flags.set_nal_hrd_parameters_present_flag(0);
@@ -145,8 +145,8 @@ impl H264 {
         pps_flags.set_deblocking_filter_control_present_flag(1);
 
         // vk_video_samples sets chroma QP offsets to 6 for 4:4:4 (driver compat).
-        let (chroma_qp_index_offset, second_chroma_qp_index_offset) = match config.pixel_format {
-            PixelFormat::Yuv444 => (6i8, 6i8),
+        let (chroma_qp_index_offset, second_chroma_qp_index_offset) = match config.chroma_format {
+            ChromaFormat::Yuv444 => (6i8, 6i8),
             _ => (0i8, 0i8),
         };
 

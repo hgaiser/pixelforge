@@ -1,20 +1,20 @@
 //! Image utilities for creating and uploading video frames.
 //!
-//! This module provides [`InputImage`], a helper for uploading YUV data from the CPU
+//! This module provides [`YuvUploader`], a helper for uploading YUV data from the CPU
 //! to the GPU. The image it creates is a transfer-only staging image (not a Vulkan Video
 //! image) and must be copied into an encoder's input image before encoding.
-//! Use [`InputImage::upload`] to upload to the internal image, then submit
-//! [`InputImage::source`] with [`Frame::image`](crate::Frame::image).
-//! Alternatively, use [`InputImage::upload_to`] to upload directly into an
+//! Use [`YuvUploader::upload`] to upload to the internal image, then submit
+//! [`YuvUploader::source`] with [`Frame::image`](crate::Frame::image).
+//! Alternatively, use [`YuvUploader::upload_to`] to upload directly into an
 //! encoder's [`InputSlot`] (from
 //! [`Encoder::input_slot`](crate::encoder::Encoder::input_slot)).
 
-use crate::encoder::{BitDepth, Encoder, Handoff, InputSlot, PixelFormat, Source, SourceImage};
+use crate::encoder::{BitDepth, ChromaFormat, Encoder, Handoff, InputSlot, Source, SourceImage};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 
-/// How the YUV samples handed to [`InputImage::upload`] are laid out in
+/// How the YUV samples handed to [`YuvUploader::upload`] are laid out in
 /// memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YuvLayout {
@@ -58,7 +58,7 @@ impl YuvLayout {
 ///   input image, or
 /// - [`upload_to`](Self::upload_to) the encoder's input image directly,
 ///   through an [`InputSlot`].
-pub struct InputImage {
+pub struct YuvUploader {
     /// Keeps track of the frames that read `image`.
     source: SourceImage,
     context: VideoContext,
@@ -77,11 +77,11 @@ pub struct InputImage {
     width: u32,
     height: u32,
     bit_depth: BitDepth,
-    pixel_format: PixelFormat,
+    chroma_format: ChromaFormat,
 }
 
-impl InputImage {
-    /// A staging image for the frames of `encoder`: its size, pixel format
+impl YuvUploader {
+    /// A staging image for the frames of `encoder`: its size, chroma format
     /// and bit depth.
     ///
     /// An error for an encoder with an RGB [`Source`]: this uploads YUV.
@@ -89,7 +89,7 @@ impl InputImage {
         let config = encoder.config();
         if config.source != Source::Yuv {
             return Err(PixelForgeError::InvalidInput(
-                "an InputImage uploads YUV, and the encoder's source is RGB".to_string(),
+                "a YuvUploader uploads YUV, and the encoder's source is RGB".to_string(),
             ));
         }
         Self::new(
@@ -97,7 +97,7 @@ impl InputImage {
             config.dimensions.width,
             config.dimensions.height,
             config.bit_depth,
-            config.pixel_format,
+            config.chroma_format,
         )
     }
 
@@ -112,31 +112,31 @@ impl InputImage {
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `bit_depth` - Bit depth for the image (8-bit or 10-bit)
-    /// * `pixel_format` - Pixel format (YUV420 or YUV444)
+    /// * `chroma_format` - Chroma format (YUV420 or YUV444)
     pub fn new(
         context: VideoContext,
         width: u32,
         height: u32,
         bit_depth: BitDepth,
-        pixel_format: PixelFormat,
+        chroma_format: ChromaFormat,
     ) -> Result<Self> {
         let device = context.device();
 
-        // Select format based on pixel format and bit depth.
+        // Select format based on chroma format and bit depth.
         // Use 2-plane semi-planar formats for both YUV420 and YUV444.
-        let format = match (pixel_format, bit_depth) {
-            (PixelFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            (PixelFormat::Yuv420, BitDepth::Ten) => {
+        let format = match (chroma_format, bit_depth) {
+            (ChromaFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            (ChromaFormat::Yuv420, BitDepth::Ten) => {
                 vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
             }
-            (PixelFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-            (PixelFormat::Yuv444, BitDepth::Ten) => {
+            (ChromaFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
+            (ChromaFormat::Yuv444, BitDepth::Ten) => {
                 vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
             }
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "Unsupported pixel format / bit depth combination: {:?} / {:?}",
-                    pixel_format, bit_depth
+                    "Unsupported chroma format / bit depth combination: {:?} / {:?}",
+                    chroma_format, bit_depth
                 )));
             }
         };
@@ -186,19 +186,19 @@ impl InputImage {
             .map_err(PixelForgeError::vk("vkBindImageMemory"))?;
 
         // Create staging buffer for uploads.
-        // Size depends on pixel format, bit depth, and alignment padding between planes.
+        // Size depends on chroma format, bit depth, and alignment padding between planes.
         let bytes_per_sample_init = match bit_depth {
             BitDepth::Eight => 1usize,
             BitDepth::Ten => 2,
         };
         let luma_pixels = (width * height) as usize;
-        let staging_size = match pixel_format {
-            PixelFormat::Yuv444 => {
+        let staging_size = match chroma_format {
+            ChromaFormat::Yuv444 => {
                 // Y plane (aligned to 4 bytes) + UV interleaved plane.
                 let y_bytes = luma_pixels * bytes_per_sample_init;
                 crate::align4(y_bytes) + luma_pixels * 2 * bytes_per_sample_init
             }
-            _ => pixel_format.frame_size(width, height) * bytes_per_sample_init,
+            _ => chroma_format.frame_size(width, height) * bytes_per_sample_init,
         };
         let buffer_create_info = vk::BufferCreateInfo::default()
             .size(staging_size as vk::DeviceSize)
@@ -276,7 +276,7 @@ impl InputImage {
             width,
             height,
             bit_depth,
-            pixel_format,
+            chroma_format,
         };
         // Start from zeroed planes in GENERAL, so the image is a valid source
         // before the first upload.
@@ -323,16 +323,16 @@ impl InputImage {
     /// Convert `data` into the staging buffer, in the image's format.
     fn write_staging(&mut self, layout: YuvLayout, data: &[u8]) -> Result<()> {
         let fits = matches!(
-            (layout, self.pixel_format, self.bit_depth),
-            (YuvLayout::I420, PixelFormat::Yuv420, _)
-                | (YuvLayout::Nv12, PixelFormat::Yuv420, BitDepth::Eight)
-                | (YuvLayout::I420P10, PixelFormat::Yuv420, BitDepth::Ten)
-                | (YuvLayout::I444, PixelFormat::Yuv444, _)
+            (layout, self.chroma_format, self.bit_depth),
+            (YuvLayout::I420, ChromaFormat::Yuv420, _)
+                | (YuvLayout::Nv12, ChromaFormat::Yuv420, BitDepth::Eight)
+                | (YuvLayout::I420P10, ChromaFormat::Yuv420, BitDepth::Ten)
+                | (YuvLayout::I444, ChromaFormat::Yuv444, _)
         );
         if !fits {
             return Err(PixelForgeError::InvalidInput(format!(
                 "{layout:?} data cannot be uploaded to a {:?} {:?}-bit image",
-                self.pixel_format, self.bit_depth
+                self.chroma_format, self.bit_depth
             )));
         }
         let expected_size = layout.frame_size(self.width, self.height);
@@ -344,16 +344,16 @@ impl InputImage {
         }
 
         let luma = (self.width * self.height) as usize;
-        let chroma = match self.pixel_format {
-            PixelFormat::Yuv444 => luma,
+        let chroma = match self.chroma_format {
+            ChromaFormat::Yuv444 => luma,
             _ => luma / 4,
         };
         let ten_bit = self.bit_depth == BitDepth::Ten;
         let luma_bytes = if ten_bit { luma * 2 } else { luma };
         // The UV plane of a 4:4:4 image starts 4-byte aligned, as
         // `copy_staging_to_image_internal` copies it.
-        let uv_offset = match self.pixel_format {
-            PixelFormat::Yuv444 => crate::align4(luma_bytes),
+        let uv_offset = match self.chroma_format {
+            ChromaFormat::Yuv444 => crate::align4(luma_bytes),
             _ => luma_bytes,
         };
 
@@ -449,8 +449,8 @@ impl InputImage {
         // YUV420 dimensions are always even (required for 4:2:0), so alignment is
         // naturally satisfied and must not pad to stay consistent with upload functions.
         let y_plane_bytes = (width * height) as usize * bytes_per_sample;
-        let y_plane_size_bytes = match self.pixel_format {
-            PixelFormat::Yuv444 => crate::align4(y_plane_bytes) as vk::DeviceSize,
+        let y_plane_size_bytes = match self.chroma_format {
+            ChromaFormat::Yuv444 => crate::align4(y_plane_bytes) as vk::DeviceSize,
             _ => y_plane_bytes as vk::DeviceSize,
         };
 
@@ -493,9 +493,9 @@ impl InputImage {
             );
         }
 
-        // Build copy regions based on pixel format.
-        let copy_regions = match self.pixel_format {
-            PixelFormat::Yuv420 => {
+        // Build copy regions based on chroma format.
+        let copy_regions = match self.chroma_format {
+            ChromaFormat::Yuv420 => {
                 // NV12/P010: Y plane (PLANE_0) + interleaved UV plane (PLANE_1)
                 vec![
                     // Y plane.
@@ -534,7 +534,7 @@ impl InputImage {
                         }),
                 ]
             }
-            PixelFormat::Yuv444 => {
+            ChromaFormat::Yuv444 => {
                 // 2-plane semi-planar YUV444: Y (PLANE_0), UV interleaved (PLANE_1) at full resolution.
                 vec![
                     // Y plane.
@@ -575,8 +575,8 @@ impl InputImage {
             }
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "Unsupported pixel format: {:?}",
-                    self.pixel_format
+                    "Unsupported chroma format: {:?}",
+                    self.chroma_format
                 )));
             }
         };
@@ -657,7 +657,7 @@ impl InputImage {
     }
 }
 
-impl Drop for InputImage {
+impl Drop for YuvUploader {
     fn drop(&mut self) {
         let device = self.context.device();
         unsafe {

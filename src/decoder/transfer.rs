@@ -94,7 +94,7 @@ impl DecoderCommon {
             base_array_layer: 0,
             layer_count: 1,
         };
-        let (cdiv_hor, cdiv_vert) = frame.pixel_format.chroma_div();
+        let (cdiv_hor, cdiv_vert) = frame.chroma_format.chroma_div();
         let regions = [
             vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {

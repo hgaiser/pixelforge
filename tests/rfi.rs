@@ -20,8 +20,8 @@
 mod common;
 
 use pixelforge::{
-    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder, YuvLayout,
+    BitDepth, ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 use std::collections::VecDeque;
 use std::fs::File;
@@ -104,13 +104,13 @@ fn run_codec(
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     }
     .with_rate_control(RateControl::Cqp { qp: 10 })
-    .with_pixel_format(PixelFormat::Yuv420)
+    .with_chroma_format(ChromaFormat::Yuv420)
     .with_bit_depth(BitDepth::Eight)
     // Infinite GOP so the recovery can only come from RFI, never a periodic IDR.
     .with_gop_size(0);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input_image = InputImage::for_encoder(&encoder)?;
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
 
     let mut yuv_data = Vec::new();
     File::open(input_path)?.read_to_end(&mut yuv_data)?;

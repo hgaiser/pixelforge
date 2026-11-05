@@ -8,9 +8,9 @@ mod common;
 
 use ash::vk;
 use pixelforge::{
-    BitDepth, Codec, ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff,
-    InputFormat, InputImage, PixelFormat, RgbSource, Source, SourceImage, VideoContext,
-    VideoContextBuilder, YuvLayout,
+    BitDepth, ChromaFormat, Codec, ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame,
+    Handoff, RgbFormat, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 
 const WIDTH: u32 = 320;
@@ -29,7 +29,7 @@ fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
 fn an_input_slot_is_valid_until_the_next_submission() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
     let mut encoder = Encoder::new(context.clone(), EncodeConfig::h264(WIDTH, HEIGHT))?;
-    let input = InputImage::for_encoder(&encoder)?;
+    let input = YuvUploader::for_encoder(&encoder)?;
 
     let stale = encoder.input_slot()?;
     let packet = encoder.submit(Frame::image(input.source()))?;
@@ -52,12 +52,12 @@ fn an_input_slot_is_valid_until_the_next_submission() -> Result<(), Box<dyn std:
 #[ignore = "requires a Vulkan Video device"]
 fn a_source_image_needs_pixels() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
-    let input = InputImage::new(
+    let input = YuvUploader::new(
         context.clone(),
         WIDTH,
         HEIGHT,
         BitDepth::Eight,
-        PixelFormat::Yuv420,
+        ChromaFormat::Yuv420,
     )?;
     for layout in [vk::ImageLayout::UNDEFINED, vk::ImageLayout::PREINITIALIZED] {
         assert!(
@@ -76,7 +76,7 @@ fn a_shader_conversion_has_no_input_slot() -> Result<(), Box<dyn std::error::Err
         context,
         EncodeConfig::h264(WIDTH, HEIGHT)
             .with_source(Source::Rgb(RgbSource::new(
-                InputFormat::BGRA,
+                RgbFormat::BGRA,
                 ColorSpec::Srgb,
             )))
             .with_conversion(ConversionPreference::Shader),
@@ -103,7 +103,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
         "repeated a frame that was never there"
     );
 
-    let mut input = InputImage::for_encoder(&encoder)?;
+    let mut input = YuvUploader::for_encoder(&encoder)?;
     let luma_levels = [40u8, 120, 200];
     let plane = (WIDTH * HEIGHT) as usize;
     let mut stream = Vec::new();

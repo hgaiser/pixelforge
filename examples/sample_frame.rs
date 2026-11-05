@@ -175,7 +175,7 @@ impl Sampler {
         frame: &DecodedFrame,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = context.device().clone();
-        let format = frame.pixel_format;
+        let format = frame.chroma_format;
         let _ = format;
         let picture_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 

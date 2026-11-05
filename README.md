@@ -25,7 +25,7 @@ H.265 and AV1 encode, and H.264 decode.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
 - **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
-- **Utility helpers**: [`InputImage`] for easy YUV data upload to GPU.
+- **Utility helpers**: [`YuvUploader`] for easy YUV data upload to GPU.
 - **Optional DMA-BUF input**: import a producer's buffers, or allocate buffers
   for it, read with no copy where the driver allows, with sync_file fences
   (Linux only).
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Encoding Video
 
 ```rust
-use pixelforge::{Codec, EncodeConfig, Encoder, InputImage, RateControl, VideoContextBuilder};
+use pixelforge::{Codec, EncodeConfig, Encoder, YuvUploader, RateControl, VideoContextBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = VideoContextBuilder::new()
@@ -113,8 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_gop_size(60);
 
     let mut encoder = Encoder::new(context, config)?;
-    // Create an InputImage helper for uploading YUV data to the GPU.
-    let mut input_image = InputImage::for_encoder(&encoder)?;
+    // Create a YuvUploader helper for uploading YUV data to the GPU.
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
 
     // For each frame: upload YUV data and encode.
     // let yuv_data: &[u8] = ...;  // YUV420 frame data
@@ -195,7 +195,7 @@ stream's label cannot disagree, and a colour change through
 
 ```rust
 use pixelforge::{
-    Codec, ColorRange, ColorSpec, EncodeConfig, Encoder, InputFormat, RgbSource, Source,
+    Codec, ColorRange, ColorSpec, EncodeConfig, Encoder, RgbFormat, RgbSource, Source,
     StreamColor, VideoContextBuilder,
 };
 
@@ -206,7 +206,7 @@ let context = VideoContextBuilder::new()
 // SDR desktop content, encoded as HDR10 for an HDR streaming session.
 let config = EncodeConfig::h265(1920, 1080)
     .with_bit_depth(pixelforge::BitDepth::Ten)
-    .with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, ColorSpec::Srgb)))
+    .with_source(Source::Rgb(RgbSource::new(RgbFormat::BGRx, ColorSpec::Srgb)))
     .with_color(StreamColor::Hdr10 {
         range: ColorRange::Full,
     });
@@ -260,9 +260,9 @@ flight. The pixels are in one of:
 - a [`SourceImage`], an image of the caller's. Pixelforge copies or
   converts it into the input image after the call returns, and the
   `SourceImage` keeps track of that: write the image again only after
-  [`SourceImage::released`]. [`InputImage`], for frames uploaded from the
+  [`SourceImage::released`]. [`YuvUploader`], for frames uploaded from the
   CPU, waits for that itself.
-- an `ExternalImage`, a DMA-BUF (see below).
+- a `DmaBufImage`, a DMA-BUF (see below).
 
 ### Encoding on your own device
 
@@ -296,12 +296,12 @@ let reusable = source.released();
 ### DMA-BUF input
 
 With the `dmabuf` feature, an encoder reads DMA-BUFs from another process.
-`Encoder::input_formats` gives the DRM format it wants and, per DRM
+`Encoder::dmabuf_format` gives the DRM format it wants and, per DRM
 modifier, whether it reads such a buffer with no copy. Offer those
 modifiers to the producer first. `Encoder::import` takes a producer's
 buffer; `Encoder::allocate_input` makes one for a producer that writes
 into buffers the consumer supplies, such as `ext-image-copy-capture`.
-Either is checked once and gives an `ExternalImage`, which
+Either is checked once and gives a `DmaBufImage`, which
 `Frame::external` submits. A buffer the encoder cannot read directly is
 copied on the GPU instead.
 

@@ -22,7 +22,7 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, EncodeConfig, Encoder, Frame, InputImage, RateControl, VideoContextBuilder, YuvLayout,
+    Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder, YuvLayout, YuvUploader,
 };
 
 const WIDTH: u32 = 320;
@@ -59,7 +59,7 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
         .with_gop_size(GOP);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input_image = InputImage::for_encoder(&encoder)?;
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
 
     let mut bitstream = Vec::new();
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();

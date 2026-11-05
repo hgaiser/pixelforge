@@ -1,4 +1,4 @@
-//! `InputImage` uploads: every layout of the same picture is the same frame.
+//! `YuvUploader` uploads: every layout of the same picture is the same frame.
 //!
 //! Ignored by default: requires a Vulkan Video device. Run with
 //! `cargo test -- --ignored`.
@@ -7,8 +7,8 @@
 mod common;
 
 use pixelforge::{
-    BitDepth, Codec, EncodeConfig, Encoder, Frame, InputImage, VideoContext, VideoContextBuilder,
-    YuvLayout,
+    BitDepth, Codec, EncodeConfig, Encoder, Frame, VideoContext, VideoContextBuilder, YuvLayout,
+    YuvUploader,
 };
 
 const WIDTH: u32 = 320;
@@ -64,7 +64,7 @@ fn encode(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let config = EncodeConfig::h265(WIDTH, HEIGHT).with_bit_depth(depth);
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input = InputImage::for_encoder(&encoder)?;
+    let mut input = YuvUploader::for_encoder(&encoder)?;
     let mut stream = Vec::new();
     for i in 0..FRAMES {
         let data = frame(layout, i);
@@ -120,7 +120,7 @@ fn ten_bit_and_eight_bit_upload_the_same_frame() -> Result<(), Box<dyn std::erro
 fn a_layout_must_fit_the_image() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
     let encoder = Encoder::new(context.clone(), EncodeConfig::h265(WIDTH, HEIGHT))?;
-    let mut input = InputImage::for_encoder(&encoder)?;
+    let mut input = YuvUploader::for_encoder(&encoder)?;
     let size = |layout: YuvLayout| layout.frame_size(WIDTH, HEIGHT);
     for layout in [YuvLayout::I420P10, YuvLayout::I444] {
         assert!(

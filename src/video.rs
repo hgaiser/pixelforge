@@ -6,7 +6,7 @@
 //! resource management (encode slot pipelines, decode DPB pools) lives in
 //! `encoder::resources` and `decoder` respectively, built on these primitives.
 
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -289,26 +289,26 @@ pub(crate) fn query_supported_video_formats(
         .collect())
 }
 
-/// Get the Vulkan format for a given pixel format and bit depth.
+/// Get the Vulkan format for a given chroma format and bit depth.
 ///
 /// Supports YUV420 and YUV444 in 8-bit and 10-bit.
 /// For YUV444, uses 2-plane (semi-planar) formats from VK_EXT_ycbcr_2plane_444_formats
 /// which are supported by NVIDIA hardware for video encoding.
-pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -> vk::Format {
-    match (pixel_format, bit_depth) {
-        (PixelFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        (PixelFormat::Yuv420, BitDepth::Ten) => {
+pub(crate) fn get_video_format(chroma_format: ChromaFormat, bit_depth: BitDepth) -> vk::Format {
+    match (chroma_format, bit_depth) {
+        (ChromaFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+        (ChromaFormat::Yuv420, BitDepth::Ten) => {
             vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
         }
         // Use 2-plane semi-planar formats for YUV444 (supported by NVIDIA for video encoding).
-        (PixelFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-        (PixelFormat::Yuv444, BitDepth::Ten) => {
+        (ChromaFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
+        (ChromaFormat::Yuv444, BitDepth::Ten) => {
             vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
         }
         // TODO: Add support for YUV422 formats.
         _ => unimplemented!(
-            "Unsupported pixel format / bit depth combination: {:?} / {:?}",
-            pixel_format,
+            "Unsupported chroma format / bit depth combination: {:?} / {:?}",
+            chroma_format,
             bit_depth
         ),
     }

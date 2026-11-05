@@ -107,7 +107,7 @@ impl ColorRange {
 /// Supported input pixel formats for color conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
-pub enum InputFormat {
+pub enum RgbFormat {
     /// BGRx (32-bit, blue first, x = unused).
     BGRx,
     /// RGBx (32-bit, red first, x = unused).
@@ -130,26 +130,26 @@ pub enum InputFormat {
     RGBA16F,
 }
 
-impl InputFormat {
+impl RgbFormat {
     /// Bytes per pixel for this format.
     pub fn bytes_per_pixel(&self) -> usize {
         match self {
-            InputFormat::BGRx
-            | InputFormat::RGBx
-            | InputFormat::BGRA
-            | InputFormat::RGBA
-            | InputFormat::ABGR2101010 => 4,
-            InputFormat::RGBA16F => 8,
+            RgbFormat::BGRx
+            | RgbFormat::RGBx
+            | RgbFormat::BGRA
+            | RgbFormat::RGBA
+            | RgbFormat::ABGR2101010 => 4,
+            RgbFormat::RGBA16F => 8,
         }
     }
 
     /// Vulkan format for creating image views of this input format.
     pub fn vk_format(&self) -> vk::Format {
         match self {
-            InputFormat::BGRx | InputFormat::BGRA => vk::Format::B8G8R8A8_UNORM,
-            InputFormat::RGBx | InputFormat::RGBA => vk::Format::R8G8B8A8_UNORM,
-            InputFormat::ABGR2101010 => vk::Format::A2B10G10R10_UNORM_PACK32,
-            InputFormat::RGBA16F => vk::Format::R16G16B16A16_SFLOAT,
+            RgbFormat::BGRx | RgbFormat::BGRA => vk::Format::B8G8R8A8_UNORM,
+            RgbFormat::RGBx | RgbFormat::RGBA => vk::Format::R8G8B8A8_UNORM,
+            RgbFormat::ABGR2101010 => vk::Format::A2B10G10R10_UNORM_PACK32,
+            RgbFormat::RGBA16F => vk::Format::R16G16B16A16_SFLOAT,
         }
     }
 }
@@ -219,7 +219,7 @@ pub(crate) struct ColorConverterConfig {
     /// Input frame height.
     pub height: u32,
     /// Input pixel format.
-    pub input_format: InputFormat,
+    pub input_format: RgbFormat,
     /// Output YUV format.
     pub output_format: OutputFormat,
     /// What the input pixels already are.
@@ -244,7 +244,7 @@ impl ColorConverterConfig {
     pub fn new(
         width: u32,
         height: u32,
-        input_format: InputFormat,
+        input_format: RgbFormat,
         output_format: OutputFormat,
         source_color: ColorSpec,
         target_color: ColorSpec,
@@ -1017,42 +1017,42 @@ mod tests {
     use super::*;
 
     // ========================
-    // InputFormat tests.
+    // RgbFormat tests.
     // ========================
 
     #[test]
     fn test_input_format_bytes_per_pixel() {
-        assert_eq!(InputFormat::BGRx.bytes_per_pixel(), 4);
-        assert_eq!(InputFormat::RGBx.bytes_per_pixel(), 4);
-        assert_eq!(InputFormat::BGRA.bytes_per_pixel(), 4);
-        assert_eq!(InputFormat::RGBA.bytes_per_pixel(), 4);
-        assert_eq!(InputFormat::ABGR2101010.bytes_per_pixel(), 4);
-        assert_eq!(InputFormat::RGBA16F.bytes_per_pixel(), 8);
+        assert_eq!(RgbFormat::BGRx.bytes_per_pixel(), 4);
+        assert_eq!(RgbFormat::RGBx.bytes_per_pixel(), 4);
+        assert_eq!(RgbFormat::BGRA.bytes_per_pixel(), 4);
+        assert_eq!(RgbFormat::RGBA.bytes_per_pixel(), 4);
+        assert_eq!(RgbFormat::ABGR2101010.bytes_per_pixel(), 4);
+        assert_eq!(RgbFormat::RGBA16F.bytes_per_pixel(), 8);
     }
 
     #[test]
     fn test_input_format_enum_values() {
         // Verify enum values match shader expectations.
-        assert_eq!(InputFormat::BGRx as u32, 0);
-        assert_eq!(InputFormat::RGBx as u32, 1);
-        assert_eq!(InputFormat::BGRA as u32, 2);
-        assert_eq!(InputFormat::RGBA as u32, 3);
-        assert_eq!(InputFormat::ABGR2101010 as u32, 4);
-        assert_eq!(InputFormat::RGBA16F as u32, 5);
+        assert_eq!(RgbFormat::BGRx as u32, 0);
+        assert_eq!(RgbFormat::RGBx as u32, 1);
+        assert_eq!(RgbFormat::BGRA as u32, 2);
+        assert_eq!(RgbFormat::RGBA as u32, 3);
+        assert_eq!(RgbFormat::ABGR2101010 as u32, 4);
+        assert_eq!(RgbFormat::RGBA16F as u32, 5);
     }
 
     #[test]
     fn test_input_format_vk_format() {
-        assert_eq!(InputFormat::BGRx.vk_format(), vk::Format::B8G8R8A8_UNORM);
-        assert_eq!(InputFormat::BGRA.vk_format(), vk::Format::B8G8R8A8_UNORM);
-        assert_eq!(InputFormat::RGBx.vk_format(), vk::Format::R8G8B8A8_UNORM);
-        assert_eq!(InputFormat::RGBA.vk_format(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(RgbFormat::BGRx.vk_format(), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(RgbFormat::BGRA.vk_format(), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(RgbFormat::RGBx.vk_format(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(RgbFormat::RGBA.vk_format(), vk::Format::R8G8B8A8_UNORM);
         assert_eq!(
-            InputFormat::ABGR2101010.vk_format(),
+            RgbFormat::ABGR2101010.vk_format(),
             vk::Format::A2B10G10R10_UNORM_PACK32
         );
         assert_eq!(
-            InputFormat::RGBA16F.vk_format(),
+            RgbFormat::RGBA16F.vk_format(),
             vk::Format::R16G16B16A16_SFLOAT
         );
     }
@@ -1118,7 +1118,7 @@ mod tests {
         let base = ColorConverterConfig::new(
             64,
             64,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             OutputFormat::P010,
             ColorSpec::Bt709Linear,
             ColorSpec::Bt2020Pq,
@@ -1143,7 +1143,7 @@ mod tests {
         let config = ColorConverterConfig::new(
             64,
             64,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             OutputFormat::P010,
             ColorSpec::Bt2020Pq,
             ColorSpec::Bt2020Pq,
@@ -1168,7 +1168,7 @@ mod tests {
         ColorConverterConfig::new(
             64,
             64,
-            InputFormat::BGRA,
+            RgbFormat::BGRA,
             OutputFormat::NV12,
             source,
             target,
@@ -1345,7 +1345,7 @@ mod tests {
         let config = ColorConverterConfig::new(
             1920,
             1080,
-            InputFormat::BGRx,
+            RgbFormat::BGRx,
             OutputFormat::NV12,
             ColorSpec::Srgb,
             ColorSpec::Srgb,
@@ -1355,7 +1355,7 @@ mod tests {
         let cloned = config.clone();
         assert_eq!(cloned.width, 1920);
         assert_eq!(cloned.height, 1080);
-        assert_eq!(cloned.input_format, InputFormat::BGRx);
+        assert_eq!(cloned.input_format, RgbFormat::BGRx);
         assert_eq!(cloned.output_format, OutputFormat::NV12);
         assert_eq!(cloned.target, ColorSpec::Srgb);
         assert!(cloned.range.is_full());
@@ -1366,7 +1366,7 @@ mod tests {
         let config = ColorConverterConfig::new(
             640,
             480,
-            InputFormat::RGBA,
+            RgbFormat::RGBA,
             OutputFormat::I420,
             ColorSpec::Srgb,
             ColorSpec::Srgb,
@@ -1408,7 +1408,7 @@ mod tests {
         let config = ColorConverterConfig::new(
             64,
             64,
-            InputFormat::BGRx,
+            RgbFormat::BGRx,
             OutputFormat::NV12,
             ColorSpec::Srgb,
             ColorSpec::Srgb,
@@ -1431,10 +1431,10 @@ mod tests {
         };
 
         let input_formats = [
-            InputFormat::BGRx,
-            InputFormat::RGBx,
-            InputFormat::BGRA,
-            InputFormat::RGBA,
+            RgbFormat::BGRx,
+            RgbFormat::RGBx,
+            RgbFormat::BGRA,
+            RgbFormat::RGBA,
         ];
         let output_formats = [OutputFormat::NV12, OutputFormat::I420, OutputFormat::YUV444];
 

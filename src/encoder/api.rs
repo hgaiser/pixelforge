@@ -77,7 +77,7 @@ pub struct Encoder {
     /// The slot whose input image holds the last frame, for [`Self::repeat`].
     last_frame_slot: Option<usize>,
     /// Counts the times the codec encoder was made again with a different
-    /// conversion. An [`ExternalImage`](super::external::ExternalImage) made
+    /// conversion. A [`DmaBufImage`](super::external::DmaBufImage) made
     /// for one cannot be read by another.
     generation: u64,
     #[cfg(feature = "dmabuf")]
@@ -146,11 +146,11 @@ impl Encoder {
     /// an error: submit the RGB frames from a [`SourceImage`] instead.
     ///
     /// ```no_run
-    /// use pixelforge::{EncodeConfig, Encoder, Frame, InputImage, VideoContext, YuvLayout};
+    /// use pixelforge::{EncodeConfig, Encoder, Frame, YuvUploader, VideoContext, YuvLayout};
     ///
     /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut encoder = Encoder::new(context, EncodeConfig::h264(1920, 1080))?;
-    /// let mut upload = InputImage::for_encoder(&encoder)?;
+    /// let mut upload = YuvUploader::for_encoder(&encoder)?;
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// let slot = encoder.input_slot()?;
     /// upload.upload_to(&slot, YuvLayout::I420, &yuv_data)?;
@@ -183,7 +183,7 @@ impl Encoder {
     /// itself, depending on the [`Conversion`] and the source.
     ///
     /// The call returns before the source is read. A [`SourceImage`] or an
-    /// `ExternalImage` keeps track of that itself, see
+    /// `DmaBufImage` keeps track of that itself, see
     /// [`SourceImage::released`].
     pub fn submit(&mut self, frame: Frame<'_>) -> Result<EncodeFuture> {
         if let FrameSource::Input(slot) = &frame.source
@@ -448,7 +448,7 @@ impl Encoder {
     ///   encoder is made again, because its video session fixes the input
     ///   format, matrix and range. Packet timestamps carry on across that.
     ///
-    /// An `ExternalImage` made before a change of source or conversion has to
+    /// A `DmaBufImage` made before a change of source or conversion has to
     /// be made again. On error the encoder is left as it was.
     pub fn reconfigure(&mut self, source: Source, color: StreamColor) -> Result<()> {
         if (source, color) == (self.config.source, self.config.color) {
@@ -516,7 +516,7 @@ impl Encoder {
 fn create_codec_encoder(
     context: &VideoContext,
     config: &EncodeConfig,
-    rgb_input: Option<crate::converter::InputFormat>,
+    rgb_input: Option<crate::converter::RgbFormat>,
 ) -> Result<Box<dyn EncoderApi>> {
     let context = context.clone();
     let config = config.clone();
