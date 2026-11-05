@@ -22,10 +22,11 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::decoder::DecodedFrame;
-use crate::decoder::frames::SlotPins;
+use crate::decoder::frames::{DecodedPicture, SlotPins};
 use crate::decoder::pipeline::DecodePipeline;
 use crate::decoder::plan::SessionPlan;
 use crate::decoder::profile::DecodeProfile;
+use crate::decoder::record::{DecodeRecord, RecordCodec};
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
@@ -623,6 +624,79 @@ impl DecoderCommon {
         let queue = self.decode_queue;
         self.pipeline
             .submit_decode(&device, self.context.sync2(), queue)
+    }
+
+    /// Record `vkCmdBeginVideoCoding`, `vkCmdDecodeVideo` and
+    /// `vkCmdEndVideoCoding` from a linked `record`, resetting the session
+    /// first if this is its first decode.
+    pub fn record_coding<C: RecordCodec>(&self, record: &DecodeRecord<C>) {
+        let command_buffer = self.decode_command_buffer();
+        // A session's first decode sees no active slot.
+        let first_use = self
+            .session
+            .as_ref()
+            .is_none_or(|s| !s.dpb_slot_active.iter().any(|&a| a));
+        unsafe {
+            self.video_queue_fn
+                .cmd_begin_video_coding(command_buffer, record.begin_info());
+            // On the first use of the session, all DPB slots must be reset.
+            if first_use {
+                let control = vk::VideoCodingControlInfoKHR::default()
+                    .flags(vk::VideoCodingControlFlagsKHR::RESET);
+                self.video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control);
+            }
+            self.video_decode_fn
+                .cmd_decode_video(command_buffer, record.decode_info());
+            self.video_queue_fn
+                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
+        }
+    }
+
+    /// Mark `slot` as decoded into, and describe the picture now in it for
+    /// output. Call after the picture's decode is submitted.
+    ///
+    /// `width` and `height` are the visible (cropped) size.
+    pub fn decoded_picture(
+        &mut self,
+        slot: u8,
+        width: u32,
+        height: u32,
+        pts: u64,
+        display_order: i32,
+        is_keyframe: bool,
+    ) -> DecodedPicture {
+        let picture_layout = self.picture_layout();
+        let output_layout = self.output_layout();
+        let generation = self.generation;
+        let session = self.session.as_mut().expect("a picture was just decoded");
+        session.dpb_slot_active[slot as usize] = true;
+        let (image, image_view, layout, array_layer) = if session.coincide {
+            let (image, layer) = session.dpb_image_for_slot(slot);
+            (image, session.dpb_entry(slot).2, picture_layout, layer)
+        } else {
+            let (image, _, view) = session
+                .output_image
+                .expect("non-coincide implies output image");
+            (image, view, output_layout, 0)
+        };
+        DecodedPicture {
+            slot,
+            image,
+            image_view,
+            layout,
+            array_layer,
+            chroma_format: session.chroma_format,
+            bit_depth: session.bit_depth,
+            generation,
+            width,
+            height,
+            coded_width: session.coded_width,
+            coded_height: session.coded_height,
+            pts,
+            display_order,
+            is_keyframe,
+        }
     }
 
     /// Close off the current picture and hand `frames` to the completion thread.

@@ -430,41 +430,10 @@ impl H264Decoder {
         self.common.submit_decode()?;
 
         // --- Publish the frame, then retire references ---
-        let active = self.common.session.as_mut().expect("active");
-        active.dpb_slot_active[slot as usize] = true;
-
-        let picture_layout = self.common.picture_layout();
-        let output_layout = self.common.output_layout();
-        let generation = self.common.generation;
-        let active = self.common.session.as_mut().expect("active");
-        let (image, image_view, layout, array_layer) = if active.coincide {
-            let (image, layer) = active.dpb_image_for_slot(slot);
-            (image, active.dpb_entry(slot).2, picture_layout, layer)
-        } else {
-            let (image, _, view) = active
-                .output_image
-                .expect("non-coincide implies output image");
-            (image, view, output_layout, 0)
-        };
-
         let (width, height) = sps.display_dimensions();
-        let frame = DecodedPicture {
-            slot,
-            image,
-            image_view,
-            layout,
-            array_layer,
-            chroma_format: active.chroma_format,
-            bit_depth: active.bit_depth,
-            generation,
-            width,
-            height,
-            coded_width: active.coded_width,
-            coded_height: active.coded_height,
-            pts,
-            display_order: state.poc,
-            is_keyframe: state.is_idr,
-        };
+        let frame = self
+            .common
+            .decoded_picture(slot, width, height, pts, state.poc, state.is_idr);
 
         self.dpb
             .as_mut()
@@ -484,7 +453,6 @@ impl H264Decoder {
         slice_offsets: &[u32],
     ) -> Result<()> {
         let active = self.common.session.as_ref().expect("active");
-        let command_buffer = self.common.decode_command_buffer();
 
         // The slot's previous decode has finished (`begin_decode_commands`
         // waited for it), so its record can be rewritten.
@@ -571,31 +539,7 @@ impl H264Decoder {
             setup_std,
         });
 
-        unsafe {
-            self.common
-                .video_queue_fn
-                .cmd_begin_video_coding(command_buffer, record.begin_info());
-        }
-
-        // On the first use of the session, all DPB slots must be reset.
-        if !active.dpb_slot_active.iter().any(|&a| a) {
-            let control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            unsafe {
-                self.common
-                    .video_queue_fn
-                    .cmd_control_video_coding(command_buffer, &control);
-            }
-        }
-
-        unsafe {
-            self.common
-                .video_decode_fn
-                .cmd_decode_video(command_buffer, record.decode_info());
-            self.common
-                .video_queue_fn
-                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
-        }
+        self.common.record_coding(record);
         Ok(())
     }
 }
