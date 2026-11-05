@@ -7,9 +7,11 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+use crate::decoder::DecodeConfig;
 use crate::decoder::annexb::START_CODE;
 use crate::decoder::common::DecoderCommon;
-use crate::decoder::frames::{DecodedPicture, ReorderBuffer};
+use crate::decoder::driver::CodecDecoder;
+use crate::decoder::frames::DecodedPicture;
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
@@ -18,7 +20,6 @@ use crate::decoder::h264::record::{DecodeRecord, LinkParams};
 use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
 use crate::decoder::plan::StreamNeeds;
 use crate::decoder::profile::DecodeProfile;
-use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -26,7 +27,9 @@ use crate::vulkan::VideoContext;
 /// H.264 decoder.
 ///
 /// Owns only what is specific to H.264: the parameter sets seen so far, and the
-/// POC / reference-marking state. Everything Vulkan lives in [`DecoderCommon`].
+/// POC / reference-marking state. Everything Vulkan lives in [`DecoderCommon`],
+/// and the flow around a picture (framing, keyframes, reordering) is
+/// [`StreamDecoder`](crate::decoder::driver::StreamDecoder)'s.
 pub(crate) struct H264Decoder {
     common: DecoderCommon,
 
@@ -53,31 +56,10 @@ pub(crate) struct H264Decoder {
     /// into themselves.
     records: Box<[DecodeRecord]>,
 
-    /// Display-order reordering, which holds pictures by pinning their DPB
-    /// slots rather than by copying them out.
-    reorder: ReorderBuffer,
     /// `max_num_reorder_frames` for the active SPS: how deep the reorder buffer
     /// may hold pictures before emitting. Set by `activate`, which also sizes
     /// the DPB so that many pictures can be pinned rather than copied.
     reorder_depth: usize,
-
-    /// How input is framed, which decides whether the end of a `decode` call is
-    /// also the end of a coded picture.
-    framing: Framing,
-    /// Bytes of a coded picture that has not been seen to end yet, held over
-    /// from earlier `decode` calls. Only ever non-empty in
-    /// [`Framing::ByteStream`].
-    carry: Vec<u8>,
-    /// The `pts` of the call that delivered the first byte of `carry`, so a
-    /// picture is timestamped by when it started arriving rather than by which
-    /// call happened to complete it.
-    carry_pts: u64,
-
-    /// Whether decoding is waiting for a keyframe (IDR) before it can produce
-    /// output. True until the first IDR is decoded: non-IDR pictures reference
-    /// state that does not exist yet, so they are skipped and the caller is told
-    /// to request an IDR. This is the normal state when joining a stream.
-    awaiting_keyframe: bool,
 }
 
 /// What `group_slices` did with a slice.
@@ -90,7 +72,7 @@ enum Grouped {
 }
 
 /// The slices making up one picture, gathered from the input.
-struct Picture<'a> {
+pub(crate) struct Picture<'a> {
     header: SliceHeader,
     nal_type: NalType,
     ref_idc: u8,
@@ -121,42 +103,8 @@ impl H264Decoder {
             records: (0..DECODE_PIPELINE_DEPTH)
                 .map(|_| DecodeRecord::new())
                 .collect(),
-            reorder: ReorderBuffer::new(),
             reorder_depth: 0,
-            framing: config.framing,
-            carry: Vec::new(),
-            carry_pts: 0,
-            awaiting_keyframe: true,
         })
-    }
-
-    /// Emit any pictures still held for reordering. Call at end of stream.
-    ///
-    /// These pictures were copied out by earlier calls, so this submits no new
-    /// GPU work; the future still resolves in call order behind whatever is
-    /// already in flight.
-    pub(crate) fn finish(&mut self) -> Result<()> {
-        // In byte-stream framing the tail is a picture that was never seen to
-        // end because nothing followed it. End of stream is what ends it.
-        if !self.carry.is_empty() {
-            let tail = std::mem::take(&mut self.carry);
-            let pts = self.carry_pts;
-            // A tail that cannot be decoded is not worth failing over: the
-            // frames already decoded still have to come out.
-            self.decode_frames(&tail, pts)?;
-        }
-        let frames = self.reorder.flush();
-        self.common.finish_stream(frames);
-        Ok(())
-    }
-
-    /// Hand over the frame channel's receiving end, once.
-    pub(crate) fn take_frame_receiver(&mut self) -> Option<crate::decoder::FrameReceiver> {
-        self.common.frames_rx.take()
-    }
-
-    pub(crate) fn picture_format(&self) -> Option<vk::Format> {
-        self.common.session.as_ref().map(|a| a.picture_format)
     }
 
     /// Build the H.264 decode profile for a parsed SPS.
@@ -429,113 +377,7 @@ impl H264Decoder {
         Ok((pictures, awaiting))
     }
 
-    /// Decode a chunk of input, doing the framing the configuration calls for.
-    pub(crate) fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
-        match self.framing {
-            // The caller guarantees the chunk ends on a picture boundary, so it
-            // can go straight to the decoder with no buffering and no copy.
-            Framing::FrameAligned => self.decode_frames(data, pts),
-            Framing::ByteStream => self.decode_byte_stream(data, pts),
-        }
-    }
-
-    /// Framing for input that may cut anywhere.
-    ///
-    /// A coded picture is only known to have ended once the next one starts, so
-    /// everything up to the last picture start is complete and decodable, and
-    /// everything from it onward is held over for the next call. `flush` ends
-    /// the final picture.
-    fn decode_byte_stream(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
-        let carried = self.carry.len();
-        let mut buffer = std::mem::take(&mut self.carry);
-        buffer.extend_from_slice(data);
-
-        // Nothing before the last picture start can still be waiting for more
-        // slices. With no picture start at all, nothing is complete yet.
-        let split = super::complete_prefix(&buffer);
-
-        let result = if split > 0 {
-            self.decode_frames(&buffer[..split], self.carry_pts)
-        } else {
-            // Not enough bytes to complete a picture yet.
-            Ok(DecodeStatus::Buffered)
-        };
-
-        // The held-over picture is timestamped by the call its first byte came
-        // in on, which is this one only if the split consumed everything the
-        // previous calls had left.
-        if split >= carried {
-            self.carry_pts = pts;
-        }
-        buffer.drain(..split);
-        self.carry = buffer;
-        result
-    }
-
-    /// Decode input already known to end on a picture boundary.
-    ///
-    /// Frames go to the consumer as each picture's work is handed to the
-    /// completion thread, so a call decoding many pictures does not hold their
-    /// frames until it returns.
-    fn decode_frames(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
-        // What is missing when a picture cannot be decoded yet; set only while
-        // no frame has been produced, so a keyframe later in the same buffer
-        // still yields output. Seeded with slices skipped during splitting for
-        // missing parameter sets.
-        let (pictures, mut awaiting) = self.split_pictures(data)?;
-        // Whether any picture actually reached the GPU, which decides between
-        // returning a batch and asking for a keyframe.
-        let mut decoded_any = false;
-
-        for picture in pictures {
-            let is_idr = picture.nal_type == NalType::IdrSlice;
-
-            // A non-IDR picture before the first keyframe references reference
-            // pictures and POC state that do not exist yet. Skip it and ask for
-            // a keyframe rather than decoding garbage.
-            if self.awaiting_keyframe && !is_idr {
-                awaiting.get_or_insert_with(|| {
-                    "no keyframe decoded yet; non-IDR picture cannot be decoded".to_string()
-                });
-                continue;
-            }
-
-            // The parameter sets this picture was grouped under, not whatever
-            // currently sits at those ids: a later SPS in the same chunk must
-            // not reach back and change how this picture is decoded.
-            let (sps, pps) = (picture.sps.clone(), picture.pps.clone());
-
-            // (Re)build the session if the stream's geometry or ids changed.
-            self.activate(&sps, &pps)?;
-
-            if let Some(frame) = self.decode_picture(&picture, &sps, pts)? {
-                // A decoded IDR re-establishes a valid decode point.
-                if is_idr {
-                    self.awaiting_keyframe = false;
-                }
-                let depth_reorder = self.reorder_depth;
-                let ready = self.reorder.push(&mut self.common, &frame, depth_reorder)?;
-                decoded_any = true;
-                // The picture's submissions are complete as far as recording
-                // goes; hand its slot and frames to the completion thread and
-                // move on to the next slot.
-                self.common.end_picture(ready);
-            }
-        }
-
-        if decoded_any {
-            return Ok(DecodeStatus::Decoded);
-        }
-        // Only ask for a keyframe when nothing was decoded: if one arrived
-        // later in the same buffer, its pictures take priority.
-        if let Some(reason) = awaiting {
-            debug!("H.264 decode: awaiting keyframe: {}", reason);
-            return Ok(DecodeStatus::NeedsKeyframe);
-        }
-        Ok(DecodeStatus::Buffered)
-    }
-
-    /// Record and submit the decode of a single picture, and wait for it.
+    /// Record and submit the decode of a single picture, without waiting for it.
     fn decode_picture(
         &mut self,
         picture: &Picture,
@@ -754,11 +596,44 @@ impl H264Decoder {
     }
 }
 
-impl Drop for H264Decoder {
-    fn drop(&mut self) {
-        // The reorder pool's images must be freed while `common` (and its
-        // device) is still alive; `common`'s own Drop runs afterward.
-        self.reorder.destroy(&self.common);
+impl CodecDecoder for H264Decoder {
+    type Unit<'a> = Picture<'a>;
+
+    const NAME: &'static str = "H.264";
+
+    fn common(&self) -> &DecoderCommon {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut DecoderCommon {
+        &mut self.common
+    }
+
+    fn complete_prefix(buffer: &[u8]) -> usize {
+        super::complete_prefix(buffer)
+    }
+
+    fn split_units<'a>(&mut self, data: &'a [u8]) -> Result<(Vec<Picture<'a>>, Option<String>)> {
+        self.split_pictures(data)
+    }
+
+    fn is_keyframe(picture: &Picture<'_>) -> bool {
+        picture.nal_type == NalType::IdrSlice
+    }
+
+    fn decode_unit(&mut self, picture: &Picture<'_>, pts: u64) -> Result<Option<DecodedPicture>> {
+        // The parameter sets this picture was grouped under, not whatever
+        // currently sits at those ids: a later SPS in the same chunk must not
+        // reach back and change how this picture is decoded.
+        let (sps, pps) = (picture.sps.clone(), picture.pps.clone());
+
+        // (Re)build the session if the stream's geometry or ids changed.
+        self.activate(&sps, &pps)?;
+        self.decode_picture(picture, &sps, pts)
+    }
+
+    fn reorder_depth(&self) -> usize {
+        self.reorder_depth
     }
 }
 

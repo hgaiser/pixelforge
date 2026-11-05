@@ -43,6 +43,8 @@ pub(crate) mod annexb;
 pub(crate) mod bitreader;
 /// The Vulkan video session and the per-decoder state every codec shares.
 pub(crate) mod common;
+/// The decode flow every codec shares.
+pub(crate) mod driver;
 /// Frame ownership: pool images, DPB slot pins, display-order reordering.
 pub(crate) mod frames;
 /// H.264 decoding.
@@ -403,7 +405,10 @@ impl Decoder {
             )));
         }
         let mut inner: Box<dyn DecoderApi> = match config.codec {
-            Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
+            Codec::H264 => Box::new(driver::StreamDecoder::new(
+                h264::H264Decoder::create(context, &config)?,
+                &config,
+            )),
             other => {
                 return Err(PixelForgeError::InvalidInput(format!(
                     "{:?} decoding is not implemented yet",

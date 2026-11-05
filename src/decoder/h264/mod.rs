@@ -14,10 +14,6 @@ mod dpb;
 mod record;
 mod session;
 
-use crate::decoder::{DecodeStatus, FrameReceiver};
-use crate::error::Result;
-use ash::vk;
-
 pub(crate) use session::H264Decoder;
 
 /// Byte offsets at which each coded picture begins in an Annex B stream.
@@ -57,22 +53,4 @@ pub(crate) fn picture_starts(stream: &[u8]) -> Vec<usize> {
 /// slices. Zero means nothing in `buffer` can be decoded yet.
 pub(crate) fn complete_prefix(buffer: &[u8]) -> usize {
     picture_starts(buffer).last().copied().unwrap_or(0)
-}
-
-impl crate::decoder::DecoderApi for H264Decoder {
-    fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
-        H264Decoder::decode(self, data, pts)
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        H264Decoder::finish(self)
-    }
-
-    fn take_frame_receiver(&mut self) -> Option<FrameReceiver> {
-        H264Decoder::take_frame_receiver(self)
-    }
-
-    fn picture_format(&self) -> Option<vk::Format> {
-        H264Decoder::picture_format(self)
-    }
 }
