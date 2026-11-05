@@ -52,6 +52,9 @@ pub(crate) mod driver;
 pub(crate) mod frames;
 /// H.264 decoding.
 pub(crate) mod h264;
+/// H.265 parsing and reference bookkeeping. Nothing uses it yet.
+#[allow(dead_code)]
+pub(crate) mod h265;
 pub(crate) mod pipeline;
 /// Turning what a stream needs into a session plan.
 pub(crate) mod plan;
