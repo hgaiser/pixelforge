@@ -89,7 +89,7 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
     let yuv_path = dir.join("out.yuv");
     let mut out = Some(File::create(&yuv_path)?);
     let mut readback = Some(Readback::new(&context)?);
-    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(context, DecodeConfig::new(Codec::H264).with_byte_stream())?;
     let mut decoded_count = 0usize;
 
     decode_stream(&mut decoder, &bitstream, |frame| {

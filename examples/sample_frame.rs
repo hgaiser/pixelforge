@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // picture's sharing set. Without this, sampling a decoded image from a
     // family the decoder did not share with is undefined.
     let consumer_family = context.compute_queue_family();
-    let config = DecodeConfig::h264()
+    let config = DecodeConfig::new(Codec::H264)
         .with_byte_stream()
         .with_output_depth(8)
         .with_consumer_queue_family(consumer_family);

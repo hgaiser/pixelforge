@@ -606,7 +606,10 @@ fn unaligned_sizes_are_read_at_the_display_size() -> Result<(), Box<dyn std::err
     let stream = encode_external(&mut encoder, &mut producer, &allocated, &frames)?;
 
     let mut readback = Readback::new(&context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(
+        context.clone(),
+        DecodeConfig::new(Codec::H264).with_byte_stream(),
+    )?;
     let mut decoded = Vec::new();
     decode_stream(&mut decoder, &stream, |frame| {
         decoded.push(readback.read(&frame)?.y);

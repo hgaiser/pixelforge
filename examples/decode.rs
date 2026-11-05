@@ -59,7 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sized for one frame per call, so raise it: past the budget the decoder
     // copies pictures out instead of handing over its own images, which is
     // still correct but gives up the zero-copy path.
-    let config = DecodeConfig::h264().with_byte_stream().with_output_depth(8);
+    let config = DecodeConfig::new(Codec::H264)
+        .with_byte_stream()
+        .with_output_depth(8);
     let mut output = output_path.as_ref().map(File::create).transpose()?;
     // Readback lives in the consumer, not in pixelforge: the decoder hands over
     // a GPU image and a renderer would sample it in place. See examples/common.

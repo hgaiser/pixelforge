@@ -144,7 +144,10 @@ fn decode_all(
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut readback = Readback::new(context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(
+        context.clone(),
+        DecodeConfig::new(Codec::H264).with_byte_stream(),
+    )?;
     let mut frames = Vec::new();
     decode_stream(&mut decoder, stream, |frame| {
         let data = readback.read(&frame)?;

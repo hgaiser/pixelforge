@@ -120,10 +120,10 @@ pub struct DecodeConfig {
 }
 
 impl DecodeConfig {
-    /// Create an H.264 decode configuration.
-    pub fn h264() -> Self {
+    /// Create a decode configuration for `codec`.
+    pub fn new(codec: Codec) -> Self {
         Self {
-            codec: Codec::H264,
+            codec,
             output_depth: DEFAULT_OUTPUT_DEPTH,
             consumer_queue_family: None,
             framing: Framing::FrameAligned,

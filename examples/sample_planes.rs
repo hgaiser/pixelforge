@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let consumer_family = context.compute_queue_family();
-    let config = DecodeConfig::h264()
+    let config = DecodeConfig::new(Codec::H264)
         .with_byte_stream()
         .with_output_depth(8)
         .with_consumer_queue_family(consumer_family);

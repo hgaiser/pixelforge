@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A file can cut anywhere, so let the decoder frame it. Input that
     // arrives already framed (RTP, a container) skips `with_byte_stream`.
-    let config = DecodeConfig::h264().with_byte_stream();
+    let config = DecodeConfig::new(Codec::H264).with_byte_stream();
     let mut decoder = Decoder::new(context, config)?;
     let stream: Vec<u8> = std::fs::read("input.264")?;
 

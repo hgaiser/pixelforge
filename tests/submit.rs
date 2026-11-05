@@ -131,7 +131,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
     let mut readback = common::Readback::new(&context)?;
     let mut decoder = pixelforge::Decoder::new(
         context.clone(),
-        pixelforge::DecodeConfig::h264().with_byte_stream(),
+        pixelforge::DecodeConfig::new(pixelforge::Codec::H264).with_byte_stream(),
     )?;
     let mut means = Vec::new();
     common::decode_stream(&mut decoder, &stream, |frame| {

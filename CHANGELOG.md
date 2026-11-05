@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `ColorConverter`, `ColorConverterConfig` and `OutputFormat`
   are no longer public. Describe an RGB source with `Source::Rgb` instead, and
   the encoder runs the converter itself, with the right target and range.
+- **Breaking:** `DecodeConfig::new(codec)` replaces `DecodeConfig::h264()`,
+  in the same way as `EncodeConfig::new`.
 - **Breaking:** `RateControl` replaces `RateControlMode`, `quality_level`,
   `target_bitrate` and `max_bitrate`: `Cqp { qp }`, `Cbr { bitrate }` or
   `Vbr { target, max }`, so each mode carries exactly the values it uses.
