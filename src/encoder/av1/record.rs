@@ -3,13 +3,10 @@
 
 use super::Av1;
 
-use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{
-    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers,
-    record_post_encode_dpb_barrier, reset_start_timestamp,
-};
-use crate::error::{PixelForgeError, Result};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -29,7 +26,6 @@ impl Av1 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
-        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = common.source_view();
@@ -295,22 +291,6 @@ impl Av1 {
                 .use_max_q_index(false);
         }
 
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate.numerator)
-            .frame_rate_denominator(common.config.frame_rate.denominator)
-            .push(&mut av1_rc_layer_info);
-        let rc_layers = [rc_layer_info];
-
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
-        }
-
         // Begin coding: setup slot (slot_index -1) plus any active reference slots.
         let mut all_reference_slots = Vec::new();
         if is_reference {
@@ -322,62 +302,14 @@ impl Av1 {
         }
         all_reference_slots.extend_from_slice(&reference_slots);
 
-        let is_first_frame = plan.is_first_frame();
-        let should_reset_coding_state = is_first_frame || (is_key_frame && !rc.is_disabled());
         // Clamp GOP values to at least 1; a value of 0 is undefined in
         // Vulkan and causes undefined behavior on some drivers (RADV).
         let gop_frames = common.config.gop_size.max(1);
-        let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
+        let codec_rate_control = vk::VideoEncodeAV1RateControlInfoKHR::default()
             .gop_frame_count(gop_frames)
             .key_frame_period(gop_frames)
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
-
-        // Reset and write start timestamp
-        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-        // Ash links pNext chains in place, so each command needs its own extension structs.
-        let mut begin_rc_info = rc_info;
-        let mut begin_av1_rc_info = av1_rc_info;
-        let begin_coding_info = if is_first_frame {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&all_reference_slots)
-                .push(&mut begin_av1_rc_info)
-        } else {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&all_reference_slots)
-                .push(&mut begin_rc_info)
-                .push(&mut begin_av1_rc_info)
-        };
-
-        unsafe {
-            common
-                .video_queue_fn
-                .cmd_begin_video_coding(command_buffer, &begin_coding_info);
-        }
-
-        if should_reset_coding_state {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut av1_rc_info)
-                .push(&mut quality_level_info);
-            unsafe {
-                common
-                    .video_queue_fn
-                    .cmd_control_video_coding(command_buffer, &control_info);
-            }
-        }
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -398,43 +330,18 @@ impl Av1 {
         }
         encode_info = encode_info.push(&mut av1_picture_info);
 
-        unsafe {
-            let device = common.device();
-            device.cmd_begin_query(
-                command_buffer,
-                query_pool,
-                0,
-                vk::QueryControlFlags::empty(),
-            );
-            common
-                .video_encode_fn
-                .cmd_encode_video(command_buffer, &encode_info);
-            device.cmd_end_query(command_buffer, query_pool, 0);
-
-            // Write end timestamp
-            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-            record_post_encode_dpb_barrier(
-                device,
-                command_buffer,
-                &common.dpb_images,
-                common.use_layered_dpb,
-                current_dpb_slot,
-            );
-
-            let end_coding_info = vk::VideoEndCodingInfoKHR::default();
-            common
-                .video_queue_fn
-                .cmd_end_video_coding(command_buffer, &end_coding_info);
-
-            common.record_source_release(command_buffer);
-
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
-        }
-
-        common.submit_frame()
+        // A key frame with a bitrate controller resets it too.
+        let first_frame = plan.is_first_frame();
+        common.record_encode(EncodeCommands {
+            begin_slots: &all_reference_slots,
+            encode_info: &encode_info,
+            rate_control: &rc,
+            codec_rate_control,
+            codec_layer: av1_rc_layer_info,
+            first_frame,
+            reset: first_frame || (is_key_frame && !rc.is_disabled()),
+            post_encode_barrier: true,
+        })
     }
 
     /// Build `ref_frame_idx`, `ref_order_hint`, `primary_ref_frame` and

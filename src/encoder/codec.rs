@@ -25,8 +25,9 @@ use crate::encoder::pipeline::{
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::resources::{
     EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
-    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
-    query_supported_video_formats, upload_image_to_input,
+    create_dpb_images, destroy_encoder_resources, end_timestamp, get_video_format, lcm,
+    query_supported_video_formats, record_post_encode_dpb_barrier, reset_start_timestamp,
+    upload_image_to_input,
 };
 use crate::encoder::rgb::RgbConversionCaps;
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl, StreamColor};
@@ -312,6 +313,116 @@ impl EncoderCommon {
         Ok(future)
     }
 
+    /// Record one frame's encode into the current slot's command buffer,
+    /// from begin coding to the end of the command buffer, and submit it.
+    ///
+    /// The codec builds what differs: the reference slots, the encode info
+    /// with its picture info, and its rate control structs.
+    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<EncodeFuture>
+    where
+        R: for<'x> vk::Extends<vk::VideoBeginCodingInfoKHR<'x>>
+            + for<'x> vk::Extends<vk::VideoCodingControlInfoKHR<'x>>
+            + TaggedStructure<'static>
+            + Copy,
+        L: for<'x> vk::Extends<vk::VideoEncodeRateControlLayerInfoKHR<'x>>
+            + TaggedStructure<'static>,
+    {
+        let slot = self.pipeline.current();
+        let command_buffer = slot.encode_command_buffer;
+        let query_pool = slot.query_pool;
+        let timestamp_query_pool = slot.timestamp_query_pool;
+        let rc = cmd.rate_control;
+
+        let mut codec_layer = cmd.codec_layer;
+        let rc_layers = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(rc.average_bitrate as u64)
+            .max_bitrate(rc.max_bitrate as u64)
+            .frame_rate_numerator(self.config.frame_rate.numerator)
+            .frame_rate_denominator(self.config.frame_rate.denominator)
+            .push(&mut codec_layer)];
+        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
+        if !rc.is_disabled() {
+            rc_info = rc_info
+                .layers(&rc_layers)
+                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
+        }
+
+        reset_start_timestamp(self.device(), command_buffer, timestamp_query_pool);
+
+        // Ash links pNext chains in place, so each command needs its own
+        // extension structs. The first frame sets rate control with the
+        // control command below, after RESET, rather than here.
+        let mut begin_codec_rc = cmd.codec_rate_control;
+        let mut begin_rc = rc_info;
+        let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.session_params)
+            .reference_slots(cmd.begin_slots)
+            .push(&mut begin_codec_rc);
+        if !cmd.first_frame {
+            begin_info = begin_info.push(&mut begin_rc);
+        }
+        unsafe {
+            self.video_queue_fn
+                .cmd_begin_video_coding(command_buffer, &begin_info);
+        }
+
+        // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command (matches
+        // FFmpeg; required for AMD RADV).
+        if cmd.reset {
+            let mut codec_rc = cmd.codec_rate_control;
+            let mut quality_level_info =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                )
+                .push(&mut rc_info)
+                .push(&mut codec_rc)
+                .push(&mut quality_level_info);
+            unsafe {
+                self.video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control_info);
+            }
+        }
+
+        unsafe {
+            let device = self.device();
+            device.cmd_begin_query(
+                command_buffer,
+                query_pool,
+                0,
+                vk::QueryControlFlags::empty(),
+            );
+            self.video_encode_fn
+                .cmd_encode_video(command_buffer, cmd.encode_info);
+            device.cmd_end_query(command_buffer, query_pool, 0);
+            end_timestamp(device, command_buffer, timestamp_query_pool);
+
+            if cmd.post_encode_barrier {
+                record_post_encode_dpb_barrier(
+                    device,
+                    command_buffer,
+                    &self.dpb_images,
+                    self.use_layered_dpb,
+                    self.current_dpb_slot,
+                );
+            }
+
+            self.video_queue_fn
+                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
+            self.record_source_release(command_buffer);
+            self.device()
+                .end_command_buffer(command_buffer)
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
+        }
+
+        self.submit_frame()
+    }
+
     /// Epilogue: advance to the next pipeline slot.
     pub fn advance(&mut self) {
         self.pipeline.advance();
@@ -373,6 +484,30 @@ pub(crate) struct PictureSetup {
     /// Codec header to prepend (SPS/PPS, VPS/SPS/PPS, AV1 sequence header).
     /// `Some` only for frames that carry one (typically the IDR/key frame).
     pub header: Option<Vec<u8>>,
+}
+
+/// What differs between the codecs in one frame's encode commands, for
+/// [`EncoderCommon::record_encode`].
+pub(crate) struct EncodeCommands<'a, R, L> {
+    /// The slots for begin coding: the setup slot as inactive (index -1),
+    /// if the frame is a reference, then the references it uses.
+    pub begin_slots: &'a [vk::VideoReferenceSlotInfoKHR<'a>],
+    /// The encode, with the codec's picture info chained in.
+    pub encode_info: &'a vk::VideoEncodeInfoKHR<'a>,
+    pub rate_control: &'a RateControlPlan,
+    /// The codec's rate control info, such as
+    /// `VideoEncodeH264RateControlInfoKHR`.
+    pub codec_rate_control: R,
+    /// The codec's rate control layer info, such as
+    /// `VideoEncodeH264RateControlLayerInfoKHR`.
+    pub codec_layer: L,
+    /// Whether this is the session's first frame.
+    pub first_frame: bool,
+    /// Whether to reset the coding state and set rate control and the
+    /// quality level with a control command. At least on the first frame.
+    pub reset: bool,
+    /// Whether to make the DPB write visible with a barrier after the encode.
+    pub post_encode_barrier: bool,
 }
 
 /// The resolved rate-control decision for a frame.

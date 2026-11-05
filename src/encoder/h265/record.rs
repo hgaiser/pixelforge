@@ -3,13 +3,10 @@
 
 use super::H265;
 
-use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{
-    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers,
-    record_post_encode_dpb_barrier, reset_start_timestamp,
-};
-use crate::error::{PixelForgeError, Result};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -27,7 +24,6 @@ impl H265 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
-        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = common.source_view();
@@ -369,73 +365,12 @@ impl H265 {
             qp_p: qp_max,
             qp_b: qp_max,
         };
-        let mut h265_rc_layer_info = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
+        let codec_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .min_qp(min_qp)
             .max_qp(max_qp);
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate.numerator)
-            .frame_rate_denominator(common.config.frame_rate.denominator)
-            .push(&mut h265_rc_layer_info);
-        let rc_layers = [rc_layer_info];
-
-        let mut h265_rc_info = vk::VideoEncodeH265RateControlInfoKHR::default()
+        let codec_rate_control = vk::VideoEncodeH265RateControlInfoKHR::default()
             .gop_frame_count(common.config.gop_size)
             .idr_period(common.config.gop_size);
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
-        }
-
-        // Reset and write start timestamp
-        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-        let is_first_frame = plan.is_first_frame();
-        let begin_coding_info = if is_first_frame {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h265_rc_info)
-        } else {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h265_rc_info)
-                .push(&mut rc_info)
-        };
-
-        unsafe {
-            (common.video_queue_fn.fp().cmd_begin_video_coding_khr)(
-                command_buffer,
-                &begin_coding_info,
-            );
-        }
-
-        if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut h265_rc_info)
-                .push(&mut quality_level_info);
-            unsafe {
-                (common.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    command_buffer,
-                    &control_info,
-                );
-            }
-        }
 
         let encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
@@ -455,38 +390,16 @@ impl H265 {
             common.current_dpb_slot
         );
 
-        unsafe {
-            let device = common.device();
-            device.cmd_begin_query(
-                command_buffer,
-                query_pool,
-                0,
-                vk::QueryControlFlags::empty(),
-            );
-            (common.video_encode_fn.fp().cmd_encode_video_khr)(command_buffer, &encode_info);
-            device.cmd_end_query(command_buffer, query_pool, 0);
-
-            // Write end timestamp
-            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-            record_post_encode_dpb_barrier(
-                device,
-                command_buffer,
-                &common.dpb_images,
-                common.use_layered_dpb,
-                common.current_dpb_slot,
-            );
-
-            let end_coding_info = vk::VideoEndCodingInfoKHR::default();
-            (common.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_coding_info);
-
-            common.record_source_release(command_buffer);
-
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
-        }
-
-        common.submit_frame()
+        let first_frame = plan.is_first_frame();
+        common.record_encode(EncodeCommands {
+            begin_slots: &reference_slots_for_begin,
+            encode_info: &encode_info,
+            rate_control: &rc,
+            codec_rate_control,
+            codec_layer,
+            first_frame,
+            reset: first_frame,
+            post_encode_barrier: true,
+        })
     }
 }

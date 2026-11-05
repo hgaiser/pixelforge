@@ -3,12 +3,10 @@
 
 use super::H264;
 
-use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{
-    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers, reset_start_timestamp,
-};
-use crate::error::{PixelForgeError, Result};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -27,7 +25,6 @@ impl H264 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
-        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = common.source_view();
@@ -372,104 +369,26 @@ impl H264 {
             qp_p: qp_bounds_max,
             qp_b: qp_bounds_max,
         };
-
-        let mut h264_rc_layer_info = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
+        let codec_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
             .use_max_qp(true)
             .max_qp(max_qp);
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate.numerator)
-            .frame_rate_denominator(common.config.frame_rate.denominator)
-            .push(&mut h264_rc_layer_info);
-        let rc_layers = [rc_layer_info];
-
-        let mut h264_rc_info = vk::VideoEncodeH264RateControlInfoKHR::default()
+        let codec_rate_control = vk::VideoEncodeH264RateControlInfoKHR::default()
             .gop_frame_count(common.config.gop_size)
             .idr_period(common.config.gop_size);
 
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
-        }
-
-        // Reset and write start timestamp
-        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-        // For the first frame, configure rate control via the control command
-        // after RESET rather than in begin_coding.
-        let is_first_frame = plan.is_first_frame();
-        let begin_info = if is_first_frame {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h264_rc_info)
-        } else {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h264_rc_info)
-                .push(&mut rc_info)
-        };
-
-        unsafe {
-            (common.video_queue_fn.fp().cmd_begin_video_coding_khr)(command_buffer, &begin_info);
-        }
-
-        // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command on the first
-        // frame (matches FFmpeg; required for AMD RADV).
-        if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut h264_rc_info)
-                .push(&mut quality_level_info);
-            unsafe {
-                (common.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    command_buffer,
-                    &control_info,
-                );
-            }
-        }
-
-        unsafe {
-            let device = common.device();
-            device.cmd_begin_query(
-                command_buffer,
-                query_pool,
-                0,
-                vk::QueryControlFlags::empty(),
-            );
-            (common.video_encode_fn.fp().cmd_encode_video_khr)(command_buffer, &encode_info);
-            device.cmd_end_query(command_buffer, query_pool, 0);
-
-            // Write end timestamp
-            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-            let end_info = vk::VideoEndCodingInfoKHR::default();
-            (common.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_info);
-
-            common.record_source_release(command_buffer);
-
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
-        }
-
-        let future = common.submit_frame()?;
+        let first_frame = plan.is_first_frame();
+        let future = common.record_encode(EncodeCommands {
+            begin_slots: &reference_slots_for_begin,
+            encode_info: &encode_info,
+            rate_control: &rc,
+            codec_rate_control,
+            codec_layer,
+            first_frame,
+            reset: first_frame,
+            post_encode_barrier: false,
+        })?;
         // Clear the unmark queue only after the encode is committed to the GPU.
         // If any fallible step above had failed, the MMCO ops would still live
         // in `pending_unmark_frame_nums` so a retry re-emits them — otherwise the
