@@ -16,10 +16,11 @@ use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
     self, NalType, NalUnit, Pps, SliceHeader, SliceType, Sps, iter_nal_units,
 };
-use crate::decoder::h264::record::{DecodeRecord, LinkParams};
+use crate::decoder::h264::record::H264Record;
 use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
 use crate::decoder::plan::StreamNeeds;
 use crate::decoder::profile::DecodeProfile;
+use crate::decoder::record::{DecodeRecord, LinkParams};
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -54,7 +55,7 @@ pub(crate) struct H264Decoder {
     /// What each pipeline slot's decode command was recorded from, indexed like
     /// the pipeline's slots. Never resized or moved out of: the records point
     /// into themselves.
-    records: Box<[DecodeRecord]>,
+    records: Box<[DecodeRecord<H264Record>]>,
 
     /// `max_num_reorder_frames` for the active SPS: how deep the reorder buffer
     /// may hold pictures before emitting. Set by `activate`, which also sizes
@@ -100,8 +101,10 @@ impl H264Decoder {
             active_sps: None,
             active_pps: None,
             dpb: None,
+            // SAFETY: the picture info is plain C data, for which all-zero is
+            // a valid (if meaningless) value.
             records: (0..DECODE_PIPELINE_DEPTH)
-                .map(|_| DecodeRecord::new())
+                .map(|_| DecodeRecord::new(unsafe { std::mem::zeroed() }))
                 .collect(),
             reorder_depth: 0,
         })
@@ -549,6 +552,8 @@ impl H264Decoder {
             PicOrderCnt: [state.poc, state.poc],
         };
 
+        *record.picture_mut() = pic_std;
+
         // The decode destination is the DPB slot itself when the implementation
         // supports coincide, otherwise the separate output image.
         record.link(&LinkParams {
@@ -564,7 +569,6 @@ impl H264Decoder {
             setup_view: active.dpb_entry(slot).2,
             output_view: active.output_image.map(|(_, _, view)| view),
             setup_std,
-            pic_std,
         });
 
         unsafe {

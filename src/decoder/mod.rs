@@ -53,6 +53,8 @@ pub(crate) mod pipeline;
 /// Turning what a stream needs into a session plan.
 pub(crate) mod plan;
 pub(crate) mod profile;
+/// The structures a decode command is recorded from.
+pub(crate) mod record;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;
 
