@@ -22,21 +22,19 @@ pub struct Av1Frame {
     pub header: FrameHeader,
     /// The OBU that carried the header: `Frame`, `FrameHeader` or
     /// `RedundantFrameHeader` (when the original was lost).
+    ///
+    /// This and the two fields below only check the parse in tests: the
+    /// decoder hands the driver tile data alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub header_obu_type: ObuType,
-    /// Offset of the first byte of that OBU (its `obu_header()`), which is
-    /// what Vulkan's `frameHeaderOffset` asks for: "the byte offset of the
-    /// AV1 frame header OBU".
+    /// Offset of the first byte of that OBU (its `obu_header()`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub frame_header_offset: usize,
-    /// Offset of the first byte of the header's payload, the start of
-    /// `uncompressed_header()`.
-    pub frame_header_payload_offset: usize,
     /// Bytes of payload the header takes: `uncompressed_header()` plus its
     /// byte alignment in a frame OBU, plus its trailing bits in a frame
     /// header OBU.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub frame_header_bytes: usize,
-    /// `temporal_id` and `spatial_id` of the header OBU.
-    pub temporal_id: u8,
-    pub spatial_id: u8,
     /// The tile groups in order, which together cover every tile. Empty for
     /// `show_existing_frame`.
     pub tile_groups: Vec<TileGroup>,
@@ -54,9 +52,9 @@ impl Av1Frame {
 /// What one OBU produced.
 #[derive(Debug)]
 pub enum Av1Event {
-    /// A sequence header was parsed. `changed` is false when it repeats the
-    /// one in effect, which encoders do at every key frame.
-    SequenceHeader { changed: bool },
+    /// A sequence header was parsed. Encoders repeat it at every key frame;
+    /// the decoder compares it with the one its session was built from.
+    SequenceHeader,
     /// A frame is complete: all of its tile groups have arrived, or it is a
     /// `show_existing_frame`. The caller decodes (or shows) it and then calls
     /// [`Av1Parser::commit_frame`] or [`Av1Parser::discard_frame`].
@@ -113,16 +111,6 @@ impl Av1Parser {
         &self.refs
     }
 
-    /// Forget every reference and any frame in flight, keeping the sequence
-    /// header. After this, only a key frame decodes.
-    pub fn reset(&mut self) {
-        self.refs = RefState::default();
-        self.order_hints = [0; TOTAL_REFS_PER_FRAME];
-        self.current = None;
-        self.pending = None;
-        self.skipping = false;
-    }
-
     /// Apply the reference frame update process for the pending frame, now
     /// decoded into DPB slot `dpb_slot` (`None` if the caller does not track
     /// it). For `show_existing_frame` of a key frame the shown slot's DPB
@@ -176,9 +164,8 @@ impl Av1Parser {
             }
             ObuType::SequenceHeader => {
                 let seq = parse_sequence_header(obu.payload)?;
-                let changed = self.sequence.as_ref() != Some(&seq);
                 self.sequence = Some(seq);
-                Ok(Some(Av1Event::SequenceHeader { changed }))
+                Ok(Some(Av1Event::SequenceHeader))
             }
             ObuType::FrameHeader | ObuType::RedundantFrameHeader | ObuType::Frame => {
                 if !self.selected(obu)? {
@@ -267,10 +254,7 @@ impl Av1Parser {
             header: *header,
             header_obu_type: obu.header.obu_type,
             frame_header_offset: obu.offset,
-            frame_header_payload_offset: obu.payload_offset(),
             frame_header_bytes: header_bytes,
-            temporal_id: obu.header.temporal_id,
-            spatial_id: obu.header.spatial_id,
             tile_groups: Vec::new(),
         };
         if frame.header.show_existing_frame {

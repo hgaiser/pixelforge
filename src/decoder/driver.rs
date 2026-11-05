@@ -63,6 +63,10 @@ pub(crate) enum Decoded {
     /// Not decoded, and that is normal: an H.265 RASL picture after the CRA
     /// that started decoding, which references pictures from before it.
     Skipped,
+    /// Not decoded, because it references state the decoder does not have:
+    /// pictures or parameter sets from before the stream was joined, or lost
+    /// since. The reason names what is missing.
+    NeedsKeyframe(String),
 }
 
 /// Drives a [`CodecDecoder`].
@@ -172,6 +176,10 @@ impl<C: CodecDecoder> StreamDecoder<C> {
                 }
                 Decoded::Hidden => Vec::new(),
                 Decoded::Skipped => continue,
+                Decoded::NeedsKeyframe(reason) => {
+                    awaiting.get_or_insert(reason);
+                    continue;
+                }
             };
             decoded_any = true;
             // A decoded keyframe re-establishes a valid decode point.

@@ -473,6 +473,7 @@ impl H264Decoder {
             record.push_reference(
                 r.slot,
                 active.dpb_entry(r.slot).2,
+                None,
                 ash::vk::native::StdVideoDecodeH264ReferenceInfo {
                     flags,
                     FrameNum: frame_num,

@@ -581,7 +581,7 @@ fn decode_extension_name(codec: Codec) -> &'static std::ffi::CStr {
 }
 
 /// The codecs pixelforge can decode, on a device that supports them.
-const DECODE_CODECS: &[Codec] = &[Codec::H264, Codec::H265];
+const DECODE_CODECS: &[Codec] = &[Codec::H264, Codec::H265, Codec::AV1];
 
 /// The decode codecs `physical_device` supports.
 fn query_decode_codecs(

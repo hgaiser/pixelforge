@@ -68,8 +68,9 @@ pub(crate) struct DecodeRecord<C: RecordCodec> {
     // Plain data.
     offsets: Vec<u32>,
     ref_count: usize,
-    /// DPB slot and image view of each reference.
-    refs: [(u8, vk::ImageView); MAX_REFS],
+    /// DPB slot, image view and coded extent of each reference. A `None`
+    /// extent is the picture's own.
+    refs: [(u8, vk::ImageView, Option<vk::Extent2D>); MAX_REFS],
     ref_std: [C::RefStd; MAX_REFS],
     setup_std: C::RefStd,
     picture: C::Picture,
@@ -142,7 +143,7 @@ impl<C: RecordCodec> DecodeRecord<C> {
         Self {
             offsets: Vec::new(),
             ref_count: 0,
-            refs: [(0, vk::ImageView::null()); MAX_REFS],
+            refs: [(0, vk::ImageView::null(), None); MAX_REFS],
             ref_std: [zeroed_ref; MAX_REFS],
             setup_std: zeroed_ref,
             picture,
@@ -178,9 +179,19 @@ impl<C: RecordCodec> DecodeRecord<C> {
     }
 
     /// Add a reference picture, in the order the driver is to see it.
-    pub(crate) fn push_reference(&mut self, slot: u8, view: vk::ImageView, std: C::RefStd) {
+    ///
+    /// `extent` is the reference's coded extent when it differs from the
+    /// picture's own, which only AV1 allows (a frame size change between key
+    /// frames).
+    pub(crate) fn push_reference(
+        &mut self,
+        slot: u8,
+        view: vk::ImageView,
+        extent: Option<vk::Extent2D>,
+        std: C::RefStd,
+    ) {
         assert!(self.ref_count < MAX_REFS, "too many references");
-        self.refs[self.ref_count] = (slot, view);
+        self.refs[self.ref_count] = (slot, view, extent);
         self.ref_std[self.ref_count] = std;
         self.ref_count += 1;
     }
@@ -193,20 +204,21 @@ impl<C: RecordCodec> DecodeRecord<C> {
         let n = self.ref_count;
         self.setup_std = p.setup_std;
 
-        let resource = |view: vk::ImageView| {
+        let resource = |view: vk::ImageView, extent: vk::Extent2D| {
             vk::VideoPictureResourceInfoKHR::default()
                 .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(p.extent)
+                .coded_extent(extent)
                 .base_array_layer(0)
                 .image_view_binding(view)
         };
         for i in 0..n {
-            self.ref_resources[i] = resource(self.refs[i].1);
+            let (_, view, extent) = self.refs[i];
+            self.ref_resources[i] = resource(view, extent.unwrap_or(p.extent));
         }
-        self.setup_resource = resource(p.setup_view);
+        self.setup_resource = resource(p.setup_view, p.extent);
         self.output_resource = match p.output_view {
             None => self.setup_resource,
-            Some(view) => resource(view),
+            Some(view) => resource(view, p.extent),
         };
 
         // SAFETY (for every `stable`/`stable_mut` below): the target is a field

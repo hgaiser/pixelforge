@@ -43,7 +43,6 @@ pub const AFFINE: u8 = 3;
 
 /// Reference frame names (section 6.10.24), which index `OrderHints`,
 /// `RefFrameSignBias`, `gm_params` and the loop filter reference deltas.
-pub const INTRA_FRAME: usize = 0;
 pub const LAST_FRAME: usize = 1;
 pub const LAST2_FRAME: usize = 2;
 pub const LAST3_FRAME: usize = 3;

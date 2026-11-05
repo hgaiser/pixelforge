@@ -74,11 +74,6 @@ impl Obu<'_> {
     pub fn payload_offset(&self) -> usize {
         self.offset + self.header_len
     }
-
-    /// Total size of the OBU, header included.
-    pub fn total_len(&self) -> usize {
-        self.header_len + self.payload.len()
-    }
 }
 
 /// Whether an OBU belongs to the operating point with the given

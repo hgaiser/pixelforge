@@ -115,7 +115,7 @@ fn parse_stream(name: &str, data: &[u8]) -> Parsed {
             Some(Av1Event::MissingReferences(slots)) => {
                 panic!("{name}: missing references {slots:#010b}")
             }
-            Some(Av1Event::SequenceHeader { .. }) | None => {}
+            Some(Av1Event::SequenceHeader) | None => {}
         }
     }
     Parsed {

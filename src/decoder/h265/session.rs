@@ -327,11 +327,10 @@ impl H265Decoder {
             // A picture that predicts from one the decoder does not have
             // would decode to garbage, and so would everything after it that
             // predicts from it in turn.
-            debug!(
-                "H.265 decode: picture POC {} references a missing picture; skipped",
+            return Ok(Decoded::NeedsKeyframe(format!(
+                "picture POC {} references a picture that is not in the DPB",
                 state.poc
-            );
-            return Ok(Decoded::Skipped);
+            )));
         }
 
         // Every slot can be busy because a frame the caller still holds pins
@@ -398,6 +397,7 @@ impl H265Decoder {
             record.push_reference(
                 r.slot,
                 active.dpb_entry(r.slot).2,
+                None,
                 ash::vk::native::StdVideoDecodeH265ReferenceInfo {
                     flags,
                     PicOrderCntVal: r.poc,

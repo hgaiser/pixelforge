@@ -26,6 +26,9 @@ pub struct StdSequenceHeader {
     _timing: Option<Box<StdVideoAV1TimingInfo>>,
 }
 
+// SAFETY: the raw pointers only point into the boxes this value owns.
+unsafe impl Send for StdSequenceHeader {}
+
 impl StdSequenceHeader {
     pub fn new(seq: &SequenceHeader) -> Self {
         let cc = &seq.color_config;

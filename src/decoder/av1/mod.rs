@@ -32,8 +32,11 @@ pub(crate) mod sequence;
 pub(crate) mod std_info;
 pub(crate) mod tile;
 
+mod record;
+mod session;
+
 /// Parser tests against real libaom and SVT-AV1 streams (host-side, no GPU).
 #[cfg(test)]
 mod stream_tests;
 
-pub(crate) use parser::{Av1Event, Av1Frame, Av1Parser};
+pub(crate) use session::Av1Decoder;

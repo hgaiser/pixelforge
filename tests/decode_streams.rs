@@ -26,13 +26,22 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
     common::init_logging();
     let input = Path::new("tests/data").join(name);
     let dir = common::scratch_dir("decode_streams");
-    let output_path = dir.join(format!("{name}.yuv"));
-    let reference_path = dir.join(format!("{name}.ref.yuv"));
+    let file = name.replace('/', "_");
+    let output_path = dir.join(format!("{file}.yuv"));
+    let reference_path = dir.join(format!("{file}.ref.yuv"));
 
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+    // dav1d is the AV1 reference. `-noautoscale` keeps each frame at its own
+    // size, where ffmpeg would otherwise scale a stream that changes size to
+    // its first one.
+    let mut ffmpeg = std::process::Command::new("ffmpeg");
+    ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    if codec == Codec::AV1 {
+        ffmpeg.args(["-c:v", "libdav1d"]);
+    }
+    let status = ffmpeg
+        .arg("-i")
         .arg(&input)
-        .args(["-pix_fmt", pix_fmt, "-f", "rawvideo"])
+        .args(["-noautoscale", "-pix_fmt", pix_fmt, "-f", "rawvideo"])
         .arg(&reference_path)
         .status()?;
     assert!(status.success(), "ffmpeg failed to decode {name}");
@@ -83,4 +92,11 @@ stream_tests! {
     h265_scaling: Codec::H265, "scaling.265", "nv12";
     h265_slices: Codec::H265, "slices.265", "nv12";
     h265_temporal: Codec::H265, "temporal.265", "nv12";
+    av1_altref: Codec::AV1, "av1/aom_altref.obu", "nv12";
+    av1_tiles: Codec::AV1, "av1/aom_tiles.obu", "nv12";
+    av1_tilegroups: Codec::AV1, "av1/aom_tilegroups.obu", "nv12";
+    av1_errres: Codec::AV1, "av1/aom_errres.obu", "nv12";
+    av1_superres: Codec::AV1, "av1/aom_superres.obu", "nv12";
+    av1_resize: Codec::AV1, "av1/aom_resize.obu", "nv12";
+    av1_10bit: Codec::AV1, "av1/aom_10bit.obu", "p010le";
 }

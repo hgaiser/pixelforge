@@ -42,6 +42,12 @@ fn roundtrip_h265() -> Result<(), Box<dyn std::error::Error>> {
     roundtrip(Codec::H265, "h265")
 }
 
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_av1() -> Result<(), Box<dyn std::error::Error>> {
+    roundtrip(Codec::AV1, "obu")
+}
+
 fn roundtrip(codec: Codec, extension: &str) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -119,8 +125,13 @@ fn roundtrip(codec: Codec, extension: &str) -> Result<(), Box<dyn std::error::Er
 
     // --- Compare against ffmpeg's software decoder ---
     let reference_path = dir.join("reference.yuv");
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+    let mut ffmpeg = std::process::Command::new("ffmpeg");
+    ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    if codec == Codec::AV1 {
+        ffmpeg.args(["-c:v", "libdav1d"]);
+    }
+    let status = ffmpeg
+        .arg("-i")
         .arg(&bitstream_path)
         .args(["-pix_fmt", "nv12", "-f", "rawvideo"])
         .arg(&reference_path)
