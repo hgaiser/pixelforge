@@ -96,10 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Encoding Video
 
 ```rust
-use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder,
-};
+use pixelforge::{Codec, EncodeConfig, Encoder, InputImage, RateControl, VideoContextBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = VideoContextBuilder::new()
@@ -115,20 +112,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_frame_rate(30, 1)
         .with_gop_size(60);
 
-    // Create an InputImage helper for uploading YUV data to the GPU.
-    let mut input_image = InputImage::new(
-        context.clone(),
-        Codec::H264,
-        1920,
-        1080,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
     let mut encoder = Encoder::new(context, config)?;
+    // Create an InputImage helper for uploading YUV data to the GPU.
+    let mut input_image = InputImage::for_encoder(&encoder)?;
 
     // For each frame: upload YUV data and encode.
     // let yuv_data: &[u8] = ...;  // YUV420 frame data
-    // input_image.upload_yuv420(yuv_data)?;
+    // input_image.upload(YuvLayout::I420, yuv_data)?;
     // let packet = encoder.submit(Frame::image(input_image.source()))?;
 
     Ok(())

@@ -12,7 +12,7 @@ mod common;
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder,
+    VideoContextBuilder, YuvLayout,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -138,8 +138,7 @@ fn run_test(
             Err(e) => return Err(format!("Failed to create encoder: {}", e).into()),
         };
 
-        let mut input_image =
-            InputImage::new(context.clone(), codec, WIDTH, HEIGHT, depth, format)?;
+        let mut input_image = InputImage::for_encoder(&encoder)?;
 
         let input_path = match format {
             PixelFormat::Yuv420 => format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT),
@@ -174,11 +173,12 @@ fn run_test(
             // copy issues (InputImage uses the transfer queue, encoder uses the
             // video encode queue which doesn't support transfer ops).
             let slot = encoder.input_slot()?;
-            match format {
-                PixelFormat::Yuv420 => input_image.upload_yuv420_to(&slot, frame)?,
-                PixelFormat::Yuv444 => input_image.upload_yuv444_to(&slot, frame)?,
+            let layout = match format {
+                PixelFormat::Yuv420 => YuvLayout::I420,
+                PixelFormat::Yuv444 => YuvLayout::I444,
                 _ => return Err("Unsupported format".into()),
-            }
+            };
+            input_image.upload_to(&slot, layout, frame)?;
 
             pending.push_back(encoder.submit(Frame::input(slot))?);
             while pending.len() > 2 {

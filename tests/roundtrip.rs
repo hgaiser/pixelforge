@@ -22,8 +22,7 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder,
+    Codec, EncodeConfig, Encoder, Frame, InputImage, RateControl, VideoContextBuilder, YuvLayout,
 };
 
 const WIDTH: u32 = 320;
@@ -59,20 +58,13 @@ fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
         .with_frame_rate(30, 1)
         .with_gop_size(GOP);
 
-    let mut input_image = InputImage::new(
-        context.clone(),
-        Codec::H264,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
     let mut encoder = Encoder::new(context.clone(), config)?;
+    let mut input_image = InputImage::for_encoder(&encoder)?;
 
     let mut bitstream = Vec::new();
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
     for i in 0..frame_count {
-        input_image.upload_yuv420(&yuv[i * frame_size..(i + 1) * frame_size])?;
+        input_image.upload(YuvLayout::I420, &yuv[i * frame_size..(i + 1) * frame_size])?;
         pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         while pending.len() > 2 {
             let packet = pollster::block_on(pending.pop_front().expect("non-empty"))?;

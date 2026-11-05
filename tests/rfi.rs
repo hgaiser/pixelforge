@@ -21,7 +21,7 @@ mod common;
 
 use pixelforge::{
     Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder,
+    VideoContextBuilder, YuvLayout,
 };
 use std::collections::VecDeque;
 use std::fs::File;
@@ -110,14 +110,7 @@ fn run_codec(
     .with_gop_size(0);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input_image = InputImage::new(
-        context.clone(),
-        codec,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let mut input_image = InputImage::for_encoder(&encoder)?;
 
     let mut yuv_data = Vec::new();
     File::open(input_path)?.read_to_end(&mut yuv_data)?;
@@ -154,7 +147,7 @@ fn run_codec(
         }
 
         let slot = encoder.input_slot()?;
-        input_image.upload_yuv420_to(&slot, &yuv_data[start..end])?;
+        input_image.upload_to(&slot, YuvLayout::I420, &yuv_data[start..end])?;
         pending.push_back(encoder.submit(Frame::input(slot))?);
         while pending.len() > 2 {
             drain_one(&mut pending, &mut output_file, &mut recovery_is_key)?;

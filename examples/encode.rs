@@ -10,8 +10,8 @@
 //! The codec defaults to `h264`.
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl,
-    VideoContextBuilder,
+    Codec, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, RateControl, VideoContextBuilder,
+    YuvLayout,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -101,16 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rate_control, config.gop_size
     );
 
-    // Create input image for uploading frames.
-    let mut input_image = InputImage::new(
-        context.clone(),
-        codec,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
     let mut encoder = Encoder::new(context, config)?;
+    // Create input image for uploading frames.
+    let mut input_image = InputImage::for_encoder(&encoder)?;
     let mut output = File::create(output_name)?;
     let mut total_bytes = 0;
 
@@ -139,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
 
         // Upload YUV420 data to the input image.
-        input_image.upload_yuv420(frame)?;
+        input_image.upload(YuvLayout::I420, frame)?;
 
         // Submit the frame (async) and keep the pipeline at most ~2 deep.
         pending.push_back(encoder.submit(Frame::image(input_image.source()))?);

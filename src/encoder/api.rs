@@ -146,21 +146,14 @@ impl Encoder {
     /// an error: submit the RGB frames from a [`SourceImage`] instead.
     ///
     /// ```no_run
-    /// use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, Frame, InputImage, PixelFormat, VideoContext};
+    /// use pixelforge::{EncodeConfig, Encoder, Frame, InputImage, VideoContext, YuvLayout};
     ///
     /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut encoder = Encoder::new(context.clone(), EncodeConfig::h264(1920, 1080))?;
-    /// let mut upload = InputImage::new(
-    ///     context,
-    ///     Codec::H264,
-    ///     1920,
-    ///     1080,
-    ///     EncodeBitDepth::Eight,
-    ///     PixelFormat::Yuv420,
-    /// )?;
+    /// let mut encoder = Encoder::new(context, EncodeConfig::h264(1920, 1080))?;
+    /// let mut upload = InputImage::for_encoder(&encoder)?;
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// let slot = encoder.input_slot()?;
-    /// upload.upload_yuv420_to(&slot, &yuv_data)?;
+    /// upload.upload_to(&slot, YuvLayout::I420, &yuv_data)?;
     /// let packet = pollster::block_on(encoder.submit(Frame::input(slot))?)?;
     /// # Ok(())
     /// # }
@@ -371,7 +364,6 @@ impl Encoder {
         &*self.inner
     }
 
-    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub(crate) fn context(&self) -> &VideoContext {
         &self.context
     }

@@ -62,9 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
   field are removed. No codec encodes B-frames yet, and every encoder refused
   a count above 0 at runtime.
-- **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
-  `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
-  frames that read the image are done with it.
+- **Breaking:** `InputImage` has two uploads, `upload` to its own image and
+  `upload_to` an encoder's `InputSlot`, which take a `YuvLayout`: `I420`,
+  `Nv12`, `I420P10` or `I444`. They replace `upload_yuv420`, `upload_nv12`,
+  `upload_yuv420_10bit`, `upload_yuv420_to` and `upload_yuv444_to`, which
+  covered only some of the combinations. A layout the image cannot hold is
+  an error; `upload_nv12` panicked for a 10-bit or 4:4:4 image. The uploads
+  wait until the frames that read the image are done with it.
+- **Breaking:** `InputImage::new` no longer takes a `Codec`, which it did not
+  use. `InputImage::for_encoder` makes one for an encoder's frames.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and

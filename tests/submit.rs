@@ -10,7 +10,7 @@ use ash::vk;
 use pixelforge::{
     Codec, ColorSpec, ConversionPreference, EncodeBitDepth, EncodeConfig, Encoder, Frame, Handoff,
     InputFormat, InputImage, PixelFormat, RgbSource, Source, SourceImage, VideoContext,
-    VideoContextBuilder,
+    VideoContextBuilder, YuvLayout,
 };
 
 const WIDTH: u32 = 320;
@@ -29,14 +29,7 @@ fn context() -> Result<VideoContext, Box<dyn std::error::Error>> {
 fn an_input_slot_is_valid_until_the_next_submission() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
     let mut encoder = Encoder::new(context.clone(), EncodeConfig::h264(WIDTH, HEIGHT))?;
-    let input = InputImage::new(
-        context.clone(),
-        Codec::H264,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let input = InputImage::for_encoder(&encoder)?;
 
     let stale = encoder.input_slot()?;
     let packet = encoder.submit(Frame::image(input.source()))?;
@@ -61,7 +54,6 @@ fn a_source_image_needs_pixels() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
     let input = InputImage::new(
         context.clone(),
-        Codec::H264,
         WIDTH,
         HEIGHT,
         EncodeBitDepth::Eight,
@@ -111,14 +103,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
         "repeated a frame that was never there"
     );
 
-    let mut input = InputImage::new(
-        context.clone(),
-        Codec::H264,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let mut input = InputImage::for_encoder(&encoder)?;
     let luma_levels = [40u8, 120, 200];
     let plane = (WIDTH * HEIGHT) as usize;
     let mut stream = Vec::new();
@@ -126,7 +111,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
     for level in luma_levels {
         let mut yuv = vec![128u8; plane * 3 / 2];
         yuv[..plane].fill(level);
-        input.upload_yuv420(&yuv)?;
+        input.upload(YuvLayout::I420, &yuv)?;
         let packet = pollster::block_on(encoder.submit(Frame::image(input.source()))?)?;
         keys.push(packet.is_key_frame);
         stream.extend(packet.data);
@@ -134,7 +119,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
     // The source changes, and the repeats must not see it.
     let mut yuv = vec![128u8; plane * 3 / 2];
     yuv[..plane].fill(10);
-    input.upload_yuv420(&yuv)?;
+    input.upload(YuvLayout::I420, &yuv)?;
     for _ in 0..2 {
         encoder.request_idr();
         let packet = pollster::block_on(encoder.repeat()?)?;

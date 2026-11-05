@@ -17,9 +17,9 @@ use ash::vk::TaggedStructure;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::external::drm_format;
 use pixelforge::{
-    Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufPlane, EncodeBitDepth,
-    EncodeConfig, Encoder, ExternalImage, Frame, Handoff, InputFormat, InputImage, PixelFormat,
-    RateControl, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufPlane, EncodeConfig, Encoder,
+    ExternalImage, Frame, Handoff, InputFormat, InputImage, RateControl, RgbSource, Source,
+    SourceImage, VideoContext, VideoContextBuilder, YuvLayout,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -427,19 +427,11 @@ fn encode_reference(
     config: EncodeConfig,
     frames: &[Vec<u8>],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (w, h) = (config.dimensions.width, config.dimensions.height);
     let mut encoder = Encoder::new(context.clone(), config.clone())?;
-    let mut input = InputImage::new(
-        context.clone(),
-        config.codec,
-        w,
-        h,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let mut input = InputImage::for_encoder(&encoder)?;
     let mut stream = Vec::new();
     for frame in frames {
-        input.upload_nv12(frame)?;
+        input.upload(YuvLayout::Nv12, frame)?;
         stream.extend(pollster::block_on(encoder.submit(Frame::image(input.source()))?)?.data);
     }
     Ok(stream)
