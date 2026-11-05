@@ -7,7 +7,7 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
-use crate::decoder::common::{DecoderCommon, SessionPlan, query_decode_caps};
+use crate::decoder::common::DecoderCommon;
 use crate::decoder::frames::{DecodedPicture, ReorderBuffer};
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
@@ -15,10 +15,10 @@ use crate::decoder::h264::parser::{
 };
 use crate::decoder::h264::record::{DecodeRecord, LinkParams};
 use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
+use crate::decoder::plan::StreamNeeds;
 use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
-use crate::video::{align_up, get_video_format, query_supported_video_formats};
 use crate::vulkan::VideoContext;
 
 /// H.264 decoder.
@@ -259,209 +259,35 @@ impl H264Decoder {
             .chroma_bit_depth(depth_flag)
             .push(&mut profile);
 
-        // Query capabilities for this exact profile. The chain borrows the
-        // codec caps structs, so scope it and copy the results out.
-        let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
-        let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
-        let (
-            max_coded_extent,
-            picture_access_granularity,
-            max_dpb_slots,
-            max_active_reference_pictures,
-            cap_flags,
-            std_header_version,
-            min_bitstream_buffer_offset_alignment,
-            min_bitstream_buffer_size_alignment,
-        ) = {
-            let mut caps = vk::VideoCapabilitiesKHR::default()
-                .push(&mut h264_caps)
-                .push(&mut decode_caps);
-            query_decode_caps(&self.common.context, &profile_info, &mut caps)?;
-            (
-                caps.max_coded_extent,
-                caps.picture_access_granularity,
-                caps.max_dpb_slots,
-                caps.max_active_reference_pictures,
-                caps.flags,
-                caps.std_header_version,
-                caps.min_bitstream_buffer_offset_alignment,
-                caps.min_bitstream_buffer_size_alignment,
-            )
-        };
-        let decode_flags = decode_caps.flags;
-
-        let coded_width = align_up(sps.coded_width(), picture_access_granularity.width.max(1));
-        let coded_height = align_up(sps.coded_height(), picture_access_granularity.height.max(1));
-        if coded_width > max_coded_extent.width || coded_height > max_coded_extent.height {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.264 decode: stream is {}x{}, device maximum is {}x{}",
-                coded_width, coded_height, max_coded_extent.width, max_coded_extent.height
-            )));
-        }
-
-        self.common.bitstream_offset_alignment = min_bitstream_buffer_offset_alignment.max(1);
-        self.common.bitstream_size_alignment = min_bitstream_buffer_size_alignment.max(1);
-
-        let coincide =
-            decode_flags.contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE);
-        debug!("H.264 decode capability flags: {:?}", decode_flags);
-        let use_layered_dpb =
-            !cap_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
-
         // The stream needs max_num_ref_frames references plus the current
-        // picture. On top of that come the spare slots, which is what lets a
-        // picture stay pinned in place past the decode that produced it instead
-        // of being copied out: `reorder_depth` of them for pictures waiting
-        // their turn in display order, and `output_depth` for frames the caller
-        // is holding. The device caps bound the total.
-        let required = (sps.max_num_ref_frames as u32 + 1).max(2);
-        let slot_limit = max_dpb_slots.min(crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32);
-        if required > slot_limit {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.264 decode: stream needs {} DPB slots, device supports {}",
-                required, max_dpb_slots
-            )));
-        }
-        // Reorder depth comes from the stream (VUI); without it, bound by the
-        // reference count, which is never smaller than the reorder depth in
-        // practice.
+        // picture. Reorder depth comes from the stream (VUI); without it, bound
+        // by the reference count, which is never smaller than the reorder depth
+        // in practice.
         let reorder_depth = sps
             .max_num_reorder_frames
             .map(|v| v as usize)
             .unwrap_or(sps.max_num_ref_frames as usize);
-        // Spare slots only buy something when pictures can be pinned. Without
-        // that they are handed out as copies, which needs no DPB slot at all,
-        // so asking for spares would just reserve memory nothing uses.
-        let pinnable = coincide && self.common.context.has_unified_image_layouts();
-        let wanted_spare = if pinnable {
-            reorder_depth + self.output_depth
-        } else {
-            0
-        };
-        let slot_count = (required + wanted_spare as u32).min(slot_limit) as usize;
-        let spare_slots = slot_count - required as usize;
-        if spare_slots < wanted_spare {
-            debug!(
-                "H.264 decode: {} of {} spare DPB slots available \
-                 (reorder depth {} plus {} output slots; the stream's references \
-                 need {} of the device's {}); pictures beyond that are copied",
-                spare_slots,
-                wanted_spare,
-                reorder_depth,
-                self.output_depth,
-                required,
-                max_dpb_slots
-            );
-        }
-
-        // Only the reference pictures are ever active at once: the current
-        // picture and the output reservation are not references.
-        let max_active_references = (required - 1).min(max_active_reference_pictures);
-        if max_active_references < required - 1 {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.264 decode: stream needs {} active reference pictures, device supports {}",
-                required - 1,
-                max_active_reference_pictures
-            )));
-        }
-
-        // Pick a picture format the device actually supports for decode.
-        //
-        // Ask for SAMPLED as well: a coincident DPB image is what the caller
-        // receives, and SAMPLED is what lets them read it in a shader instead
-        // of copying it out first. Fall back to the plain usage if the device
-        // reports no sampleable format, which costs the caller a copy but keeps
-        // decoding working. With a distinct output image nothing asks, since
-        // those pictures reach the caller as pool copies, which are sampleable
-        // whatever the device says about video images.
-        let base_usage = if coincide {
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-                | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-                | vk::ImageUsageFlags::TRANSFER_SRC
-        } else {
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-        };
-        let sampled_usage = base_usage | vk::ImageUsageFlags::SAMPLED;
-        let sampled_formats = if coincide {
-            query_supported_video_formats(&self.common.context, &profile_info, sampled_usage)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let (dpb_usage, sampleable, supported) = if sampled_formats.is_empty() {
-            let formats =
-                query_supported_video_formats(&self.common.context, &profile_info, base_usage)?;
-            (base_usage, false, formats)
-        } else {
-            (sampled_usage, true, sampled_formats)
-        };
-        let preferred = get_video_format(chroma_format, bit_depth);
-        let chosen = supported
-            .iter()
-            .find(|f| f.format == preferred)
-            .or_else(|| supported.first())
-            .copied()
-            .ok_or_else(|| {
-                PixelForgeError::NoSuitableDevice(
-                    "H.264 decode: no supported picture format for this profile".to_string(),
-                )
-            })?;
-        let picture_format = chosen.format;
-
-        // MUTABLE_FORMAT lets a consumer view the picture's planes separately,
-        // which is the only way to read a multi-planar image without a
-        // sampler-YCbCr conversion, and the only way at all for a renderer
-        // whose shaders come from a toolchain that cannot express one (naga and
-        // therefore wgpu, among others). It is opportunistic: the driver
-        // enumerates which creation flags it accepts for this profile, format
-        // and usage, and DPB-only images on both RADV and ANV accept none.
-        //
-        // Naming the plane formats keeps a driver from having to assume the
-        // image might be reinterpreted as anything, which is what would
-        // otherwise cost it compression.
-        let plane_views = chosen
-            .create_flags
-            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT);
-        let image_flags = if plane_views {
-            vk::ImageCreateFlags::MUTABLE_FORMAT
-        } else {
-            vk::ImageCreateFlags::empty()
-        };
-        let view_formats: Vec<vk::Format> = if plane_views {
-            let mut list = vec![picture_format];
-            list.extend(crate::video::plane_view_formats(picture_format));
-            list
-        } else {
-            Vec::new()
-        };
-
-        // Hand the shared layer everything it needs to build the session; it
-        // owns the Vulkan objects, this module owns only the H.264 reasoning
-        // that produced these numbers.
-        let plan = SessionPlan {
-            coded_width,
-            coded_height,
-            picture_format,
-            bit_depth,
+        let needs = StreamNeeds {
+            codec: "H.264",
+            width: sps.coded_width(),
+            height: sps.coded_height(),
             chroma_format,
-            slot_count,
-            spare_slots,
-            max_active_references,
-            coincide,
-            pinnable,
-            sampleable,
-            plane_views,
-            image_flags,
-            view_formats,
-            use_layered_dpb,
-            dpb_usage,
+            bit_depth,
+            references: sps.max_num_ref_frames as u32,
+            active_references: sps.max_num_ref_frames as u32,
+            slot_limit: crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32,
+            reorder_depth,
+            output_depth: self.output_depth,
         };
-        self.common.create_session(
-            &plan,
-            &profile_info,
-            &std_header_version,
-            |common, session| Self::build_session_params(common, session, sps, pps),
-        )?;
+        let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
+        let plan = self
+            .common
+            .plan_session(&profile_info, &mut h264_caps, &needs)?;
+        let slot_count = plan.slot_count;
+        self.common
+            .create_session(&plan, &profile_info, |common, session| {
+                Self::build_session_params(common, session, sps, pps)
+            })?;
 
         self.active_sps = Some(sps.clone());
         self.active_pps = Some(pps.clone());
@@ -469,23 +295,6 @@ impl H264Decoder {
         let pins = self.common.session()?.slot_pins.clone();
         self.dpb = Some(DecodeDpb::new(slot_count, pins));
 
-        debug!(
-            "H.264 decode session: {}x{} {:?}, {} DPB slots ({} spare), \
-             layered={}, coincide={}, pinnable={}, sampleable={}, \
-             plane_views={}, bitstream alignment {}/{} (offset/size)",
-            coded_width,
-            coded_height,
-            picture_format,
-            slot_count,
-            spare_slots,
-            use_layered_dpb,
-            coincide,
-            pinnable,
-            sampleable,
-            plane_views,
-            self.common.bitstream_offset_alignment,
-            self.common.bitstream_size_alignment
-        );
         Ok(())
     }
 

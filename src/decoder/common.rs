@@ -25,6 +25,7 @@ use crate::decoder::DecodedFrame;
 use crate::decoder::annexb::START_CODE;
 use crate::decoder::frames::SlotPins;
 use crate::decoder::pipeline::DecodePipeline;
+use crate::decoder::plan::SessionPlan;
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
@@ -32,75 +33,6 @@ use crate::video::{
     create_video_image,
 };
 use crate::vulkan::VideoContext;
-
-/// Query decode capabilities for a profile.
-///
-/// `caps` is supplied by the caller already chained with the codec-specific
-/// capability struct, since only the codec knows which one applies.
-pub(crate) fn query_decode_caps(
-    context: &VideoContext,
-    profile_info: &vk::VideoProfileInfoKHR,
-    caps: &mut vk::VideoCapabilitiesKHR,
-) -> Result<()> {
-    let video_queue_instance =
-        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
-    let result = unsafe {
-        (video_queue_instance
-            .fp()
-            .get_physical_device_video_capabilities_khr)(
-            context.physical_device(),
-            profile_info,
-            caps,
-        )
-    };
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::NoSuitableDevice(format!(
-            "decode profile not supported: {:?}",
-            result
-        )));
-    }
-    Ok(())
-}
-
-/// What a codec decided the session should look like.
-///
-/// The codec derives these from its own parameter sets and the device caps; the
-/// generic layer turns them into Vulkan objects.
-pub(crate) struct SessionPlan {
-    /// Coded dimensions, already aligned to the device's picture granularity.
-    pub coded_width: u32,
-    pub coded_height: u32,
-    pub picture_format: vk::Format,
-    pub bit_depth: BitDepth,
-    pub chroma_format: ChromaFormat,
-    /// DPB slots: references, the picture being decoded, and `spare_slots`.
-    pub slot_count: usize,
-    /// How many of `slot_count` are spare capacity for pictures pinned past the
-    /// decode that produced them: those held for display-order reordering, and
-    /// those handed to the caller. Zero means every emitted picture has to be
-    /// copied out instead of pinned in place.
-    pub spare_slots: usize,
-    /// References the driver may use for a single picture, which is
-    /// `slot_count` minus the current picture and the output reservation.
-    pub max_active_references: u32,
-    /// Driver decodes straight into the DPB image (`DPB_AND_OUTPUT_COINCIDE`).
-    pub coincide: bool,
-    /// A decoded picture may be handed to the caller in place, pinned in its
-    /// DPB slot, rather than copied out. See [`DecodeSession::pinnable`].
-    pub pinnable: bool,
-    /// `dpb_usage` includes `SAMPLED`, so handed-out frames can be sampled.
-    pub sampleable: bool,
-    /// Picture images are created with `MUTABLE_FORMAT`, so a consumer can view
-    /// their planes separately. See [`DecodeSession::plane_views`].
-    pub plane_views: bool,
-    /// Creation flags for picture images, from what the driver reported.
-    pub image_flags: vk::ImageCreateFlags,
-    /// Formats views of a picture image may use. Empty unless `plane_views`.
-    pub view_formats: Vec<vk::Format>,
-    /// One layered DPB image rather than one image per slot.
-    pub use_layered_dpb: bool,
-    pub dpb_usage: vk::ImageUsageFlags,
-}
 
 /// One DPB image and everything that lives and dies with it.
 ///
@@ -375,10 +307,11 @@ impl DecoderCommon {
         &mut self,
         plan: &SessionPlan,
         profile_info: &vk::VideoProfileInfoKHR,
-        std_header_version: &vk::ExtensionProperties,
         make_params: impl FnOnce(&Self, vk::VideoSessionKHR) -> Result<vk::VideoSessionParametersKHR>,
     ) -> Result<()> {
         self.destroy_session();
+        self.bitstream_offset_alignment = plan.bitstream_offset_alignment;
+        self.bitstream_size_alignment = plan.bitstream_size_alignment;
 
         let session_create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(self.decode_queue_family)
@@ -392,7 +325,7 @@ impl DecoderCommon {
             .reference_picture_format(plan.picture_format)
             .max_dpb_slots(plan.slot_count as u32)
             .max_active_reference_pictures(plan.max_active_references)
-            .std_header_version(std_header_version);
+            .std_header_version(&plan.std_header_version);
 
         let session = unsafe {
             self.video_queue_fn
@@ -491,6 +424,25 @@ impl DecoderCommon {
             plane_views: plan.plane_views,
             output_image,
         });
+
+        tracing::debug!(
+            "{} decode session: {}x{} {:?}, {} DPB slots ({} spare), \
+             layered={}, coincide={}, pinnable={}, sampleable={}, \
+             plane_views={}, bitstream alignment {}/{} (offset/size)",
+            plan.codec,
+            plan.coded_width,
+            plan.coded_height,
+            plan.picture_format,
+            plan.slot_count,
+            plan.spare_slots,
+            plan.use_layered_dpb,
+            plan.coincide,
+            plan.pinnable,
+            plan.sampleable,
+            plan.plane_views,
+            plan.bitstream_offset_alignment,
+            plan.bitstream_size_alignment
+        );
         Ok(())
     }
 

@@ -48,6 +48,8 @@ pub(crate) mod frames;
 /// H.264 decoding.
 pub(crate) mod h264;
 pub(crate) mod pipeline;
+/// Turning what a stream needs into a session plan.
+pub(crate) mod plan;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;
 
