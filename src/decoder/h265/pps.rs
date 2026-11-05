@@ -55,7 +55,7 @@ pub(crate) struct Pps {
     pub num_tile_rows_minus1: u8,
     pub uniform_spacing_flag: bool,
     /// `column_width_minus1[i]`, coded only without uniform spacing; see
-    /// [`Pps::tile_column_widths`] for the widths either way.
+    /// `Pps::tile_column_widths` for the widths either way.
     pub column_width_minus1: Vec<u16>,
     /// `row_height_minus1[i]`, coded only without uniform spacing.
     pub row_height_minus1: Vec<u16>,
@@ -82,6 +82,8 @@ pub(crate) struct Pps {
     pub range_extension: PpsRangeExtension,
 }
 
+// The driver takes the coded tile syntax; the derived sizes are for tests.
+#[cfg(test)]
 impl Pps {
     /// Tile column widths in CTBs (equation 6-3), for a picture
     /// `pic_width_in_ctbs` wide. One column when tiles are off.
@@ -94,20 +96,10 @@ impl Pps {
             pic_width_in_ctbs,
         )
     }
-
-    /// Tile row heights in CTBs (equation 6-4).
-    pub fn tile_row_heights(&self, pic_height_in_ctbs: u32) -> Vec<u32> {
-        tile_sizes(
-            self.tiles_enabled_flag,
-            self.uniform_spacing_flag,
-            self.num_tile_rows_minus1 as u32,
-            &self.row_height_minus1,
-            pic_height_in_ctbs,
-        )
-    }
 }
 
 /// Equations 6-3 and 6-4, which have the same shape for columns and rows.
+#[cfg(test)]
 fn tile_sizes(
     tiles: bool,
     uniform: bool,

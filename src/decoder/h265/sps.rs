@@ -289,7 +289,9 @@ impl Sps {
     }
 
     /// `SpsMaxLatencyPictures` of the highest sub-layer, or `None` when
-    /// `sps_max_latency_increase_plus1` is 0 (no limit).
+    /// `sps_max_latency_increase_plus1` is 0 (no limit). The output process
+    /// uses only the reorder depth, so this is for tests.
+    #[cfg(test)]
     pub fn max_latency_pictures(&self) -> Option<usize> {
         let tid = self.highest_tid();
         let plus1 = self.dec_pic_buf_mgr.max_latency_increase_plus1[tid] as usize;

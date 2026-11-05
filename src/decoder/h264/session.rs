@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::decoder::DecodeConfig;
 use crate::decoder::annexb::START_CODE;
 use crate::decoder::common::DecoderCommon;
-use crate::decoder::driver::CodecDecoder;
+use crate::decoder::driver::{CodecDecoder, Decoded};
 use crate::decoder::frames::DecodedPicture;
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
 use crate::decoder::h264::parser::{
@@ -381,12 +381,7 @@ impl H264Decoder {
     }
 
     /// Record and submit the decode of a single picture, without waiting for it.
-    fn decode_picture(
-        &mut self,
-        picture: &Picture,
-        sps: &Sps,
-        pts: u64,
-    ) -> Result<Option<DecodedPicture>> {
+    fn decode_picture(&mut self, picture: &Picture, sps: &Sps, pts: u64) -> Result<DecodedPicture> {
         // --- Host-side bookkeeping: POC, slot, reference set ---
         let state = {
             let dpb = self.dpb.as_mut().expect("activated above");
@@ -440,7 +435,7 @@ impl H264Decoder {
             .expect("active")
             .end_picture(slot, &state, sps);
 
-        Ok(Some(frame))
+        Ok(frame)
     }
 
     /// Record `vkCmdBeginVideoCoding` / `vkCmdDecodeVideo` / `vkCmdEndVideoCoding`.
@@ -569,7 +564,7 @@ impl CodecDecoder for H264Decoder {
         picture.nal_type == NalType::IdrSlice
     }
 
-    fn decode_unit(&mut self, picture: &Picture<'_>, pts: u64) -> Result<Option<DecodedPicture>> {
+    fn decode_unit(&mut self, picture: &Picture<'_>, pts: u64) -> Result<Decoded> {
         // The parameter sets this picture was grouped under, not whatever
         // currently sits at those ids: a later SPS in the same chunk must not
         // reach back and change how this picture is decoded.
@@ -577,7 +572,7 @@ impl CodecDecoder for H264Decoder {
 
         // (Re)build the session if the stream's geometry or ids changed.
         self.activate(&sps, &pps)?;
-        self.decode_picture(picture, &sps, pts)
+        self.decode_picture(picture, &sps, pts).map(Decoded::Shown)
     }
 
     fn reorder_depth(&self) -> usize {

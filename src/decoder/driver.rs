@@ -46,14 +46,23 @@ pub(crate) trait CodecDecoder: Send {
     fn is_keyframe(unit: &Self::Unit<'_>) -> bool;
 
     /// Decode one coded picture.
-    ///
-    /// Returns the picture to output, or `None` for one that is decoded but
-    /// not shown.
-    fn decode_unit(&mut self, unit: &Self::Unit<'_>, pts: u64) -> Result<Option<DecodedPicture>>;
+    fn decode_unit(&mut self, unit: &Self::Unit<'_>, pts: u64) -> Result<Decoded>;
 
     /// How many pictures the active stream may hold back for display-order
     /// reordering.
     fn reorder_depth(&self) -> usize;
+}
+
+/// What [`CodecDecoder::decode_unit`] did with a coded picture.
+pub(crate) enum Decoded {
+    /// Decoded, and to be output.
+    Shown(DecodedPicture),
+    /// Decoded, but not output: an AV1 frame with `show_frame` 0, or an H.265
+    /// picture with `pic_output_flag` 0.
+    Hidden,
+    /// Not decoded, and that is normal: an H.265 RASL picture after the CRA
+    /// that started decoding, which references pictures from before it.
+    Skipped,
 }
 
 /// Drives a [`CodecDecoder`].
@@ -155,20 +164,20 @@ impl<C: CodecDecoder> StreamDecoder<C> {
                 continue;
             }
 
-            let picture = self.codec.decode_unit(&unit, pts)?;
+            let ready = match self.codec.decode_unit(&unit, pts)? {
+                Decoded::Shown(picture) => {
+                    let depth = self.codec.reorder_depth();
+                    self.reorder
+                        .push(self.codec.common_mut(), &picture, depth)?
+                }
+                Decoded::Hidden => Vec::new(),
+                Decoded::Skipped => continue,
+            };
             decoded_any = true;
             // A decoded keyframe re-establishes a valid decode point.
             if is_keyframe {
                 self.awaiting_keyframe = false;
             }
-            let ready = match picture {
-                Some(picture) => {
-                    let depth = self.codec.reorder_depth();
-                    self.reorder
-                        .push(self.codec.common_mut(), &picture, depth)?
-                }
-                None => Vec::new(),
-            };
             // The picture's submissions are complete as far as recording goes;
             // hand its slot and frames to the completion thread and move on to
             // the next slot.
