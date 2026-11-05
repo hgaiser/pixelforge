@@ -17,8 +17,8 @@
 //!   from the same thread.
 
 use ash::vk;
-use pixelforge::decoder::{DecodedFrame, Decoder, FramePoll};
-use pixelforge::encoder::BitDepth;
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder, FramePoll};
+use pixelforge::encoder::{BitDepth, Codec};
 use pixelforge::vulkan::VideoContext;
 use std::fs::File;
 use std::io::Write;
@@ -26,20 +26,81 @@ use std::io::Write;
 /// Bytes handed to the decoder per call, standing in for a network read.
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
-/// Drive `decoder` over `stream`, calling `on_frame` for every frame it emits.
+/// A coded stream read from a file.
+pub enum Input {
+    /// A raw stream that the decoder frames itself: Annex B for H.264 and
+    /// H.265, low-overhead OBUs for AV1.
+    ByteStream(Vec<u8>),
+    /// Whole coded frames, as a container gives them (IVF).
+    Frames(Vec<Vec<u8>>),
+}
+
+/// Read `path`, and pick the codec from its extension: `.264`/`.h264`,
+/// `.265`/`.h265`/`.hevc`, `.obu`/`.av1` or `.ivf` (AV1 in IVF).
+pub fn open_input(path: &str) -> Result<(Codec, Input), Box<dyn std::error::Error>> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let data = std::fs::read(path)?;
+    Ok(match extension.as_str() {
+        "264" | "h264" => (Codec::H264, Input::ByteStream(data)),
+        "265" | "h265" | "hevc" => (Codec::H265, Input::ByteStream(data)),
+        "obu" | "av1" => (Codec::AV1, Input::ByteStream(data)),
+        "ivf" => (Codec::AV1, Input::Frames(ivf_frames(&data)?)),
+        other => return Err(format!("unknown stream extension {other:?}").into()),
+    })
+}
+
+/// The frames of an IVF file: a 32-byte file header, then each frame behind a
+/// 12-byte header holding its size and timestamp.
+fn ivf_frames(data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    if data.len() < 32 || &data[..4] != b"DKIF" {
+        return Err("not an IVF file".into());
+    }
+    let header_len = u16::from_le_bytes([data[6], data[7]]) as usize;
+    let mut frames = Vec::new();
+    let mut pos = header_len;
+    while pos + 12 <= data.len() {
+        let size = u32::from_le_bytes(data[pos..pos + 4].try_into()?) as usize;
+        let start = pos + 12;
+        let frame = data.get(start..start + size).ok_or("truncated IVF frame")?;
+        frames.push(frame.to_vec());
+        pos = start + size;
+    }
+    Ok(frames)
+}
+
+/// The decode configuration `input` needs: byte-stream framing for a raw
+/// stream, frame-aligned for frames from a container.
+pub fn decode_config(codec: Codec, input: &Input) -> DecodeConfig {
+    match input {
+        Input::ByteStream(_) => DecodeConfig::new(codec).with_byte_stream(),
+        Input::Frames(_) => DecodeConfig::new(codec),
+    }
+}
+
+/// Drive `decoder` over `input`, calling `on_frame` for every frame it emits.
 ///
-/// Frames are polled after each chunk and again after `finish`, so the
-/// in-stream and end-of-stream paths share one callback. `NeedsKeyframe` is not
+/// A raw stream is fed in chunks of [`CHUNK_SIZE`], standing in for network
+/// reads; frames from a container are fed one per call. Frames are polled
+/// after each call and again after `finish`, so the in-stream and
+/// end-of-stream paths share one callback. `NeedsKeyframe` is not
 /// special-cased: polling then is a no-op when nothing is ready.
-pub fn decode_stream<F>(
+pub fn decode_input<F>(
     decoder: &mut Decoder,
-    stream: &[u8],
+    input: &Input,
     mut on_frame: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     F: FnMut(DecodedFrame) -> Result<(), Box<dyn std::error::Error>>,
 {
-    for (i, chunk) in stream.chunks(CHUNK_SIZE).enumerate() {
+    let chunks: Box<dyn Iterator<Item = &[u8]>> = match input {
+        Input::ByteStream(stream) => Box::new(stream.chunks(CHUNK_SIZE)),
+        Input::Frames(frames) => Box::new(frames.iter().map(Vec::as_slice)),
+    };
+    for (i, chunk) in chunks.enumerate() {
         decoder.decode(chunk, i as u64)?;
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             on_frame(frame)?;

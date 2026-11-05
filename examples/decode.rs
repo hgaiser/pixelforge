@@ -1,4 +1,7 @@
-//! Decode an H.264 Annex B stream to raw YUV.
+//! Decode an H.264, H.265 or AV1 stream to raw YUV.
+//!
+//! The codec comes from the file extension: `.264`, `.265`/`.hevc`, `.obu`
+//! (AV1 OBUs) or `.ivf` (AV1 in IVF).
 //!
 //! Usage:
 //!   cargo run --example decode -- input.264 [output.yuv]
@@ -13,10 +16,9 @@ use std::fs::File;
 
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{Readback, decode_input, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
-use pixelforge::encoder::Codec;
+use pixelforge::decoder::Decoder;
 use pixelforge::vulkan::VideoContextBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,10 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = std::env::args().skip(1);
     let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: decode <input.264> [output.yuv]");
+        eprintln!("usage: decode <input.264|.265|.obu|.ivf> [output.yuv]");
         std::process::exit(1);
     });
     let output_path = args.next();
+    let (codec, input) = common::open_input(&input_path)?;
 
     // PIXELFORGE_VALIDATION=1 enables the Vulkan validation layers, which
     // report the exact offending call for any API misuse.
@@ -36,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hardware that would otherwise take the zero-copy path.
     let mut builder = VideoContextBuilder::new()
         .app_name("pixelforge-decode")
-        .require_decode(Codec::H264)
+        .require_decode(codec)
         .enable_validation(validation);
     if std::env::var("PIXELFORGE_NO_UNIFIED_LAYOUTS").is_ok() {
         builder = builder.without_unified_image_layouts();
@@ -59,9 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sized for one frame per call, so raise it: past the budget the decoder
     // copies pictures out instead of handing over its own images, which is
     // still correct but gives up the zero-copy path.
-    let config = DecodeConfig::new(Codec::H264)
-        .with_byte_stream()
-        .with_output_depth(8);
+    let config = common::decode_config(codec, &input).with_output_depth(8);
     let mut output = output_path.as_ref().map(File::create).transpose()?;
     // Readback lives in the consumer, not in pixelforge: the decoder hands over
     // a GPU image and a renderer would sample it in place. See examples/common.
@@ -71,7 +72,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .then(|| Readback::new(&context))
         .transpose()?;
     let mut decoder = Decoder::new(context, config)?;
-    let stream = std::fs::read(&input_path)?;
 
     let start = std::time::Instant::now();
     let mut frame_count = 0usize;
@@ -83,8 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // flight, not that there are none, so they are collected on a later pass.
     // A renderer would instead `split()` the decoder and await `next_frame` on
     // its own thread, which is what the `Decoder::split` docs show.
-    // `common::decode_stream` owns that loop.
-    decode_stream(&mut decoder, &stream, |frame| {
+    // `common::decode_input` owns that loop.
+    decode_input(&mut decoder, &input, |frame| {
         write_nv12(&frame, &mut readback, &mut output)?;
         // A rebuilt session means a new set of images, so anything caching
         // per-image state has to notice. Reporting it here is what makes the
