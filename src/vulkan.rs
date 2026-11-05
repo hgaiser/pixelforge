@@ -7,7 +7,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
-mod encode_device;
+mod adopt;
 mod queues;
 use queues::QueueOverrides;
 pub use queues::{DeviceQueue, QueueRoles};
@@ -169,59 +169,13 @@ impl VideoContextBuilder {
         VideoContext::new(self)
     }
 
-    /// What a caller-created device must provide for pixelforge to decode on it.
-    ///
-    /// Use this when you already have your own Vulkan device (e.g. a renderer's)
-    /// and want to decode into images that device can use directly, without the
-    /// cross-device copy a separate context would require.
-    pub fn decode_device_requirements(
-        &self,
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> Result<DeviceRequirements> {
-        let families = find_decode_queue_families(
-            entry,
-            instance,
-            physical_device,
-            &self.required_decode_codecs,
-        )?;
-        let unified_image_layouts = supports_unified_image_layouts(instance, physical_device);
-        let mut extensions = decode_extension_names(&self.required_decode_codecs);
-        if unified_image_layouts {
-            extensions.push(ash::khr::unified_image_layouts::NAME);
-        }
-        let queues = QueueRoles {
-            encode: None,
-            decode: Some(families.decode),
-            transfer: families.transfer,
-            compute: families.compute,
-        };
-        Ok(DeviceRequirements {
-            queue_families: queues.unique_families(),
-            queues,
-            extensions,
-            features: DeviceFeatures {
-                synchronization2: true,
-                timeline_semaphore: true,
-                ..DeviceFeatures::default()
-            },
-            unified_image_layouts,
-            internally_synchronized_queues: supports_internally_synchronized_queues(
-                instance,
-                physical_device,
-                &DeviceExtensions::of(instance, physical_device),
-            ),
-        })
-    }
-
     /// Declare that the adopted device was created with
     /// `VK_KHR_unified_image_layouts` enabled, including both
     /// `unifiedImageLayouts` and `unifiedImageLayoutsVideo`.
     ///
-    /// Only meaningful for [`Self::build_from_existing_decode`]: a context that
-    /// creates its own device enables the extension itself when the hardware
-    /// has it. Vulkan offers no way to ask a device which features were enabled
+    /// Only meaningful for [`Self::build_from_existing`] with a decode codec:
+    /// a context that creates its own device enables the extension itself when
+    /// the hardware has it. Vulkan offers no way to ask a device which features were enabled
     /// on it, so this is a promise pixelforge cannot verify. What it *can*
     /// check, and does, is that the physical device supports both bits; a
     /// declaration on hardware that cannot support them is a clean error rather
@@ -249,41 +203,12 @@ impl VideoContextBuilder {
         self.unified_image_layouts = Some(false);
         self
     }
-
-    /// Adopt a caller-created device for decoding, rather than creating one.
-    ///
-    /// The device must have been created with the queue families and extensions
-    /// reported by [`Self::decode_device_requirements`] for the same
-    /// `physical_device`, and with the `synchronization2` and
-    /// `timelineSemaphore` features enabled (the decoder orders its pipelined
-    /// submissions with timeline semaphores). The
-    /// resulting context **borrows** `instance` and `device`: dropping it frees
-    /// neither, so the caller must keep both alive for at least as long as the
-    /// context and anything decoded with it.
-    pub fn build_from_existing_decode(
-        self,
-        entry: ash::Entry,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: ash::Device,
-    ) -> Result<VideoContext> {
-        VideoContext::from_existing_decode(
-            self.required_decode_codecs,
-            self.unified_image_layouts.unwrap_or(false),
-            self.queues,
-            entry,
-            instance,
-            physical_device,
-            device,
-        )
-    }
 }
 
 /// Queue families, extensions and features a caller's device must provide for
 /// pixelforge to work on it.
 ///
-/// Returned by [`VideoContextBuilder::decode_device_requirements`] and
-/// [`VideoContextBuilder::encode_device_requirements`]. Enable every extension
+/// Returned by [`VideoContextBuilder::device_requirements`]. Enable every extension
 /// in [`Self::extensions`] and every feature set in [`Self::features`]:
 /// pixelforge assumes all of them are on, since Vulkan cannot be asked
 /// afterwards which were.
@@ -1489,114 +1414,6 @@ impl VideoContext {
                 owns_device: true,
                 retired_semaphores: Default::default(),
                 debug_messenger,
-            }),
-        })
-    }
-
-    /// Adopt a caller-created device for decoding.
-    ///
-    /// See [`VideoContextBuilder::build_from_existing_decode`], the public entry
-    /// point. The returned context borrows `instance` and `device` and destroys
-    /// neither on drop.
-    fn from_existing_decode(
-        required_decode_codecs: Vec<Codec>,
-        declared_unified_image_layouts: bool,
-        queue_overrides: QueueOverrides,
-        entry: ash::Entry,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: ash::Device,
-    ) -> Result<VideoContext> {
-        let families = find_decode_queue_families(
-            &entry,
-            &instance,
-            physical_device,
-            &required_decode_codecs,
-        )?;
-
-        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        let decode = queues::resolve(
-            &instance,
-            physical_device,
-            "decode",
-            queue_overrides.decode,
-            families.decode,
-            vk::QueueFlags::VIDEO_DECODE_KHR,
-        )?;
-        let transfer = queues::resolve(
-            &instance,
-            physical_device,
-            "transfer",
-            queue_overrides.transfer,
-            families.transfer,
-            vk::QueueFlags::TRANSFER,
-        )?;
-        let compute = queues::resolve(
-            &instance,
-            physical_device,
-            "compute",
-            queue_overrides.compute,
-            families.compute,
-            vk::QueueFlags::COMPUTE,
-        )?;
-
-        let video_decode_queue = unsafe { device.get_device_queue(decode.family, decode.index) };
-        let transfer_queue = unsafe { device.get_device_queue(transfer.family, transfer.index) };
-        let compute_queue = unsafe { device.get_device_queue(compute.family, compute.index) };
-
-        let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
-
-        // The declaration is a promise about what the caller enabled, which
-        // cannot be verified. That the hardware could support it can be, so a
-        // declaration that is impossible fails here rather than in the driver.
-        if declared_unified_image_layouts
-            && !supports_unified_image_layouts(&instance, physical_device)
-        {
-            return Err(PixelForgeError::NoSuitableDevice(
-                "unified image layouts were declared, but this device does not support \
-                 VK_KHR_unified_image_layouts with both unifiedImageLayouts and \
-                 unifiedImageLayoutsVideo"
-                    .to_string(),
-            ));
-        }
-
-        info!(
-            "Adopted caller device for decode: decode queue {:?}, transfer queue {:?}, compute queue {:?}",
-            decode, transfer, compute
-        );
-
-        Ok(VideoContext {
-            inner: std::sync::Arc::new(VideoContextInner {
-                entry,
-                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
-                timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
-                instance,
-                physical_device,
-                device,
-                video_encode_queue_family: None,
-                video_encode_timestamp_valid_bits: 0u32,
-                video_encode_queue: None,
-                video_decode_queue_family: Some(decode.family),
-                video_decode_queue: Some(video_decode_queue),
-                transfer_queue_family: transfer.family,
-                transfer_queue,
-                compute_queue_family: compute.family,
-                compute_queue,
-                memory_properties,
-                device_properties,
-                supported_encode_codecs: Vec::new(),
-                supported_decode_codecs,
-                has_push_descriptor: false,
-                has_video_encode_rgb_conversion: false,
-                has_unified_image_layouts: declared_unified_image_layouts,
-                external: ExternalSupport::default(),
-                owns_device: false,
-                retired_semaphores: Default::default(),
-                // The caller owns the instance; reporting is theirs to set up.
-                debug_messenger: None,
             }),
         })
     }

@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `EncodedPacket::is_key_frame` is a method, not a field. An
   IDR's `frame_type` is `FrameType::Idr`; it was `FrameType::I`.
   `FrameType::Unknown`, which no packet had, is removed.
+- **Breaking:** `VideoContextBuilder::device_requirements` and
+  `build_from_existing` adopt a caller's device for the codecs asked for with
+  `require_encode` and `require_decode`, so one adopted context can encode
+  and decode. They replace `encode_device_requirements`,
+  `decode_device_requirements`, `build_from_existing_encode` and
+  `build_from_existing_decode`. At least one codec must be asked for: an
+  encode adoption with none no longer takes every codec the device has.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and

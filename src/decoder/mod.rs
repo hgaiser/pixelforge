@@ -162,9 +162,8 @@ impl DecodeConfig {
     /// Passing that family here adds it to the sharing set, so frames can be
     /// sampled directly with no ownership transfer and no copy. Set it whenever
     /// frames are consumed by anything outside the decoder; for a context
-    /// adopted from an existing device
-    /// (see
-    /// [`build_from_existing_decode`](crate::vulkan::VideoContextBuilder::build_from_existing_decode))
+    /// adopted from an existing device (see
+    /// [`build_from_existing`](crate::vulkan::VideoContextBuilder::build_from_existing))
     /// this is the family the caller already renders on.
     pub fn with_consumer_queue_family(mut self, family: u32) -> Self {
         self.consumer_queue_family = Some(family);

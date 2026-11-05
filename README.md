@@ -271,9 +271,10 @@ device instead of letting it create a second one. Frames then never leave
 the device: no external memory, no import, and no CPU wait between the
 application's work and pixelforge's.
 
-[`VideoContextBuilder::encode_device_requirements`] lists the queue
-families, extensions and features to create the device with, and
-[`VideoContextBuilder::build_from_existing_encode`] adopts it. A `VkQueue`
+[`VideoContextBuilder::device_requirements`] lists the queue
+families, extensions and features to create the device with, for the
+codecs asked for with `require_encode` and `require_decode`, and
+[`VideoContextBuilder::build_from_existing`] adopts it. A `VkQueue`
 may not be submitted to from two threads at once, so give pixelforge queues
 the application does not use, with
 [`VideoContextBuilder::with_encode_queue`] and friends.
