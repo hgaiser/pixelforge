@@ -40,6 +40,9 @@
 
 /// Annex B start-code framing, shared by H.264 and H.265.
 pub(crate) mod annexb;
+/// AV1 OBU parsing and reference state (host side; not wired up yet).
+#[allow(dead_code, unused_imports)]
+pub(crate) mod av1;
 pub(crate) mod bitreader;
 /// The Vulkan video session and the per-decoder state every codec shares.
 pub(crate) mod common;
