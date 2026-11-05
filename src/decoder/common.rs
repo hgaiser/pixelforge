@@ -22,10 +22,10 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::decoder::DecodedFrame;
-use crate::decoder::annexb::START_CODE;
 use crate::decoder::frames::SlotPins;
 use crate::decoder::pipeline::DecodePipeline;
 use crate::decoder::plan::SessionPlan;
+use crate::decoder::profile::DecodeProfile;
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
@@ -135,6 +135,8 @@ pub(crate) struct DecodeSession {
     pub plane_views: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    /// The profile everything in this session was created with.
+    pub profile: DecodeProfile,
 }
 impl DecodeSession {
     /// The image and array layer holding DPB slot `slot`.
@@ -306,10 +308,11 @@ impl DecoderCommon {
     pub fn create_session(
         &mut self,
         plan: &SessionPlan,
-        profile_info: &vk::VideoProfileInfoKHR,
+        profile: DecodeProfile,
         make_params: impl FnOnce(&Self, vk::VideoSessionKHR) -> Result<vk::VideoSessionParametersKHR>,
     ) -> Result<()> {
         self.destroy_session();
+        let profile_info = profile.info();
         self.bitstream_offset_alignment = plan.bitstream_offset_alignment;
         self.bitstream_size_alignment = plan.bitstream_size_alignment;
 
@@ -423,6 +426,7 @@ impl DecoderCommon {
             sampleable: plan.sampleable,
             plane_views: plan.plane_views,
             output_image,
+            profile,
         });
 
         tracing::debug!(
@@ -482,18 +486,22 @@ impl DecoderCommon {
         }
     }
 
-    /// Copy a picture's slices into the staging buffer, each prefixed with a
-    /// start code, and report the buffer range plus each slice's offset.
-    pub fn stage_slices(
-        &mut self,
-        slices: &[&[u8]],
-        profile_info: &vk::VideoProfileInfoKHR,
-    ) -> Result<(u64, Vec<u32>)> {
-        let total: usize = slices.iter().map(|s| s.len() + START_CODE.len()).sum();
+    /// Copy a picture's slices into the staging buffer, each preceded by
+    /// `prefix` (a start code for H.26x, nothing for AV1), and report the
+    /// buffer range plus each slice's offset.
+    pub fn stage_slices(&mut self, slices: &[&[u8]], prefix: &[u8]) -> Result<(u64, Vec<u32>)> {
+        let total: usize = slices.iter().map(|s| s.len() + prefix.len()).sum();
         let aligned_total =
             crate::video::align_up(total as u32, self.bitstream_size_alignment as u32) as usize;
-        self.pipeline
-            .ensure_bitstream_capacity(&self.context, aligned_total, profile_info)?;
+        // Borrow the session by field, so the pipeline can be borrowed mutably.
+        let session = self.session.as_ref().ok_or_else(|| {
+            PixelForgeError::InvalidInput("decode: no active session".to_string())
+        })?;
+        self.pipeline.ensure_bitstream_capacity(
+            &self.context,
+            aligned_total,
+            session.profile.info(),
+        )?;
         let dst = self.pipeline.current().bitstream_ptr;
 
         let mut offsets = Vec::with_capacity(slices.len());
@@ -501,12 +509,8 @@ impl DecoderCommon {
         for slice in slices {
             offsets.push(cursor as u32);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    START_CODE.as_ptr(),
-                    dst.add(cursor),
-                    START_CODE.len(),
-                );
-                cursor += START_CODE.len();
+                std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst.add(cursor), prefix.len());
+                cursor += prefix.len();
                 std::ptr::copy_nonoverlapping(slice.as_ptr(), dst.add(cursor), slice.len());
                 cursor += slice.len();
             }

@@ -7,6 +7,7 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+use crate::decoder::annexb::START_CODE;
 use crate::decoder::common::DecoderCommon;
 use crate::decoder::frames::{DecodedPicture, ReorderBuffer};
 use crate::decoder::h264::dpb::{DecodeDpb, PictureState};
@@ -16,6 +17,7 @@ use crate::decoder::h264::parser::{
 use crate::decoder::h264::record::{DecodeRecord, LinkParams};
 use crate::decoder::pipeline::DECODE_PIPELINE_DEPTH;
 use crate::decoder::plan::StreamNeeds;
+use crate::decoder::profile::DecodeProfile;
 use crate::decoder::{DecodeConfig, DecodeStatus, Framing};
 use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
@@ -157,14 +159,8 @@ impl H264Decoder {
         self.common.session.as_ref().map(|a| a.picture_format)
     }
 
-    /// Build the H.264 decode profile info for a parsed SPS.
-    fn profile_for(
-        sps: &Sps,
-    ) -> Result<(
-        vk::VideoDecodeH264ProfileInfoKHR<'static>,
-        ChromaFormat,
-        BitDepth,
-    )> {
+    /// Build the H.264 decode profile for a parsed SPS.
+    fn profile_for(sps: &Sps) -> Result<(DecodeProfile, ChromaFormat, BitDepth)> {
         let chroma_format = match sps.chroma_format_idc {
             1 => ChromaFormat::Yuv420,
             3 => ChromaFormat::Yuv444,
@@ -207,10 +203,7 @@ impl H264Decoder {
             }
         };
 
-        let profile = vk::VideoDecodeH264ProfileInfoKHR::default()
-            .std_profile_idc(std_profile)
-            .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
-
+        let profile = DecodeProfile::h264(std_profile, chroma_format, bit_depth);
         Ok((profile, chroma_format, bit_depth))
     }
 
@@ -237,27 +230,7 @@ impl H264Decoder {
             ));
         }
 
-        let (mut profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
-        let chroma_subsampling = match chroma_format {
-            ChromaFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            ChromaFormat::Yuv444 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
-            other => {
-                return Err(PixelForgeError::InvalidInput(format!(
-                    "H.264 decode: unsupported chroma format {:?}",
-                    other
-                )));
-            }
-        };
-        let depth_flag = match bit_depth {
-            BitDepth::Eight => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-            BitDepth::Ten => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
-        };
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-            .chroma_subsampling(chroma_subsampling)
-            .luma_bit_depth(depth_flag)
-            .chroma_bit_depth(depth_flag)
-            .push(&mut profile);
+        let (profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
 
         // The stream needs max_num_ref_frames references plus the current
         // picture. Reorder depth comes from the stream (VUI); without it, bound
@@ -282,10 +255,10 @@ impl H264Decoder {
         let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
         let plan = self
             .common
-            .plan_session(&profile_info, &mut h264_caps, &needs)?;
+            .plan_session(profile.info(), &mut h264_caps, &needs)?;
         let slot_count = plan.slot_count;
         self.common
-            .create_session(&plan, &profile_info, |common, session| {
+            .create_session(&plan, profile, |common, session| {
                 Self::build_session_params(common, session, sps, pps)
             })?;
 
@@ -605,7 +578,8 @@ impl H264Decoder {
         // completed. Staging before this waits overwrote coded data the GPU was
         // still reading.
         self.common.begin_decode_commands()?;
-        let (buffer_range, slice_offsets) = self.stage_slices(picture, sps)?;
+        let (buffer_range, slice_offsets) =
+            self.common.stage_slices(&picture.slices, &START_CODE)?;
         self.common.record_barriers(slot);
         self.record_decode(picture, &state, slot, buffer_range, &slice_offsets)?;
         self.common.submit_decode()?;
@@ -653,34 +627,6 @@ impl H264Decoder {
             .end_picture(slot, &state, sps);
 
         Ok(Some(frame))
-    }
-
-    /// Copy the picture's slice NALs into the staging buffer.
-    ///
-    /// Returns the aligned buffer range to hand to the driver and the offset of
-    /// each slice within it.
-    /// Stage this picture's slices for the driver.
-    ///
-    /// The copying is generic; only the profile (needed to size the buffer) is
-    /// H.264's business.
-    fn stage_slices(&mut self, picture: &Picture, sps: &Sps) -> Result<(u64, Vec<u32>)> {
-        let (mut profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
-        let chroma_subsampling = match chroma_format {
-            ChromaFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            _ => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
-        };
-        let depth_flag = match bit_depth {
-            BitDepth::Eight => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-            BitDepth::Ten => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
-        };
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-            .chroma_subsampling(chroma_subsampling)
-            .luma_bit_depth(depth_flag)
-            .chroma_bit_depth(depth_flag)
-            .push(&mut profile);
-
-        self.common.stage_slices(&picture.slices, &profile_info)
     }
 
     /// Record `vkCmdBeginVideoCoding` / `vkCmdDecodeVideo` / `vkCmdEndVideoCoding`.
