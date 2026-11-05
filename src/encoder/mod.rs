@@ -275,8 +275,6 @@ pub enum FrameType {
     P,
     /// Bi-predicted frame.
     B,
-    /// Unknown frame type.
-    Unknown,
 }
 
 /// Video dimensions.
@@ -622,14 +620,19 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
-    /// Whether this is a keyframe.
-    pub is_key_frame: bool,
     /// Presentation timestamp.
     pub pts: u64,
     /// Decode timestamp.
     pub dts: u64,
     /// Stats about the packet.
     pub stats: EncodedPacketStats,
+}
+
+impl EncodedPacket {
+    /// Whether a decoder can start at this packet: an IDR frame.
+    pub fn is_key_frame(&self) -> bool {
+        self.frame_type == FrameType::Idr
+    }
 }
 
 #[cfg(test)]
@@ -897,7 +900,6 @@ mod tests {
             assert_ne!(FrameType::Idr, FrameType::I);
             assert_ne!(FrameType::I, FrameType::P);
             assert_ne!(FrameType::P, FrameType::B);
-            assert_ne!(FrameType::B, FrameType::Unknown);
         }
     }
 
@@ -910,15 +912,19 @@ mod tests {
             let packet = EncodedPacket {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x67],
                 frame_type: FrameType::Idr,
-                is_key_frame: true,
                 pts: 0,
                 dts: 0,
                 stats: EncodedPacketStats::default(),
             };
 
-            assert!(packet.is_key_frame);
-            assert_eq!(packet.frame_type, FrameType::Idr);
+            assert!(packet.is_key_frame());
             assert_eq!(packet.data.len(), 5);
+
+            let packet = EncodedPacket {
+                frame_type: FrameType::P,
+                ..packet
+            };
+            assert!(!packet.is_key_frame());
         }
     }
 

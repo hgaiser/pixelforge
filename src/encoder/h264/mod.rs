@@ -85,10 +85,7 @@ impl VideoCodec for H264 {
             None
         };
 
-        Ok(PictureSetup {
-            frame_type: plan.frame_type(),
-            header,
-        })
+        Ok(PictureSetup { header })
     }
 
     fn record_picture(

@@ -126,7 +126,7 @@ fn run_codec(
      -> Result<(), Box<dyn std::error::Error>> {
         let packet = pollster::block_on(pending.pop_front().unwrap())?;
         if packet.pts == INVALIDATE_AT {
-            *recovery_is_key = Some(packet.is_key_frame);
+            *recovery_is_key = Some(packet.is_key_frame());
         }
         output_file.write_all(&packet.data)?;
         Ok(())

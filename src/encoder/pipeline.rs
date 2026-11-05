@@ -125,7 +125,6 @@ pub(crate) const ENCODE_PIPELINE_DEPTH: usize = 2;
 /// when the completion thread reads the slot back.
 pub(crate) struct SlotPacketMetadata {
     pub frame_type: FrameType,
-    pub is_key_frame: bool,
     pub pts: u64,
     pub dts: u64,
     /// Codec header (SPS/PPS, VPS/SPS/PPS, or AV1 sequence header) to prepend.
@@ -630,7 +629,6 @@ fn run_completion_thread(
         let packet = result.map(|()| EncodedPacket {
             data,
             frame_type: work.metadata.frame_type,
-            is_key_frame: work.metadata.is_key_frame,
             pts: work.metadata.pts,
             dts: work.metadata.dts,
             stats,

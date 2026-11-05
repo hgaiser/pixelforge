@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             packet.dts,
             packet.data.len(),
             packet.frame_type,
-            if packet.is_key_frame { " [KEY]" } else { "" }
+            if packet.is_key_frame() { " [KEY]" } else { "" }
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     };

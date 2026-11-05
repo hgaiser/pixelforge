@@ -105,7 +105,6 @@ impl VideoCodec for Av1 {
         }
 
         Ok(PictureSetup {
-            frame_type: plan.frame_type(),
             header: Some(header),
         })
     }

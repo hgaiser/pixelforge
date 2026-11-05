@@ -362,16 +362,14 @@ impl FramePlan {
     /// The stream-level frame type for packet metadata.
     pub fn frame_type(&self) -> FrameType {
         match self.gop.frame_type {
-            GopFrameType::Idr => FrameType::I,
+            GopFrameType::Idr => FrameType::Idr,
             GopFrameType::P => FrameType::P,
         }
     }
 }
 
-/// The codec header (if any) and stream frame type produced by
-/// [`VideoCodec::begin_picture`].
+/// The codec header (if any) produced by [`VideoCodec::begin_picture`].
 pub(crate) struct PictureSetup {
-    pub frame_type: FrameType,
     /// Codec header to prepend (SPS/PPS, VPS/SPS/PPS, AV1 sequence header).
     /// `Some` only for frames that carry one (typically the IDR/key frame).
     pub header: Option<Vec<u8>>,
@@ -506,8 +504,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
-            frame_type: setup.frame_type,
-            is_key_frame: plan.is_idr(),
+            frame_type: plan.frame_type(),
             pts: plan.display_order,
             dts: plan.encode_index,
             header: setup.header,

@@ -93,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed.
 - Every failed Vulkan call on a lost device is `PixelForgeError::DeviceLost`.
   Some were reported as another variant.
+- **Breaking:** `EncodedPacket::is_key_frame` is a method, not a field. An
+  IDR's `frame_type` is `FrameType::Idr`; it was `FrameType::I`.
+  `FrameType::Unknown`, which no packet had, is removed.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and

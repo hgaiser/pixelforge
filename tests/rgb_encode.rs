@@ -330,7 +330,7 @@ fn color_change_follows_into_the_conversion() -> Result<(), Box<dyn std::error::
         let image = source_image(&context, &src)?;
         let packet = pollster::block_on(encoder.submit(Frame::image(&image))?)?;
         pts.push(packet.pts);
-        keys.push(packet.is_key_frame);
+        keys.push(packet.is_key_frame());
     }
     assert_eq!(pts, (0..u64::from(FRAMES)).collect::<Vec<_>>());
     assert!(keys[0] && keys[FRAMES as usize / 2], "key frames: {keys:?}");
@@ -381,7 +381,7 @@ fn a_format_change_switches_the_shader_in_place() -> Result<(), Box<dyn std::err
         let src = unsafe { create_src_image_as(&context, WIDTH, HEIGHT, format, &pixels)? };
         let image = source_image(&context, &src)?;
         let packet = pollster::block_on(encoder.submit(Frame::image(&image))?)?;
-        keys.push(packet.is_key_frame);
+        keys.push(packet.is_key_frame());
         stream.extend_from_slice(&packet.data);
     }
     assert_eq!(encoder.conversion(), Conversion::Shader);

@@ -113,7 +113,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
         yuv[..plane].fill(level);
         input.upload(YuvLayout::I420, &yuv)?;
         let packet = pollster::block_on(encoder.submit(Frame::image(input.source()))?)?;
-        keys.push(packet.is_key_frame);
+        keys.push(packet.is_key_frame());
         stream.extend(packet.data);
     }
     // The source changes, and the repeats must not see it.
@@ -123,7 +123,7 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
     for _ in 0..2 {
         encoder.request_idr();
         let packet = pollster::block_on(encoder.repeat()?)?;
-        keys.push(packet.is_key_frame);
+        keys.push(packet.is_key_frame());
         stream.extend(packet.data);
     }
     assert_eq!(keys, [true, false, false, true, true]);
