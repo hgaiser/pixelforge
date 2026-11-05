@@ -161,6 +161,7 @@ impl H265Decoder {
             slot_limit: super::dpb::MAX_DPB_SLOTS as u32,
             reorder_depth,
             output_depth: self.output_depth,
+            film_grain: false,
         };
         let mut h265_caps = vk::VideoDecodeH265CapabilitiesKHR::default();
         let plan = self

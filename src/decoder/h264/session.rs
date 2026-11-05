@@ -202,6 +202,7 @@ impl H264Decoder {
             slot_limit: crate::decoder::h264::dpb::MAX_DPB_SLOTS as u32,
             reorder_depth,
             output_depth: self.output_depth,
+            film_grain: false,
         };
         let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
         let plan = self

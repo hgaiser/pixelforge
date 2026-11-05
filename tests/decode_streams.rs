@@ -99,4 +99,6 @@ stream_tests! {
     av1_superres: Codec::AV1, "av1/aom_superres.obu", "nv12";
     av1_resize: Codec::AV1, "av1/aom_resize.obu", "nv12";
     av1_10bit: Codec::AV1, "av1/aom_10bit.obu", "p010le";
+    av1_grain: Codec::AV1, "av1/aom_grain.obu", "nv12";
+    av1_svt_grain: Codec::AV1, "av1/svt_grain.obu", "nv12";
 }

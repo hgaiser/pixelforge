@@ -136,6 +136,15 @@ pub(crate) struct DecodeSession {
     pub plane_views: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    /// One film grain output image per DPB slot, or none.
+    ///
+    /// Vulkan applies AV1 film grain only to a decode output that is not the
+    /// DPB slot, since the reference must stay grain-free. A frame with grain
+    /// is therefore decoded into its slot's grain image as well, and handed
+    /// out from there. One per slot rather than one in all, because
+    /// `show_existing_frame` can show a frame again long after its decode, and
+    /// it has to show the same grain.
+    pub grain_outputs: Vec<Arc<DpbImage>>,
     /// The profile everything in this session was created with.
     pub profile: DecodeProfile,
 }
@@ -146,6 +155,17 @@ impl DecodeSession {
     pub fn dpb_image_for_slot(&self, slot: u8) -> (vk::Image, u32) {
         let (entry, layer, _) = self.dpb_entry(slot);
         (entry.image, layer)
+    }
+
+    /// The film grain output image of `slot`. Only for a session with film
+    /// grain.
+    pub fn grain_entry(&self, slot: u8) -> &Arc<DpbImage> {
+        &self.grain_outputs[slot as usize]
+    }
+
+    /// The view of `slot`'s film grain output image.
+    pub fn grain_view(&self, slot: u8) -> vk::ImageView {
+        self.grain_outputs[slot as usize].views[0]
     }
 
     /// The image backing `slot`, the array layer within it, and its view.
@@ -403,6 +423,32 @@ impl DecoderCommon {
             )?)
         };
 
+        let grain_outputs = if plan.film_grain {
+            let mut usage =
+                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::TRANSFER_SRC;
+            if plan.sampleable {
+                usage |= vk::ImageUsageFlags::SAMPLED;
+            }
+            let grain_params = VideoImageParams {
+                usage,
+                ..dpb_params
+            };
+            (0..plan.slot_count)
+                .map(|_| {
+                    let (image, memory, view) =
+                        create_video_image(&self.context, &grain_params, profile_info)?;
+                    Ok(Arc::new(DpbImage {
+                        context: self.context.clone(),
+                        image,
+                        memory,
+                        views: vec![view],
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
         let session_params = make_params(self, session)?;
 
         // A new set of images, so a new generation. Frames from the previous
@@ -427,6 +473,7 @@ impl DecoderCommon {
             sampleable: plan.sampleable,
             plane_views: plan.plane_views,
             output_image,
+            grain_outputs,
             profile,
         });
 
@@ -584,6 +631,49 @@ impl DecoderCommon {
         unsafe { sync2.cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency) };
     }
 
+    /// Transition `slot`'s film grain output image into the layout
+    /// `vkCmdDecodeVideo` writes it in. Its old contents are discarded: the
+    /// slot is free, so nothing still shows them.
+    pub fn record_grain_barrier(&self, slot: u8) {
+        let session = self.session.as_ref().expect("active session");
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+            .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(self.output_layout())
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(session.grain_entry(slot).image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let barriers = [barrier];
+        let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        unsafe {
+            self.context
+                .sync2()
+                .cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency)
+        };
+    }
+
+    /// Point `picture` at its slot's film grain output image instead of the
+    /// slot itself.
+    pub fn use_grain_output(&self, picture: &mut DecodedPicture) {
+        let session = self.session.as_ref().expect("active session");
+        let entry = session.grain_entry(picture.slot);
+        picture.image = entry.image;
+        picture.image_view = entry.views[0];
+        picture.layout = self.output_layout();
+        picture.array_layer = 0;
+        picture.film_grain = true;
+    }
+
     /// The decode command buffer of the picture currently being recorded.
     pub fn decode_command_buffer(&self) -> vk::CommandBuffer {
         self.pipeline.current().decode_command_buffer
@@ -696,6 +786,7 @@ impl DecoderCommon {
             pts,
             display_order,
             is_keyframe,
+            film_grain: false,
         }
     }
 

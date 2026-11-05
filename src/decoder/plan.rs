@@ -35,6 +35,9 @@ pub(crate) struct StreamNeeds {
     pub reorder_depth: usize,
     /// Frames the caller may hold at once (`DecodeConfig::output_depth`).
     pub output_depth: usize,
+    /// The stream applies film grain (AV1), which needs an output image apart
+    /// from the DPB slot for every slot.
+    pub film_grain: bool,
 }
 
 /// What a codec decided the session should look like.
@@ -79,6 +82,8 @@ pub(crate) struct SessionPlan {
     /// One layered DPB image rather than one image per slot.
     pub use_layered_dpb: bool,
     pub dpb_usage: vk::ImageUsageFlags,
+    /// Create a film grain output image for every DPB slot.
+    pub film_grain: bool,
     /// The Std header version the device reports for this profile.
     pub std_header_version: vk::ExtensionProperties,
     /// Bitstream buffer alignments the device requires, each at least one.
@@ -291,6 +296,7 @@ impl DecoderCommon {
             view_formats,
             use_layered_dpb,
             dpb_usage,
+            film_grain: needs.film_grain,
             std_header_version: caps.std_header_version,
             bitstream_offset_alignment: caps.min_bitstream_buffer_offset_alignment.max(1),
             bitstream_size_alignment: caps.min_bitstream_buffer_size_alignment.max(1),

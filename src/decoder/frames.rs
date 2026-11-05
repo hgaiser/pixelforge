@@ -42,6 +42,8 @@ pub(crate) struct DecodedPicture {
     pub pts: u64,
     pub display_order: i32,
     pub is_keyframe: bool,
+    /// The picture is in its slot's film grain output image, not in the slot.
+    pub film_grain: bool,
 }
 
 /// An image in the frame pool, by index.
@@ -450,7 +452,11 @@ impl ReorderBuffer {
         // holds frames gets copies rather than a decoder that cannot proceed.
         if session.pinnable && session.slot_pins.count() < session.spare_slots {
             session.slot_pins.pin(picture.slot);
-            let (entry, _, _) = session.dpb_entry(picture.slot);
+            let entry = if picture.film_grain {
+                session.grain_entry(picture.slot)
+            } else {
+                session.dpb_entry(picture.slot).0
+            };
             return Ok(Retained::Slot {
                 pin: FramePin::DpbSlot {
                     slot: picture.slot,

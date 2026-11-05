@@ -60,6 +60,10 @@ pub(crate) struct Av1Decoder {
     std_sequence: Option<Box<StdSequenceHeader>>,
     /// DPB slots in the current session.
     slot_count: usize,
+    /// Which DPB slots hold a frame decoded with film grain, whose output is
+    /// in the slot's grain image. A `show_existing_frame` of it shows that
+    /// image again.
+    grain_applied: [bool; MAX_DPB_SLOTS as usize],
 
     /// Shown frames since the last key frame, which is the display order: AV1
     /// shows frames in the order the stream gives them.
@@ -79,6 +83,7 @@ impl Av1Decoder {
             active: None,
             std_sequence: None,
             slot_count: 0,
+            grain_applied: [false; MAX_DPB_SLOTS as usize],
             shown_since_key: 0,
             records: (0..DECODE_PIPELINE_DEPTH)
                 .map(|_| DecodeRecord::new(Av1Picture::default()))
@@ -113,14 +118,10 @@ impl Av1Decoder {
                 )));
             }
         };
-        if seq.film_grain_params_present {
-            return Err(PixelForgeError::InvalidInput(
-                "AV1 decode: film grain is not supported yet".to_string(),
-            ));
-        }
+        // A session that may apply film grain has to say so in its profile.
         let profile = DecodeProfile::av1(
             seq.seq_profile as ash::vk::native::StdVideoAV1Profile,
-            false,
+            seq.film_grain_params_present,
             chroma_format,
             bit_depth,
         );
@@ -152,6 +153,7 @@ impl Av1Decoder {
             // Frames are shown in the order the stream gives them.
             reorder_depth: 0,
             output_depth: self.output_depth,
+            film_grain: seq.film_grain_params_present,
         };
         let mut av1_caps = vk::VideoDecodeAV1CapabilitiesKHR::default();
         let plan = self
@@ -273,7 +275,7 @@ impl Av1Decoder {
             if is_key {
                 self.shown_since_key = 0;
             }
-            let picture = self.common.decoded_picture(
+            let mut picture = self.common.decoded_picture(
                 slot,
                 shown.upscaled_width,
                 shown.frame_height,
@@ -281,6 +283,9 @@ impl Av1Decoder {
                 self.shown_since_key,
                 is_key,
             );
+            if self.grain_applied[slot as usize] {
+                self.common.use_grain_output(&mut picture);
+            }
             self.shown_since_key += 1;
             self.parser.commit_frame(None)?;
             return Ok(Some(picture));
@@ -295,16 +300,21 @@ impl Av1Decoder {
             .map(|t| &tu[t.offset..t.offset + t.size])
             .collect();
         let (buffer_range, offsets) = self.common.stage_slices(&tile_data, &[])?;
+        let grain = header.film_grain.apply_grain;
         self.common.record_barriers(slot);
-        self.record_decode(frame, slot, buffer_range, &offsets)?;
+        if grain {
+            self.common.record_grain_barrier(slot);
+        }
+        self.record_decode(frame, slot, buffer_range, &offsets, grain)?;
         self.common.submit_decode()?;
+        self.grain_applied[slot as usize] = grain;
 
         let size = &header.frame_size;
         let is_key = header.frame_type == FrameType::Key;
         if is_key && header.show_frame {
             self.shown_since_key = 0;
         }
-        let picture = self.common.decoded_picture(
+        let mut picture = self.common.decoded_picture(
             slot,
             size.upscaled_width,
             size.frame_height,
@@ -312,6 +322,9 @@ impl Av1Decoder {
             self.shown_since_key,
             is_key && header.show_frame,
         );
+        if grain {
+            self.common.use_grain_output(&mut picture);
+        }
         self.parser.commit_frame(Some(slot))?;
         if !header.show_frame {
             return Ok(None);
@@ -347,6 +360,7 @@ impl Av1Decoder {
         slot: u8,
         buffer_range: u64,
         offsets: &[u32],
+        grain: bool,
     ) -> Result<()> {
         let header = &frame.header;
         let active = self.common.session.as_ref().expect("active");
@@ -418,7 +432,13 @@ impl Av1Decoder {
             bitstream_range: buffer_range,
             setup_slot: slot,
             setup_view: active.dpb_entry(slot).2,
-            output_view: active.output_image.map(|(_, _, view)| view),
+            // With grain, the output must not be the reference picture, which
+            // stays grain-free.
+            output_view: if grain {
+                Some(active.grain_view(slot))
+            } else {
+                active.output_image.map(|(_, _, view)| view)
+            },
             setup_std,
         });
         self.common.record_coding(record);
