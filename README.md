@@ -56,7 +56,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pixelforge = "0.1"
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.11.0" }
 ```
 
 ### Optional Features
@@ -69,7 +69,7 @@ To enable DMA-BUF support:
 
 ```toml
 [dependencies]
-pixelforge = { version = "0.1", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.11.0", features = ["dmabuf"] }
 ```
 
 ## Quick Start

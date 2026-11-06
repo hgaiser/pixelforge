@@ -2,10 +2,10 @@
 name = "pixelforge"
 version = "0.11.0"
 edition = "2024"
-description = "A Vulkan-based video encoding library for Rust"
+description = "A Vulkan-based video encoding and decoding library for Rust"
 license = "BSD-2-Clause"
 repository = "https://github.com/hgaiser/pixelforge"
-keywords = ["vulkan", "video", "encoding", "h264", "h265"]
+keywords = ["vulkan", "video", "encoding", "decoding", "h264"]
 categories = ["multimedia::video", "graphics"]
 readme = "README.md"
 
