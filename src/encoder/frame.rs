@@ -13,7 +13,7 @@ pub(crate) enum FrameSource<'a> {
     Image(&'a SourceImage),
     /// A DMA-BUF pixelforge imported or allocated.
     #[cfg(feature = "dmabuf")]
-    External(&'a crate::encoder::external::ExternalImage),
+    External(&'a crate::encoder::external::DmaBufImage),
 }
 
 /// The encoder's input image for the next frame, from
@@ -91,7 +91,7 @@ impl<'a> Frame<'a> {
     /// Pixelforge acquires it from the foreign queue family before it reads,
     /// and releases it back after.
     #[cfg(feature = "dmabuf")]
-    pub fn external(image: &'a crate::encoder::external::ExternalImage) -> Self {
+    pub fn external(image: &'a crate::encoder::external::DmaBufImage) -> Self {
         Self::new(FrameSource::External(image))
     }
 

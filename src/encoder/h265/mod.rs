@@ -10,9 +10,6 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::dpb::{
-    DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType,
-};
 use crate::encoder::pipeline::EncodeFuture;
 use crate::error::Result;
 use ash::vk;
@@ -30,12 +27,8 @@ pub(crate) struct ReferenceInfo {
 
 /// H.265-specific encoder state.
 pub(crate) struct H265 {
-    dpb: DecodedPictureBuffer,
     /// Cached VPS/SPS/PPS header (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-    has_backward_reference: bool,
-    backward_reference_poc: i32,
-    backward_reference_dpb_slot: u8,
     /// References held in the DPB, most-recent first. Each frame predicts
     /// from the first `active_reference_count`; the rest stay in its
     /// reference picture set, unused, for reference frame invalidation to fall
@@ -66,17 +59,7 @@ impl VideoCodec for H265 {
         plan: &FramePlan,
     ) -> Result<PictureSetup> {
         if plan.is_idr() {
-            let dpb_config = DpbConfig {
-                dpb_size: common.dpb_slot_count as u32,
-                max_num_ref_frames: self.reference_window,
-                use_multiple_references: common.config.b_frame_count > 0,
-                log2_max_frame_num_minus4: 0,
-                log2_max_pic_order_cnt_lsb_minus4: 4,
-                ..Default::default()
-            };
-            self.dpb.h265.sequence_start(dpb_config);
             self.l0_references.clear();
-            self.has_backward_reference = false;
             // All DPB slots become inactive at the start of a coded video sequence.
             common.dpb_slot_active.fill(false);
         }
@@ -90,10 +73,7 @@ impl VideoCodec for H265 {
             None
         };
 
-        Ok(PictureSetup {
-            frame_type: plan.frame_type(),
-            header,
-        })
+        Ok(PictureSetup { header })
     }
 
     fn record_picture(
@@ -109,23 +89,6 @@ impl VideoCodec for H265 {
             return;
         }
         let pic_order_cnt = plan.pic_order_cnt();
-        let pic_type = if plan.is_idr() {
-            PictureType::Idr
-        } else if plan.is_b_frame() {
-            PictureType::B
-        } else {
-            PictureType::P
-        };
-        let pic_info = PictureStartInfo {
-            frame_id: plan.display_order,
-            pic_order_cnt,
-            frame_num: 0,
-            pic_type,
-            is_reference: true,
-            ..Default::default()
-        };
-        self.dpb.h265.picture_start(pic_info);
-        self.dpb.h265.picture_end(true);
 
         self.l0_references.insert(
             0,
@@ -139,13 +102,11 @@ impl VideoCodec for H265 {
             self.l0_references.pop();
         }
 
-        if !plan.is_b_frame() {
-            let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
-            for i in 0..common.dpb_slot_count as u8 {
-                if !used_slots.contains(&i) {
-                    common.current_dpb_slot = i;
-                    break;
-                }
+        let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+        for i in 0..common.dpb_slot_count as u8 {
+            if !used_slots.contains(&i) {
+                common.current_dpb_slot = i;
+                break;
             }
         }
     }
@@ -162,9 +123,6 @@ impl VideoCodec for H265 {
         // the decoder to follow — no extra bitstream marking is required.
         self.l0_references
             .retain(|r| r.display_order < first_lost_display_order);
-        // A backward (L1) reference may also be tainted; B-frames are the only
-        // consumer of it, so simply forget it on invalidation.
-        self.has_backward_reference = false;
         !self.l0_references.is_empty()
     }
 

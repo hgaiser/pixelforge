@@ -3,12 +3,10 @@
 
 use super::H264;
 
-use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{
-    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers, reset_start_timestamp,
-};
-use crate::error::{PixelForgeError, Result};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -21,14 +19,12 @@ impl H264 {
     ) -> Result<EncodeFuture> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
-        let is_b_frame = plan.is_b_frame();
         let pic_order_cnt = plan.pic_order_cnt();
         let frame_num = self.frame_num_syntax;
 
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
-        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
         let input_image_view = common.source_view();
@@ -103,16 +99,12 @@ impl H264 {
 
         let slice_type = if is_idr {
             ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I
-        } else if is_b_frame {
-            ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_B
         } else {
             ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P
         };
 
         let picture_type = if is_idr {
             ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
-        } else if is_b_frame {
-            ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_B
         } else {
             ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
         };
@@ -167,7 +159,7 @@ impl H264 {
         // STD_VIDEO_H264_NO_REFERENCE_PICTURE = 0xFF.
         const NO_REFERENCE_PICTURE: u8 = 0xFF;
         let mut ref_list0: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
-        let mut ref_list1: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
+        let ref_list1: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
 
         let ref_lists_info_flags = ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags {
             _bitfield_align_1: [],
@@ -178,16 +170,8 @@ impl H264 {
             ),
         };
 
-        // Set up reference lists for P-frames and B-frames.
-        let (num_ref_l0, num_ref_l1) = if is_b_frame && self.has_backward_reference {
-            if let Some(first_ref) = self.l0_references.first() {
-                ref_list0[0] = first_ref.dpb_slot;
-                ref_list1[0] = self.backward_reference_dpb_slot;
-                (1, 1)
-            } else {
-                (0, 0)
-            }
-        } else if !is_idr && !self.l0_references.is_empty() {
+        // Set up the reference list for P-frames.
+        let num_ref_l0 = if !is_idr && !self.l0_references.is_empty() {
             let actual_count = self
                 .l0_references
                 .len()
@@ -196,9 +180,9 @@ impl H264 {
             for (i, ref_info) in self.l0_references.iter().take(actual_count).enumerate() {
                 ref_list0[i] = ref_info.dpb_slot;
             }
-            (actual_count, 0)
+            actual_count
         } else {
-            (0, 0)
+            0
         };
 
         let ref_lists_info = ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
@@ -208,11 +192,7 @@ impl H264 {
             } else {
                 0
             },
-            num_ref_idx_l1_active_minus1: if num_ref_l1 > 0 {
-                (num_ref_l1 - 1) as u8
-            } else {
-                0
-            },
+            num_ref_idx_l1_active_minus1: 0,
             RefPicList0: ref_list0,
             RefPicList1: ref_list1,
             refList0ModOpCount: 0,
@@ -324,46 +304,6 @@ impl H264 {
             );
         }
 
-        // Backward (L1) reference for B-frames.
-        let (backward_resource, backward_std_info) = if is_b_frame && self.has_backward_reference {
-            let image_view = common.dpb_image_views[self.backward_reference_dpb_slot as usize];
-            let resource = vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(coded_extent)
-                .base_array_layer(0)
-                .image_view_binding(image_view);
-            let std_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
-                flags: std_reference_info_flags,
-                primary_pic_type:
-                    ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
-                FrameNum: self.backward_reference_frame_num,
-                PicOrderCnt: self.backward_reference_poc,
-                long_term_pic_num: 0,
-                long_term_frame_idx: 0,
-                temporal_id: 0,
-            };
-            (Some(resource), Some(std_info))
-        } else {
-            (None, None)
-        };
-
-        let mut backward_dpb_info = if let Some(ref std_info) = backward_std_info {
-            vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(std_info)
-        } else {
-            vk::VideoEncodeH264DpbSlotInfoKHR::default()
-        };
-
-        let backward_ref_slot = if let Some(ref resource) = backward_resource {
-            Some(
-                vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(self.backward_reference_dpb_slot as i32)
-                    .picture_resource(resource)
-                    .push(&mut backward_dpb_info),
-            )
-        } else {
-            None
-        };
-
         // Reference info for the setup slot (this frame).
         let std_reference_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
             flags: std_reference_info_flags,
@@ -395,14 +335,7 @@ impl H264 {
 
         // Reference slots for the encode command.
         let mut encode_ref_slots = Vec::new();
-        if is_b_frame && self.has_backward_reference {
-            if let Some(l0) = l0_slots.first() {
-                encode_ref_slots.push(*l0);
-            }
-            if let Some(l1) = backward_ref_slot {
-                encode_ref_slots.push(l1);
-            }
-        } else if !is_idr {
+        if !is_idr {
             encode_ref_slots.extend_from_slice(&l0_slots);
         }
 
@@ -419,14 +352,7 @@ impl H264 {
 
         // Reference slots for begin coding (setup slot is marked inactive, -1).
         let mut reference_slots_for_begin = vec![setup_slot_for_begin];
-        if is_b_frame && self.has_backward_reference {
-            if let Some(l0) = l0_slots.first() {
-                reference_slots_for_begin.push(*l0);
-            }
-            if let Some(l1) = backward_ref_slot {
-                reference_slots_for_begin.push(l1);
-            }
-        } else if !is_idr {
+        if !is_idr {
             reference_slots_for_begin.extend_from_slice(&l0_slots);
         }
 
@@ -443,105 +369,26 @@ impl H264 {
             qp_p: qp_bounds_max,
             qp_b: qp_bounds_max,
         };
-
-        let mut h264_rc_layer_info = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
+        let codec_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
             .use_max_qp(true)
             .max_qp(max_qp);
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate_numerator)
-            .frame_rate_denominator(common.config.frame_rate_denominator)
-            .push(&mut h264_rc_layer_info);
-        let rc_layers = [rc_layer_info];
-
-        let mut h264_rc_info = vk::VideoEncodeH264RateControlInfoKHR::default()
+        let codec_rate_control = vk::VideoEncodeH264RateControlInfoKHR::default()
             .gop_frame_count(common.config.gop_size)
-            .idr_period(common.config.gop_size)
-            .consecutive_b_frame_count(common.config.b_frame_count);
+            .idr_period(common.config.gop_size);
 
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
-        }
-
-        // Reset and write start timestamp
-        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-        // For the first frame, configure rate control via the control command
-        // after RESET rather than in begin_coding.
-        let is_first_frame = plan.is_first_frame();
-        let begin_info = if is_first_frame {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h264_rc_info)
-        } else {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&reference_slots_for_begin)
-                .push(&mut h264_rc_info)
-                .push(&mut rc_info)
-        };
-
-        unsafe {
-            (common.video_queue_fn.fp().cmd_begin_video_coding_khr)(command_buffer, &begin_info);
-        }
-
-        // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command on the first
-        // frame (matches FFmpeg; required for AMD RADV).
-        if is_first_frame {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut h264_rc_info)
-                .push(&mut quality_level_info);
-            unsafe {
-                (common.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    command_buffer,
-                    &control_info,
-                );
-            }
-        }
-
-        unsafe {
-            let device = common.device();
-            device.cmd_begin_query(
-                command_buffer,
-                query_pool,
-                0,
-                vk::QueryControlFlags::empty(),
-            );
-            (common.video_encode_fn.fp().cmd_encode_video_khr)(command_buffer, &encode_info);
-            device.cmd_end_query(command_buffer, query_pool, 0);
-
-            // Write end timestamp
-            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-            let end_info = vk::VideoEndCodingInfoKHR::default();
-            (common.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_info);
-
-            common.record_source_release(command_buffer);
-
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-        }
-
-        let future = common.submit_frame()?;
+        let first_frame = plan.is_first_frame();
+        let future = common.record_encode(EncodeCommands {
+            begin_slots: &reference_slots_for_begin,
+            encode_info: &encode_info,
+            rate_control: &rc,
+            codec_rate_control,
+            codec_layer,
+            first_frame,
+            reset: first_frame,
+            post_encode_barrier: false,
+        })?;
         // Clear the unmark queue only after the encode is committed to the GPU.
         // If any fallible step above had failed, the MMCO ops would still live
         // in `pending_unmark_frame_nums` so a retry re-emits them — otherwise the

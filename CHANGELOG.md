@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add H.265 decoding: `DecodeConfig::new(Codec::H265)`. Main and Main 10, open
+  and closed GOPs, joining a stream at a CRA, scaling lists, temporal layers.
+- Add AV1 decoding: `DecodeConfig::new(Codec::AV1)`, for low-overhead OBU
+  streams. Hidden frames and `show_existing_frame`, tiles, superres, frame
+  size changes, 10-bit and film grain.
+- Add `EncodeConfig::new(codec, width, height)`, for a codec chosen at
+  runtime.
 - Add RGB input: `EncodeConfig::with_source(Source::Rgb(..))`. The encoder
   converts RGB frames to the YUV its colour description describes, through
   `VK_VALVE_video_encode_rgb_conversion` where the device can and the colour
@@ -21,12 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for them.
 - Add `Encoder::input_slot` and `InputSlot`: the encoder's own input image,
   to write a frame in place and submit with `Frame::input`.
-- Add `InputImage::source`.
+- Add `YuvUploader::source`.
 - Add `Encoder::repeat`: encode the last frame again from the encoder's own
   input image, for a key frame while no new frame arrives. The caller's
   source does not have to stay alive for it.
-- Add DMA-BUF input (feature `dmabuf`): `Encoder::input_formats`,
-  `Encoder::import`, `Encoder::allocate_input`, `ExternalImage` and
+- Add DMA-BUF input (feature `dmabuf`): `Encoder::dmabuf_format`,
+  `Encoder::import`, `Encoder::allocate_input`, `DmaBufImage` and
   `Frame::external`. The encoder reads a buffer directly where the device
   can, and copies it otherwise.
 - Add sync_file fences (feature `dmabuf`): `Frame::wait_sync_file`,
@@ -50,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `ColorConverter`, `ColorConverterConfig` and `OutputFormat`
   are no longer public. Describe an RGB source with `Source::Rgb` instead, and
   the encoder runs the converter itself, with the right target and range.
+- **Breaking:** `DecodeConfig::new(codec)` replaces `DecodeConfig::h264()`,
+  in the same way as `EncodeConfig::new`.
 - **Breaking:** `RateControl` replaces `RateControlMode`, `quality_level`,
   `target_bitrate` and `max_bitrate`: `Cqp { qp }`, `Cbr { bitrate }` or
   `Vbr { target, max }`, so each mode carries exactly the values it uses.
@@ -62,9 +71,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `EncodeConfig::with_b_frames` and the public `b_frame_count`
   field are removed. No codec encodes B-frames yet, and every encoder refused
   a count above 0 at runtime.
-- **Breaking:** `InputImage::upload_yuv420_to` and `upload_yuv444_to` take an
-  `InputSlot` instead of a `vk::Image`. `InputImage` uploads wait until the
-  frames that read the image are done with it.
+- **Breaking:** `YuvUploader` has two uploads, `upload` to its own image and
+  `upload_to` an encoder's `InputSlot`, which take a `YuvLayout`: `I420`,
+  `Nv12`, `I420P10` or `I444`. They replace `upload_yuv420`, `upload_nv12`,
+  `upload_yuv420_10bit`, `upload_yuv420_to` and `upload_yuv444_to`, which
+  covered only some of the combinations. A layout the image cannot hold is
+  an error; `upload_nv12` panicked for a 10-bit or 4:4:4 image. The uploads
+  wait until the frames that read the image are done with it.
+- **Breaking:** `YuvUploader::new` no longer takes a `Codec`, which it did not
+  use. `YuvUploader::for_encoder` makes one for an encoder's frames.
+- **Breaking:** `EncodeConfig::frame_rate` (a `FrameRate`) replaces
+  `frame_rate_numerator` and `frame_rate_denominator`. `with_frame_rate` is
+  unchanged.
+- **Breaking:** the encoder's `BitDepth` is exported as `BitDepth`, not
+  `EncodeBitDepth`. `Dimensions` and `FrameRate` are exported from the crate
+  root.
+- **Breaking:** the `DEFAULT_*` encoder constants are no longer public.
+  `EncodeConfig::new` and `RateControl::default_for` apply them.
+- **Breaking:** `PixelForgeError` has fewer, typed variants. A failed
+  Vulkan call is `Vulkan { call, result }`, with the function's name and its
+  `vk::Result`, in place of `DeviceCreation`, `VideoSessionCreation`,
+  `SessionParametersCreation`, `MemoryAllocation`, `ResourceCreation`,
+  `CommandBuffer`, `Synchronization`, `QueryPool` and `Vulkan(vk::Result)`.
+  A codec or memory type the device lacks is `NoSuitableDevice`, which
+  replaces `CodecNotSupported`. New are `Driver`, for a driver that reports
+  success with no usable result, `Io`, for a failed OS call, and
+  `Cancelled`, for a frame whose encoder shut down. `From<vk::Result>` is
+  removed.
+- Every failed Vulkan call on a lost device is `PixelForgeError::DeviceLost`.
+  Some were reported as another variant.
+- **Breaking:** `EncodedPacket::is_key_frame` is a method, not a field. An
+  IDR's `frame_type` is `FrameType::Idr`; it was `FrameType::I`.
+  `FrameType::Unknown`, which no packet had, is removed.
+- **Breaking:** types are renamed for what they are: `InputImage` is
+  `YuvUploader`, `InputFormat` is `RgbFormat`, `PixelFormat` is
+  `ChromaFormat` (with `EncodeConfig::chroma_format`, `with_chroma_format`
+  and `DecodedFrame::chroma_format`), and the DMA-BUF types are
+  `DmaBufImage`, `DmaBufFormat` and `DmaBufModifier`, from
+  `Encoder::dmabuf_format`. They were `ExternalImage`, `InputFormats`,
+  `InputModifier` and `Encoder::input_formats`.
+- **Breaking:** `VideoContextBuilder::device_requirements` and
+  `build_from_existing` adopt a caller's device for the codecs asked for with
+  `require_encode` and `require_decode`, so one adopted context can encode
+  and decode. They replace `encode_device_requirements`,
+  `decode_device_requirements`, `build_from_existing_encode` and
+  `build_from_existing_decode`. At least one codec must be asked for: an
+  encode adoption with none no longer takes every codec the device has.
 - **Breaking:** `StreamColor` replaces the raw `ColorDescription` in the
   encode API: `EncodeConfig::with_color` replaces `with_color_description`,
   `Encoder::reconfigure` replaces `set_color_description`, and
@@ -93,6 +145,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for its quality level properties before it fails.
 - `wall_latency_ns` starts before the encode submit. It started after it, so
   a submit that blocked in the driver made it shorter than the GPU time.
+
+### Removed
+
+- The encoder's internal modules are no longer public:
+  `encoder::{av1, bitwriter, dpb, gop, h264, h265, reorder, resources}` and
+  `decoder::h264`. Nothing in them was needed to encode or decode.
 
 ## [0.10.0] - 19-10-2026
 

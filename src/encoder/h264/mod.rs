@@ -11,9 +11,6 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::dpb::{
-    DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType,
-};
 use crate::encoder::pipeline::EncodeFuture;
 use crate::error::Result;
 use ash::vk;
@@ -32,17 +29,10 @@ pub(crate) struct ReferenceInfo {
 
 /// H.264-specific encoder state (everything the generic encoder doesn't own).
 pub(crate) struct H264 {
-    /// Decoded-picture-buffer bookkeeping (reference marking).
-    dpb: DecodedPictureBuffer,
     /// `frame_num` syntax element (mod `max_frame_num`).
     frame_num_syntax: u32,
     /// IDR picture id, toggled each IDR.
     idr_pic_id: u32,
-    /// Whether an L1 (backward) reference is available, for B-frames.
-    has_backward_reference: bool,
-    backward_reference_frame_num: u32,
-    backward_reference_poc: i32,
-    backward_reference_dpb_slot: u8,
     /// References held in the DPB, most-recent first. Each frame predicts
     /// from the first `active_reference_count`; the rest are kept for
     /// reference frame invalidation to fall back on.
@@ -70,18 +60,8 @@ impl VideoCodec for H264 {
         if plan.is_idr() {
             self.frame_num_syntax = 0;
             self.idr_pic_id = (self.idr_pic_id + 1) & 1;
-            // Reset the DPB for the new coded video sequence.
-            let dpb_config = DpbConfig {
-                dpb_size: common.dpb_slot_count as u32,
-                max_num_ref_frames: self.reference_window,
-                use_multiple_references: common.config.b_frame_count > 0,
-                log2_max_frame_num_minus4: 4,
-                log2_max_pic_order_cnt_lsb_minus4: 4,
-                ..Default::default()
-            };
-            self.dpb.h264.sequence_start(dpb_config);
+            // The IDR empties the DPB for the new coded video sequence.
             self.l0_references.clear();
-            self.has_backward_reference = false;
             // An IDR resets the decoder's whole DPB, so any deferred
             // unused-reference markings are moot.
             self.pending_unmark_frame_nums.clear();
@@ -93,10 +73,7 @@ impl VideoCodec for H264 {
             None
         };
 
-        Ok(PictureSetup {
-            frame_type: plan.frame_type(),
-            header,
-        })
+        Ok(PictureSetup { header })
     }
 
     fn record_picture(
@@ -113,28 +90,8 @@ impl VideoCodec for H264 {
         let frame_num = self.frame_num_syntax;
         let pic_order_cnt = plan.pic_order_cnt();
 
-        if plan.is_reference() && !plan.is_b_frame() {
-            self.frame_num_syntax = (frame_num + 1) % 256;
-        }
-
         if plan.is_reference() {
-            let pic_type = if plan.is_idr() {
-                PictureType::Idr
-            } else if plan.is_b_frame() {
-                PictureType::B
-            } else {
-                PictureType::P
-            };
-            let pic_info = PictureStartInfo {
-                frame_id: plan.display_order,
-                pic_order_cnt,
-                frame_num,
-                pic_type,
-                is_reference: true,
-                ..Default::default()
-            };
-            self.dpb.h264.picture_start(pic_info);
-            self.dpb.h264.picture_end(true);
+            self.frame_num_syntax = (frame_num + 1) % 256;
 
             // The current frame becomes a reference for subsequent frames.
             self.l0_references.insert(
@@ -181,8 +138,6 @@ impl VideoCodec for H264 {
             }
         }
         self.l0_references = survivors;
-        // A backward (L1) reference may also be tainted; only B-frames use it.
-        self.has_backward_reference = false;
         !self.l0_references.is_empty()
     }
 

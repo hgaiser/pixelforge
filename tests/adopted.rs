@@ -19,8 +19,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, InputFormat,
-    RateControl, RgbSource, Source, SourceImage, TimelinePoint,
+    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat,
+    RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -144,7 +144,10 @@ fn decode_all(
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut readback = Readback::new(context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(
+        context.clone(),
+        DecodeConfig::new(Codec::H264).with_byte_stream(),
+    )?;
     let mut frames = Vec::new();
     decode_stream(&mut decoder, stream, |frame| {
         let data = readback.read(&frame)?;
@@ -183,7 +186,7 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     let builder = VideoContextBuilder::new().require_decode(Codec::H264);
     let physical_device = same_gpu(&instance, &own);
     drop(own);
-    let reqs = builder.decode_device_requirements(&entry, &instance, physical_device)?;
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
     let app = create_app_device(entry, instance, physical_device, &reqs)?;
 
     let mut builder = builder
@@ -193,7 +196,7 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     if reqs.unified_image_layouts {
         builder = builder.declare_unified_image_layouts();
     }
-    let context = builder.build_from_existing_decode(
+    let context = builder.build_from_existing(
         app.entry.clone(),
         app.instance.clone(),
         app.physical_device,
@@ -251,7 +254,7 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
             .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
             .with_source(Source::Rgb(RgbSource::new(
-                InputFormat::BGRA,
+                RgbFormat::BGRA,
                 ColorSpec::Srgb,
             )))
             .with_conversion(ConversionPreference::Shader),
@@ -352,7 +355,7 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     let (entry, instance) = instance_1_1()?;
     let builder = VideoContextBuilder::new().require_encode(Codec::H264);
     let physical_device = same_gpu(&instance, &own);
-    let reqs = builder.encode_device_requirements(&entry, &instance, physical_device)?;
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
     assert!(
         reqs.extensions.contains(&ash::khr::push_descriptor::NAME),
         "the converter needs push descriptors, which every driver this runs on has"
@@ -362,7 +365,7 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .with_encode_queue(spare(&app, reqs.queues.encode.unwrap()))
         .with_transfer_queue(spare(&app, reqs.queues.transfer))
         .with_compute_queue(spare(&app, reqs.queues.compute))
-        .build_from_existing_encode(
+        .build_from_existing(
             app.entry.clone(),
             app.instance.clone(),
             app.physical_device,
@@ -397,5 +400,60 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
             "frame {i}: {psnr:.2} dB against the own-context encode"
         );
     }
+    Ok(())
+}
+
+/// One adopted device that both encodes and decodes: what it encodes decodes
+/// on it to what a context pixelforge created decodes from the same stream.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn encode_and_decode_on_one_adopted_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    let own = VideoContextBuilder::new()
+        .enable_validation(validation_requested())
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264)
+        .build()?;
+
+    let (entry, instance) = instance_1_1()?;
+    let physical_device = same_gpu(&instance, &own);
+    assert!(
+        VideoContextBuilder::new()
+            .device_requirements(&entry, &instance, physical_device)
+            .is_err(),
+        "requirements without a codec"
+    );
+    let builder = VideoContextBuilder::new()
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264);
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
+    for name in [
+        ash::khr::video_encode_h264::NAME,
+        ash::khr::video_decode_h264::NAME,
+    ] {
+        assert!(reqs.extensions.contains(&name), "{name:?} is missing");
+    }
+    let app = create_app_device(entry, instance, physical_device, &reqs)?;
+    let mut builder = builder
+        .with_encode_queue(spare(&app, reqs.queues.encode.unwrap()))
+        .with_decode_queue(spare(&app, reqs.queues.decode.unwrap()))
+        .with_transfer_queue(spare(&app, reqs.queues.transfer))
+        .with_compute_queue(spare(&app, reqs.queues.compute));
+    if reqs.unified_image_layouts {
+        builder = builder.declare_unified_image_layouts();
+    }
+    let context = builder.build_from_existing(
+        app.entry.clone(),
+        app.instance.clone(),
+        app.physical_device,
+        app.device.clone(),
+    )?;
+    let stream = encode_all(&context, Wait::Gpu)?;
+    let actual = decode_all(&context, &stream)?;
+    drop(context);
+
+    let expected = decode_all(&own, &stream)?;
+    assert_eq!(actual.len(), ENCODE_FRAMES as usize, "frame count");
+    assert!(actual == expected, "the adopted decode differs");
     Ok(())
 }

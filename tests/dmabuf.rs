@@ -17,9 +17,9 @@ use ash::vk::TaggedStructure;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::external::drm_format;
 use pixelforge::{
-    Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufPlane, EncodeBitDepth,
-    EncodeConfig, Encoder, ExternalImage, Frame, Handoff, InputFormat, InputImage, PixelFormat,
-    RateControl, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder,
+    Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufImage, DmaBufPlane,
+    EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat, RgbSource, Source, SourceImage,
+    VideoContext, VideoContextBuilder, YuvLayout, YuvUploader,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -427,19 +427,11 @@ fn encode_reference(
     config: EncodeConfig,
     frames: &[Vec<u8>],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (w, h) = (config.dimensions.width, config.dimensions.height);
     let mut encoder = Encoder::new(context.clone(), config.clone())?;
-    let mut input = InputImage::new(
-        context.clone(),
-        config.codec,
-        w,
-        h,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let mut input = YuvUploader::for_encoder(&encoder)?;
     let mut stream = Vec::new();
     for frame in frames {
-        input.upload_nv12(frame)?;
+        input.upload(YuvLayout::Nv12, frame)?;
         stream.extend(pollster::block_on(encoder.submit(Frame::image(input.source()))?)?.data);
     }
     Ok(stream)
@@ -449,7 +441,7 @@ fn encode_reference(
 fn encode_external(
     encoder: &mut Encoder,
     producer: &mut Producer,
-    external: &ExternalImage,
+    external: &DmaBufImage,
     frames: &[Vec<u8>],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut stream = Vec::new();
@@ -463,7 +455,7 @@ fn encode_external(
 
 /// Every modifier the encoder can allocate.
 fn exportable_modifiers(encoder: &Encoder) -> Vec<u64> {
-    encoder.input_formats().map_or(Vec::new(), |formats| {
+    encoder.dmabuf_format().map_or(Vec::new(), |formats| {
         formats
             .modifiers
             .iter()
@@ -526,7 +518,7 @@ fn copy_only_modifiers_are_copied() -> Result<(), Box<dyn std::error::Error>> {
     let frames: Vec<Vec<u8>> = (0..FRAMES).map(|n| nv12_frame(w, h, n)).collect();
     let reference = encode_reference(&context, config(Codec::H264, w, h), &frames)?;
     let mut encoder = Encoder::new(context.clone(), config(Codec::H264, w, h))?;
-    let formats = encoder.input_formats()?;
+    let formats = encoder.dmabuf_format()?;
     let Some(copy_only) = formats
         .modifiers
         .iter()
@@ -551,7 +543,7 @@ fn copy_only_modifiers_are_copied() -> Result<(), Box<dyn std::error::Error>> {
 fn rgb_buffers_are_converted_directly() -> Result<(), Box<dyn std::error::Error>> {
     let context = context()?;
     let (w, h) = (320, 256);
-    let rgb = Source::Rgb(RgbSource::new(InputFormat::BGRA, ColorSpec::Srgb));
+    let rgb = Source::Rgb(RgbSource::new(RgbFormat::BGRA, ColorSpec::Srgb));
     let shader = |c: EncodeConfig| {
         c.with_source(rgb)
             .with_conversion(ConversionPreference::Shader)
@@ -614,7 +606,10 @@ fn unaligned_sizes_are_read_at_the_display_size() -> Result<(), Box<dyn std::err
     let stream = encode_external(&mut encoder, &mut producer, &allocated, &frames)?;
 
     let mut readback = Readback::new(&context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(
+        context.clone(),
+        DecodeConfig::new(Codec::H264).with_byte_stream(),
+    )?;
     let mut decoded = Vec::new();
     decode_stream(&mut decoder, &stream, |frame| {
         decoded.push(readback.read(&frame)?.y);

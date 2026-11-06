@@ -55,14 +55,14 @@ impl DecoderCommon {
         unsafe {
             device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
             device
                 .begin_command_buffer(
                     command_buffer,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
         }
 
         let to_transfer = [
@@ -94,7 +94,7 @@ impl DecoderCommon {
             base_array_layer: 0,
             layer_count: 1,
         };
-        let (cdiv_hor, cdiv_vert) = frame.pixel_format.chroma_div();
+        let (cdiv_hor, cdiv_vert) = frame.chroma_format.chroma_div();
         let regions = [
             vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {

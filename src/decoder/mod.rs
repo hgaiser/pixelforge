@@ -29,23 +29,44 @@
 //!   image is valid for exactly as long as the frame is; see [`DecodedFrame`]
 //!   for what holding one costs.
 //!
-//! # Limitations (H.264)
+//! # Limitations
 //!
-//! - Progressive streams only (no interlaced/field coding).
-//! - Streams using explicit scaling matrices are rejected.
-//!
-//! Reference management is complete (IDR, sliding-window, and MMCO), so any
-//! stream this crate's encoder produces — and typical output from x264, NVENC
-//! and friends, including B-pyramid — decodes correctly.
+//! - **H.264**: progressive streams only (no interlaced/field coding), and no
+//!   explicit scaling matrices. Reference management is complete (IDR,
+//!   sliding-window, and MMCO), so any stream this crate's encoder produces,
+//!   and typical output from x264, NVENC and friends, including B-pyramid,
+//!   decodes correctly.
+//! - **H.265**: the base layer only; Main and Main 10 (and 4:2:2 or 4:4:4 where
+//!   the device has the profile), progressive. The screen content and
+//!   multi-layer extensions are rejected. RASL pictures after the CRA that
+//!   decoding starts at are skipped, as the standard allows.
+//! - **AV1**: low-overhead OBU streams (the format of `.obu` files, IVF and
+//!   MP4), not Annex B; operating point 0. Monochrome streams and 12-bit are
+//!   rejected. Film grain is applied, which takes a second image for every DPB
+//!   slot. A device whose DPB and output images do not coincide is not
+//!   supported.
 
+/// Annex B start-code framing, shared by H.264 and H.265.
+pub(crate) mod annexb;
+/// AV1 decoding.
+pub(crate) mod av1;
 pub(crate) mod bitreader;
 /// The Vulkan video session and the per-decoder state every codec shares.
 pub(crate) mod common;
+/// The decode flow every codec shares.
+pub(crate) mod driver;
 /// Frame ownership: pool images, DPB slot pins, display-order reordering.
 pub(crate) mod frames;
 /// H.264 decoding.
-pub mod h264;
+pub(crate) mod h264;
+/// H.265 decoding.
+pub(crate) mod h265;
 pub(crate) mod pipeline;
+/// Turning what a stream needs into a session plan.
+pub(crate) mod plan;
+pub(crate) mod profile;
+/// The structures a decode command is recorded from.
+pub(crate) mod record;
 /// Readback and copies, all of which run on the transfer queue.
 pub(crate) mod transfer;
 
@@ -56,7 +77,7 @@ use std::task::{Context, Poll};
 use ash::vk;
 use futures_core::Stream;
 
-use crate::encoder::{BitDepth, Codec, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, Codec};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 
@@ -113,10 +134,10 @@ pub struct DecodeConfig {
 }
 
 impl DecodeConfig {
-    /// Create an H.264 decode configuration.
-    pub fn h264() -> Self {
+    /// Create a decode configuration for `codec`.
+    pub fn new(codec: Codec) -> Self {
         Self {
-            codec: Codec::H264,
+            codec,
             output_depth: DEFAULT_OUTPUT_DEPTH,
             consumer_queue_family: None,
             framing: Framing::FrameAligned,
@@ -162,9 +183,8 @@ impl DecodeConfig {
     /// Passing that family here adds it to the sharing set, so frames can be
     /// sampled directly with no ownership transfer and no copy. Set it whenever
     /// frames are consumed by anything outside the decoder; for a context
-    /// adopted from an existing device
-    /// (see
-    /// [`build_from_existing_decode`](crate::vulkan::VideoContextBuilder::build_from_existing_decode))
+    /// adopted from an existing device (see
+    /// [`build_from_existing`](crate::vulkan::VideoContextBuilder::build_from_existing))
     /// this is the family the caller already renders on.
     pub fn with_consumer_queue_family(mut self, family: u32) -> Self {
         self.consumer_queue_family = Some(family);
@@ -225,8 +245,8 @@ pub struct DecodedFrame {
     /// non-layered DPB or a distinct output image; the DPB slot's layer
     /// when the DPB is layered and the driver decoded straight into it.
     pub array_layer: u32,
-    /// The pixel format of this frame.
-    pub pixel_format: PixelFormat,
+    /// The chroma format of this frame.
+    pub chroma_format: ChromaFormat,
     /// Bit depth of the samples: eight for NV12, ten for P010.
     pub bit_depth: BitDepth,
     /// Which set of decoder images [`image`](Self::image) belongs to.
@@ -393,19 +413,24 @@ impl Decoder {
     /// and [`VideoContext::supports_decode`]).
     pub fn new(context: VideoContext, config: DecodeConfig) -> Result<Self> {
         if !context.supports_decode(config.codec) {
-            return Err(PixelForgeError::CodecNotSupported(format!(
+            return Err(PixelForgeError::NoSuitableDevice(format!(
                 "{:?} decode is not supported by the selected device",
                 config.codec
             )));
         }
         let mut inner: Box<dyn DecoderApi> = match config.codec {
-            Codec::H264 => Box::new(h264::H264Decoder::create(context, &config)?),
-            other => {
-                return Err(PixelForgeError::CodecNotSupported(format!(
-                    "{:?} decoding is not implemented yet",
-                    other
-                )));
-            }
+            Codec::H264 => Box::new(driver::StreamDecoder::new(
+                h264::H264Decoder::create(context, &config)?,
+                &config,
+            )),
+            Codec::H265 => Box::new(driver::StreamDecoder::new(
+                h265::H265Decoder::create(context, &config)?,
+                &config,
+            )),
+            Codec::AV1 => Box::new(driver::StreamDecoder::new(
+                av1::Av1Decoder::create(context, &config)?,
+                &config,
+            )),
         };
         let rx = inner
             .take_frame_receiver()

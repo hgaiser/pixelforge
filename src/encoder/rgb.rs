@@ -8,8 +8,8 @@
 //! matrix, range and chroma siting to convert with.
 
 use super::support::report;
-use super::{BitDepth, Codec, ColorDescription, EncodeConfig, PixelFormat, StreamColor};
-use crate::converter::InputFormat;
+use super::{BitDepth, ChromaFormat, Codec, ColorDescription, EncodeConfig, StreamColor};
+use crate::converter::RgbFormat;
 use crate::error::{PixelForgeError, Result};
 use crate::video::query_supported_video_formats;
 use crate::vulkan::VideoContext;
@@ -26,13 +26,13 @@ pub(crate) fn rgb_conversion_profile() -> vk::VideoEncodeProfileRgbConversionInf
 /// 8-bit RGB becomes 8-bit YUV and 10-bit RGB 10-bit YUV. Half floats carry
 /// values outside the 0 to 1 range that need tone mapping first, which only
 /// the colour converter does.
-pub(crate) fn rgb_input_bit_depth(format: InputFormat) -> Option<BitDepth> {
+pub(crate) fn rgb_input_bit_depth(format: RgbFormat) -> Option<BitDepth> {
     match format {
-        InputFormat::BGRx | InputFormat::BGRA | InputFormat::RGBx | InputFormat::RGBA => {
+        RgbFormat::BGRx | RgbFormat::BGRA | RgbFormat::RGBx | RgbFormat::RGBA => {
             Some(BitDepth::Eight)
         }
-        InputFormat::ABGR2101010 => Some(BitDepth::Ten),
-        InputFormat::RGBA16F => None,
+        RgbFormat::ABGR2101010 => Some(BitDepth::Ten),
+        RgbFormat::RGBA16F => None,
     }
 }
 
@@ -45,7 +45,7 @@ pub(crate) fn rgb_input_bit_depth(format: InputFormat) -> Option<BitDepth> {
 pub(crate) fn check_rgb_input(
     context: &VideoContext,
     config: &EncodeConfig,
-    format: InputFormat,
+    format: RgbFormat,
 ) -> Result<()> {
     if !context.has_video_encode_rgb_conversion() {
         return Err(PixelForgeError::NoSuitableDevice(
@@ -60,11 +60,11 @@ pub(crate) fn check_rgb_input(
              converter does"
         )));
     };
-    if config.pixel_format != PixelFormat::Yuv420 || config.bit_depth != bit_depth {
+    if config.chroma_format != ChromaFormat::Yuv420 || config.bit_depth != bit_depth {
         return Err(PixelForgeError::InvalidInput(format!(
             "RGB input: {format:?} converts to {bit_depth:?} 4:2:0, but the encoder is set \
              up for {:?} {:?}",
-            config.bit_depth, config.pixel_format
+            config.bit_depth, config.chroma_format
         )));
     }
     Ok(())
@@ -159,7 +159,7 @@ impl VideoContext {
     /// profile exists, that its conversion does `color`'s matrix and range,
     /// and that it accepts `format` as an input image. The output is always
     /// 4:2:0, at 8 bits for 8-bit RGB and 10 bits for
-    /// [`InputFormat::ABGR2101010`]. Resolution and rate control are not
+    /// [`RgbFormat::ABGR2101010`]. Resolution and rate control are not
     /// considered.
     ///
     /// When this is true, an encoder for an RGB [`Source`](crate::Source) in
@@ -168,7 +168,7 @@ impl VideoContext {
     pub fn supports_rgb_encode_input(
         &self,
         codec: Codec,
-        format: InputFormat,
+        format: RgbFormat,
         color: StreamColor,
     ) -> bool {
         if matches!(color, StreamColor::Other(_)) {
@@ -185,7 +185,7 @@ impl VideoContext {
         let what = format!("{codec:?} encode from {format:?} RGB");
         let formats = self.query_encode_profile(
             codec,
-            PixelFormat::Yuv420,
+            ChromaFormat::Yuv420,
             bit_depth,
             Some(&mut caps),
             |profile| {

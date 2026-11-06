@@ -9,8 +9,8 @@
 //!   cargo bench --bench encode
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderTuningMode, Frame, InputImage,
-    PixelFormat, RateControl, VideoContextBuilder,
+    Codec, EncodeConfig, Encoder, EncoderTuningMode, Frame, RateControl, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 use std::fs::File;
 use std::io::Read;
@@ -134,16 +134,9 @@ fn run_encode_test(
 
     println!("Config: {:?}, GOP={}", config.rate_control, config.gop_size);
 
-    // Create input image for uploading frames.
-    let mut input_image = InputImage::new(
-        context.clone(),
-        codec,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
     let mut encoder = Encoder::new(context.clone(), config)?;
+    // Create input image for uploading frames.
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
     let mut total_bytes = 0;
 
     let mut gpu_durations: Vec<Duration> = Vec::new();
@@ -169,7 +162,7 @@ fn run_encode_test(
         let frame = &yuv_data[i * frame_size..(i + 1) * frame_size];
 
         // Upload YUV420 data to the input image
-        input_image.upload_yuv420(frame)?;
+        input_image.upload(YuvLayout::I420, frame)?;
 
         pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
         // drain before submitting when at capacity

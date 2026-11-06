@@ -22,45 +22,9 @@ pub enum PixelForgeError {
     #[error("The Vulkan device was lost")]
     DeviceLost,
 
-    /// Vulkan logical device creation failed.
-    #[error("Failed to create Vulkan device: {0}")]
-    DeviceCreation(String),
-
-    /// Video session creation failed.
-    #[error("Failed to create video session: {0}")]
-    VideoSessionCreation(String),
-
-    /// Video session parameters creation failed.
-    #[error("Failed to create video session parameters: {0}")]
-    SessionParametersCreation(String),
-
-    /// Memory allocation failed.
-    #[error("Memory allocation failed: {0}")]
-    MemoryAllocation(String),
-
-    /// Resource creation failed (images, buffers, fences, command pools, etc.).
-    #[error("Failed to create resource: {0}")]
-    ResourceCreation(String),
-
-    /// Command buffer operation failed.
-    #[error("Command buffer error: {0}")]
-    CommandBuffer(String),
-
     /// Invalid input (dimensions, data size, format, etc.).
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-
-    /// Codec not supported.
-    #[error("Codec not supported: {0}")]
-    CodecNotSupported(String),
-
-    /// Synchronization primitive error.
-    #[error("Synchronization error: {0}")]
-    Synchronization(String),
-
-    /// Query pool error.
-    #[error("Query pool error: {0}")]
-    QueryPool(String),
 
     /// The encoded bitstream overflowed the destination buffer.
     #[error("Encoder bitstream buffer overflow (wrote {written} bytes into {capacity} bytes)")]
@@ -71,26 +35,49 @@ pub enum PixelForgeError {
         capacity: usize,
     },
 
-    /// Generic Vulkan error.
-    #[error("Vulkan error: {0}")]
-    Vulkan(ash::vk::Result),
-}
+    /// A Vulkan call failed. A lost device is [`Self::DeviceLost`] instead.
+    #[error("{call} failed: {result}")]
+    Vulkan {
+        /// The Vulkan function that failed.
+        call: &'static str,
+        /// What it returned.
+        result: ash::vk::Result,
+    },
 
-impl From<ash::vk::Result> for PixelForgeError {
-    fn from(result: ash::vk::Result) -> Self {
-        Self::vk(result, |_| PixelForgeError::Vulkan(result))
-    }
+    /// The driver reported success, but what it returned cannot be used,
+    /// such as an encode that wrote no bytes.
+    #[error("Driver error: {0}")]
+    Driver(String),
+
+    /// An operating system call failed.
+    #[error("{what} failed: {source}")]
+    Io {
+        /// What failed.
+        what: &'static str,
+        /// The error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The encoder was dropped before the frame was read back.
+    #[error("Encode cancelled: the encoder shut down before the frame was read back")]
+    Cancelled,
 }
 
 impl PixelForgeError {
-    /// `wrap` the description of a failed Vulkan call, except a lost device,
-    /// which is always [`Self::DeviceLost`].
-    pub(crate) fn vk(result: ash::vk::Result, wrap: impl FnOnce(String) -> Self) -> Self {
+    /// The error for `result` from the Vulkan function `call`: a lost device
+    /// is always [`Self::DeviceLost`].
+    pub(crate) fn vulkan(call: &'static str, result: ash::vk::Result) -> Self {
         if result == ash::vk::Result::ERROR_DEVICE_LOST {
             Self::DeviceLost
         } else {
-            wrap(result.to_string())
+            Self::Vulkan { call, result }
         }
+    }
+
+    /// [`Self::vulkan`] for `map_err`.
+    pub(crate) fn vk(call: &'static str) -> impl FnOnce(ash::vk::Result) -> Self {
+        move |result| Self::vulkan(call, result)
     }
 }
 
@@ -105,22 +92,15 @@ mod tests {
     #[test]
     fn a_lost_device_is_always_device_lost() {
         assert!(matches!(
-            PixelForgeError::vk(
-                vk::Result::ERROR_DEVICE_LOST,
-                PixelForgeError::CommandBuffer
-            ),
+            PixelForgeError::vulkan("vkQueueSubmit", vk::Result::ERROR_DEVICE_LOST),
             PixelForgeError::DeviceLost
         ));
         assert!(matches!(
-            PixelForgeError::from(vk::Result::ERROR_DEVICE_LOST),
-            PixelForgeError::DeviceLost
-        ));
-        assert!(matches!(
-            PixelForgeError::vk(
-                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
-                PixelForgeError::CommandBuffer
-            ),
-            PixelForgeError::CommandBuffer(_)
+            PixelForgeError::vk("vkQueueSubmit")(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            PixelForgeError::Vulkan {
+                call: "vkQueueSubmit",
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+            }
         ));
     }
 }

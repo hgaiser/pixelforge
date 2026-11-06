@@ -160,7 +160,10 @@ impl DecodePipeline {
         let completion_thread = std::thread::Builder::new()
             .name("pixelforge-decode-completion".to_string())
             .spawn(move || run_completion_thread(thread_device, work_rx, thread_sync, frames_tx))
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn completion thread: {e}")))?;
+            .map_err(|source| PixelForgeError::Io {
+                what: "spawning the completion thread",
+                source,
+            })?;
 
         Ok((
             Self {
@@ -250,10 +253,10 @@ impl DecodePipeline {
         unsafe {
             device
                 .end_command_buffer(slot.decode_command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
             device
                 .reset_fences(&[slot.decode_fence])
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetFences"))?;
         }
 
         // A timeline wait on value 0 is satisfied immediately, so the first
@@ -288,7 +291,7 @@ impl DecodePipeline {
         unsafe {
             sync2
                 .queue_submit2(decode_queue, &[submit], slot.decode_fence)
-                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
+                .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
 
         self.decodes.commit();
@@ -312,10 +315,10 @@ impl DecodePipeline {
         unsafe {
             device
                 .end_command_buffer(slot.transfer_command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
             device
                 .reset_fences(&[slot.transfer_fence])
-                .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetFences"))?;
         }
 
         let waits = [
@@ -344,7 +347,7 @@ impl DecodePipeline {
         unsafe {
             sync2
                 .queue_submit2(transfer_queue, &[submit], slot.transfer_fence)
-                .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
+                .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
 
         self.copies.commit();
@@ -451,10 +454,7 @@ fn run_completion_thread(
             if let Err(e) = wait
                 && let Some(tx) = &frames_tx
             {
-                let _ = tx.unbounded_send(Err(PixelForgeError::vk(
-                    e,
-                    PixelForgeError::Synchronization,
-                )));
+                let _ = tx.unbounded_send(Err(PixelForgeError::vulkan("vkWaitForFences", e)));
             }
         }
 

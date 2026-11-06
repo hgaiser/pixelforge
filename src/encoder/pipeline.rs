@@ -45,7 +45,7 @@ use crate::encoder::resources::{
     create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
-use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, EncodedPacket, FrameType};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{SlotSync, TimelineChain};
@@ -108,12 +108,7 @@ impl Future for EncodeFuture {
             })),
             // The sender was dropped without sending. The completion thread only
             // drops a sender after sending, so this indicates encoder teardown.
-            Poll::Ready(Err(oneshot::Canceled)) => {
-                Poll::Ready(Err(PixelForgeError::CommandBuffer(
-                    "encode cancelled: encoder shut down before the frame was read back"
-                        .to_string(),
-                )))
-            }
+            Poll::Ready(Err(oneshot::Canceled)) => Poll::Ready(Err(PixelForgeError::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -130,7 +125,6 @@ pub(crate) const ENCODE_PIPELINE_DEPTH: usize = 2;
 /// when the completion thread reads the slot back.
 pub(crate) struct SlotPacketMetadata {
     pub frame_type: FrameType,
-    pub is_key_frame: bool,
     pub pts: u64,
     pub dts: u64,
     /// Codec header (SPS/PPS, VPS/SPS/PPS, or AV1 sequence header) to prepend.
@@ -203,7 +197,7 @@ pub(crate) struct PipelineConfig<'a> {
     pub picture_format: vk::Format,
     /// Whether the input image is RGB, for the encoder to convert.
     pub rgb_input: bool,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     pub bitstream_buffer_size: usize,
     /// Codec profile (with the codec-specific profile chained in) used for the
@@ -293,7 +287,7 @@ impl EncodePipeline {
                     image: input_image,
                     width: config.aligned_width,
                     height: config.aligned_height,
-                    pixel_format: config.pixel_format,
+                    chroma_format: config.chroma_format,
                     bit_depth: config.bit_depth,
                     rgb: config.rgb_input,
                 },
@@ -344,7 +338,10 @@ impl EncodePipeline {
             .spawn(move || {
                 run_completion_thread(thread_device, work_rx, thread_sync);
             })
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn readback thread: {e}")))?;
+            .map_err(|source| PixelForgeError::Io {
+                what: "spawning the readback thread",
+                source,
+            })?;
 
         Ok(Self {
             slots,
@@ -423,7 +420,7 @@ impl EncodePipeline {
         ) = {
             let slot = &mut self.slots[slot_index];
             let metadata = slot.pending_metadata.take().ok_or_else(|| {
-                PixelForgeError::CommandBuffer(
+                PixelForgeError::InvalidInput(
                     "submit_current called without pending packet metadata".to_string(),
                 )
             })?;
@@ -632,7 +629,6 @@ fn run_completion_thread(
         let packet = result.map(|()| EncodedPacket {
             data,
             frame_type: work.metadata.frame_type,
-            is_key_frame: work.metadata.is_key_frame,
             pts: work.metadata.pts,
             dts: work.metadata.dts,
             stats,

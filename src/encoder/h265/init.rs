@@ -1,11 +1,10 @@
 use super::{CTB_SIZE, H265};
 
-use crate::converter::InputFormat;
+use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
-use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h265_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
@@ -21,18 +20,18 @@ impl H265 {
     pub(crate) fn create(
         context: VideoContext,
         config: EncodeConfig,
-        rgb_input: Option<InputFormat>,
+        rgb_input: Option<RgbFormat>,
     ) -> Result<CodecEncoder<Self>> {
         info!(
-            "Creating H.265 encoder: {}x{}, pixel_format={:?}",
-            config.dimensions.width, config.dimensions.height, config.pixel_format
+            "Creating H.265 encoder: {}x{}, chroma_format={:?}",
+            config.dimensions.width, config.dimensions.height, config.chroma_format
         );
 
         let profile_idc =
-            h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
+            h265_profile_idc(config.chroma_format, config.bit_depth).ok_or_else(|| {
                 PixelForgeError::InvalidInput(format!(
                     "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
-                    config.pixel_format, config.bit_depth
+                    config.chroma_format, config.bit_depth
                 ))
             })?;
 
@@ -74,23 +73,8 @@ impl H265 {
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
-        let mut dpb = DecodedPictureBuffer::new();
-        dpb.h265.sequence_start(DpbConfig {
-            dpb_size: common.dpb_slot_count as u32,
-            max_num_ref_frames: if config.b_frame_count > 0 { 2 } else { 1 },
-            use_multiple_references: config.b_frame_count > 0,
-            max_long_term_refs: 0,
-            log2_max_frame_num_minus4: 0,
-            log2_max_pic_order_cnt_lsb_minus4: 4,
-            num_temporal_layers: 1,
-        });
-
         let codec = H265 {
-            dpb,
             header_data: None,
-            has_backward_reference: false,
-            backward_reference_poc: 0,
-            backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
             reference_window,
             active_reference_count,

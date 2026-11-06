@@ -4,7 +4,7 @@ use super::H265;
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -27,9 +27,9 @@ impl H265 {
         let pic_width_in_luma_samples = common.aligned_width;
         let pic_height_in_luma_samples = common.aligned_height;
 
-        let (sub_width_c, sub_height_c) = match config.pixel_format {
-            PixelFormat::Yuv420 => (2u32, 2u32),
-            PixelFormat::Yuv444 => (1u32, 1u32),
+        let (sub_width_c, sub_height_c) = match config.chroma_format {
+            ChromaFormat::Yuv420 => (2u32, 2u32),
+            ChromaFormat::Yuv444 => (1u32, 1u32),
             _ => (2u32, 2u32),
         };
         let conf_win_right_offset = (common.aligned_width - config.dimensions.width) / sub_width_c;
@@ -130,7 +130,7 @@ impl H265 {
                 1,
                 // chroma_loc_info_present_flag: 4:2:0 chroma sits on the left
                 // luma sample, midway between the two rows (type 0).
-                matches!(config.pixel_format, PixelFormat::Yuv420) as u32,
+                matches!(config.chroma_format, ChromaFormat::Yuv420) as u32,
                 0,
                 0,
                 0,
@@ -181,17 +181,17 @@ impl H265 {
             BitDepth::Ten => 2,
         };
 
-        let chroma_format_idc = match config.pixel_format {
-            PixelFormat::Yuv420 => {
+        let chroma_format_idc = match config.chroma_format {
+            ChromaFormat::Yuv420 => {
                 ash::vk::native::StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420
             }
-            PixelFormat::Yuv444 => {
+            ChromaFormat::Yuv444 => {
                 ash::vk::native::StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_444
             }
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "Unsupported pixel format for H.265: {:?}",
-                    config.pixel_format
+                    "Unsupported chroma format for H.265: {:?}",
+                    config.chroma_format
                 )));
             }
         };
@@ -355,10 +355,10 @@ impl H265 {
             )
         };
         if result != vk::Result::SUCCESS {
-            return Err(PixelForgeError::SessionParametersCreation(format!(
-                "{:?}",
-                result
-            )));
+            return Err(PixelForgeError::vulkan(
+                "vkCreateVideoSessionParametersKHR",
+                result,
+            ));
         }
         Ok(session_params)
     }

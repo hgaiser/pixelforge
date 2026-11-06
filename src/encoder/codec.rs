@@ -15,8 +15,7 @@
 use ash::vk;
 use ash::vk::TaggedStructure;
 
-use crate::converter::InputFormat;
-use crate::encoder::dpb::MAX_DPB_SLOTS;
+use crate::converter::RgbFormat;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
 use crate::encoder::pipeline::{
@@ -25,8 +24,9 @@ use crate::encoder::pipeline::{
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::resources::{
     EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
-    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
-    query_supported_video_formats, upload_image_to_input,
+    create_dpb_images, destroy_encoder_resources, end_timestamp, get_video_format, lcm,
+    query_supported_video_formats, record_post_encode_dpb_barrier, reset_start_timestamp,
+    upload_image_to_input,
 };
 use crate::encoder::rgb::RgbConversionCaps;
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl, StreamColor};
@@ -34,6 +34,9 @@ use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{TimelineChain, allocate_command_buffers};
 use crate::vulkan::VideoContext;
+
+/// The most DPB slots an encoder uses, for any codec.
+pub(crate) const MAX_DPB_SLOTS: usize = 16;
 
 /// Per-encoder state shared by every codec.
 ///
@@ -101,7 +104,7 @@ pub(crate) struct EncoderCommon {
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
-    pub rgb_input: Option<InputFormat>,
+    pub rgb_input: Option<RgbFormat>,
 }
 
 impl EncoderCommon {
@@ -165,7 +168,7 @@ impl EncoderCommon {
                     dst_image: slot_image,
                     width: self.config.dimensions.width,
                     height: self.config.dimensions.height,
-                    pixel_format: self.config.pixel_format,
+                    chroma_format: self.config.chroma_format,
                     input_image_layout: slot_layout,
                     rgb: self.rgb_input.is_some(),
                     upload_queue: self.context.transfer_queue(),
@@ -312,6 +315,116 @@ impl EncoderCommon {
         Ok(future)
     }
 
+    /// Record one frame's encode into the current slot's command buffer,
+    /// from begin coding to the end of the command buffer, and submit it.
+    ///
+    /// The codec builds what differs: the reference slots, the encode info
+    /// with its picture info, and its rate control structs.
+    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<EncodeFuture>
+    where
+        R: for<'x> vk::Extends<vk::VideoBeginCodingInfoKHR<'x>>
+            + for<'x> vk::Extends<vk::VideoCodingControlInfoKHR<'x>>
+            + TaggedStructure<'static>
+            + Copy,
+        L: for<'x> vk::Extends<vk::VideoEncodeRateControlLayerInfoKHR<'x>>
+            + TaggedStructure<'static>,
+    {
+        let slot = self.pipeline.current();
+        let command_buffer = slot.encode_command_buffer;
+        let query_pool = slot.query_pool;
+        let timestamp_query_pool = slot.timestamp_query_pool;
+        let rc = cmd.rate_control;
+
+        let mut codec_layer = cmd.codec_layer;
+        let rc_layers = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(rc.average_bitrate as u64)
+            .max_bitrate(rc.max_bitrate as u64)
+            .frame_rate_numerator(self.config.frame_rate.numerator)
+            .frame_rate_denominator(self.config.frame_rate.denominator)
+            .push(&mut codec_layer)];
+        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
+        if !rc.is_disabled() {
+            rc_info = rc_info
+                .layers(&rc_layers)
+                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
+        }
+
+        reset_start_timestamp(self.device(), command_buffer, timestamp_query_pool);
+
+        // Ash links pNext chains in place, so each command needs its own
+        // extension structs. The first frame sets rate control with the
+        // control command below, after RESET, rather than here.
+        let mut begin_codec_rc = cmd.codec_rate_control;
+        let mut begin_rc = rc_info;
+        let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.session_params)
+            .reference_slots(cmd.begin_slots)
+            .push(&mut begin_codec_rc);
+        if !cmd.first_frame {
+            begin_info = begin_info.push(&mut begin_rc);
+        }
+        unsafe {
+            self.video_queue_fn
+                .cmd_begin_video_coding(command_buffer, &begin_info);
+        }
+
+        // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command (matches
+        // FFmpeg; required for AMD RADV).
+        if cmd.reset {
+            let mut codec_rc = cmd.codec_rate_control;
+            let mut quality_level_info =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                )
+                .push(&mut rc_info)
+                .push(&mut codec_rc)
+                .push(&mut quality_level_info);
+            unsafe {
+                self.video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control_info);
+            }
+        }
+
+        unsafe {
+            let device = self.device();
+            device.cmd_begin_query(
+                command_buffer,
+                query_pool,
+                0,
+                vk::QueryControlFlags::empty(),
+            );
+            self.video_encode_fn
+                .cmd_encode_video(command_buffer, cmd.encode_info);
+            device.cmd_end_query(command_buffer, query_pool, 0);
+            end_timestamp(device, command_buffer, timestamp_query_pool);
+
+            if cmd.post_encode_barrier {
+                record_post_encode_dpb_barrier(
+                    device,
+                    command_buffer,
+                    &self.dpb_images,
+                    self.use_layered_dpb,
+                    self.current_dpb_slot,
+                );
+            }
+
+            self.video_queue_fn
+                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
+            self.record_source_release(command_buffer);
+            self.device()
+                .end_command_buffer(command_buffer)
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
+        }
+
+        self.submit_frame()
+    }
+
     /// Epilogue: advance to the next pipeline slot.
     pub fn advance(&mut self) {
         self.pipeline.advance();
@@ -353,9 +466,6 @@ impl FramePlan {
     pub fn is_reference(&self) -> bool {
         self.gop.is_reference
     }
-    pub fn is_b_frame(&self) -> bool {
-        self.gop.frame_type == GopFrameType::B
-    }
     pub fn is_first_frame(&self) -> bool {
         self.encode_index == 0
     }
@@ -365,20 +475,41 @@ impl FramePlan {
     /// The stream-level frame type for packet metadata.
     pub fn frame_type(&self) -> FrameType {
         match self.gop.frame_type {
-            GopFrameType::Idr | GopFrameType::I => FrameType::I,
+            GopFrameType::Idr => FrameType::Idr,
             GopFrameType::P => FrameType::P,
-            GopFrameType::B => FrameType::B,
         }
     }
 }
 
-/// The codec header (if any) and stream frame type produced by
-/// [`VideoCodec::begin_picture`].
+/// The codec header (if any) produced by [`VideoCodec::begin_picture`].
 pub(crate) struct PictureSetup {
-    pub frame_type: FrameType,
     /// Codec header to prepend (SPS/PPS, VPS/SPS/PPS, AV1 sequence header).
     /// `Some` only for frames that carry one (typically the IDR/key frame).
     pub header: Option<Vec<u8>>,
+}
+
+/// What differs between the codecs in one frame's encode commands, for
+/// [`EncoderCommon::record_encode`].
+pub(crate) struct EncodeCommands<'a, R, L> {
+    /// The slots for begin coding: the setup slot as inactive (index -1),
+    /// if the frame is a reference, then the references it uses.
+    pub begin_slots: &'a [vk::VideoReferenceSlotInfoKHR<'a>],
+    /// The encode, with the codec's picture info chained in.
+    pub encode_info: &'a vk::VideoEncodeInfoKHR<'a>,
+    pub rate_control: &'a RateControlPlan,
+    /// The codec's rate control info, such as
+    /// `VideoEncodeH264RateControlInfoKHR`.
+    pub codec_rate_control: R,
+    /// The codec's rate control layer info, such as
+    /// `VideoEncodeH264RateControlLayerInfoKHR`.
+    pub codec_layer: L,
+    /// Whether this is the session's first frame.
+    pub first_frame: bool,
+    /// Whether to reset the coding state and set rate control and the
+    /// quality level with a control command. At least on the first frame.
+    pub reset: bool,
+    /// Whether to make the DPB write visible with a barrier after the encode.
+    pub post_encode_barrier: bool,
 }
 
 /// The resolved rate-control decision for a frame.
@@ -510,8 +641,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
-            frame_type: setup.frame_type,
-            is_key_frame: plan.is_idr(),
+            frame_type: plan.frame_type(),
             pts: plan.display_order,
             dts: plan.encode_index,
             header: setup.header,
@@ -621,7 +751,7 @@ pub(crate) struct CommonInitRequest<'a> {
     /// later have to name it too.
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
-    pub rgb_input: Option<InputFormat>,
+    pub rgb_input: Option<RgbFormat>,
     /// Device capabilities for this profile, resolved by [`query_video_caps`].
     pub caps: &'a DeviceVideoCaps,
     /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
@@ -785,7 +915,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     };
 
     // Pick input (SRC) and reference (DPB) formats.
-    let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
+    let preferred_src_format = get_video_format(config.chroma_format, config.bit_depth);
     let supported_src_formats = query_supported_video_formats(
         context,
         profile_info,
@@ -904,10 +1034,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::VideoSessionCreation(format!(
-            "{:?}",
-            result
-        )));
+        return Err(PixelForgeError::vulkan("vkCreateVideoSessionKHR", result));
     }
     let session_memory = allocate_session_memory(context, session, &video_queue_fn)?;
 
@@ -940,7 +1067,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         aligned_height,
         picture_format,
         rgb_input: req.rgb_input.is_some(),
-        pixel_format: config.pixel_format,
+        chroma_format: config.chroma_format,
         bit_depth: config.bit_depth,
         bitstream_buffer_size: req.bitstream_buffer_size,
         profile_info,
@@ -949,10 +1076,9 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         upload_fence: cmd.upload_fence,
     })?;
 
-    // B-frames are not yet supported, so an I-P GOP. Set the SPS-matching
-    // counters (no-ops for AV1, which keys off order hints).
-    let mut gop = GopStructure::new_ip_only(config.gop_size);
-    gop.set_max_frame_num(4);
+    // B-frames are not yet supported, so an I-P GOP. Match the SPS's POC
+    // wrap (no-op for AV1, which keys off order hints).
+    let mut gop = GopStructure::new(config.gop_size);
     gop.set_max_poc_lsb(4);
 
     let common = EncoderCommon {

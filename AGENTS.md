@@ -46,6 +46,30 @@ cargo run --example decode -- tests/data/bframes.264 out.yuv \
     && cmp ref.yuv out.yuv && echo "decode matches ffmpeg"
 ```
 
+The `decode` example picks the codec from the extension (`.264`, `.265`,
+`.obu`, `.ivf`). For AV1 the reference is dav1d, and `-noautoscale` keeps a
+stream that changes size from being scaled to its first size (it applies to
+any codec; H.264 and H.265 streams in `tests/data` do not change size):
+
+```bash
+cargo run --example decode -- tests/data/av1/aom_altref.obu out.yuv \
+    && ffmpeg -hide_banner -loglevel error -y -c:v libdav1d -i tests/data/av1/aom_altref.obu \
+        -noautoscale -pix_fmt nv12 ref.yuv \
+    && cmp ref.yuv out.yuv && echo "decode matches dav1d"
+```
+
+`tests/decode_streams.rs` does this for every fixture in `tests/data` (use
+`p010le` for the 10-bit ones), and `tests/roundtrip.rs` for each codec's own
+encoder output. A run with `PIXELFORGE_NO_UNIFIED_LAYOUTS=1` set takes the
+copying path below.
+
+On NVIDIA (615.78.08) the AV1 decoder does not copy the `StdVideoAV1SequenceHeader`
+handed to `vkCreateVideoSessionParametersKHR`: it reads it again at every
+decode. The decoder keeps it alive for as long as the session parameters. Freed,
+nothing fails and only the chroma of inter frames comes out slightly wrong, so
+if AV1 inter frames ever differ from dav1d in chroma alone, look for a Std
+structure that does not live long enough.
+
 Decoding has two paths and both need checking. Where the device supports
 `VK_KHR_unified_image_layouts`, frames are the decoder's own images, handed over
 with no copy. Where it does not, they are copied into private images. Force the
@@ -57,7 +81,8 @@ PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode -- \
 ```
 
 Which path a run took is in the debug log (`RUST_LOG=debug`), on the
-`H.264 decode session:` line as `pinnable=`.
+`<codec> decode session:` line (for example `H.264 decode session:`) as
+`pinnable=`.
 
 The render path has its own example. `sample_frame` reads decoded frames in a
 compute shader through a sampler-YCbCr conversion, which is the path that never
@@ -199,7 +224,8 @@ view by image handle, and only RADV without validation showed it.
 - `benches/` - The encode timing/throughput benchmark (`cargo bench`)
 - `testdata/` - Test input files (note: `test_frames.yuv` is a git-LFS pointer;
   generate frames locally if LFS content is unavailable)
-- `tests/data/` - Small H.264 streams used by the decoder tests
+- `tests/data/` - Small H.264, H.265 and AV1 (`tests/data/av1/`) streams used
+  by the decoder tests
 
 ## Key Dependencies
 - Vulkan Video API

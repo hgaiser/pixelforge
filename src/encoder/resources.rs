@@ -1,5 +1,5 @@
 use crate::encoder::input::SourceOwnership;
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk::TaggedStructure;
@@ -109,7 +109,7 @@ pub(crate) fn create_encode_feedback_query_pool(
             .device()
             .create_query_pool(&query_pool_create_info, None)
     }
-    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
+    .map_err(PixelForgeError::vk("vkCreateQueryPool"))
 }
 
 pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Result<vk::QueryPool> {
@@ -122,7 +122,7 @@ pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Resu
             .device()
             .create_query_pool(&timestamp_query_pool_create_info, None)
     }
-    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
+    .map_err(PixelForgeError::vk("vkCreateQueryPool"))
 }
 
 /// Command resources for encoding operations.
@@ -148,13 +148,13 @@ pub(crate) fn create_command_resources(
     encode_queue_family: u32,
     upload_queue_family: u32,
 ) -> Result<CommandResources> {
-    let command_pool = create_command_pool(context, encode_queue_family, "encode")?;
+    let command_pool = create_command_pool(context, encode_queue_family)?;
 
     // The upload pool is the encode pool when one family does both.
     let upload_command_pool = if upload_queue_family == encode_queue_family {
         command_pool
     } else {
-        create_command_pool(context, upload_queue_family, "encode upload")?
+        create_command_pool(context, upload_queue_family)?
     };
 
     let upload_command_buffer = allocate_command_buffers(context, upload_command_pool, 1)?[0];
@@ -193,17 +193,17 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     // meets VkBufferImageCopy::bufferOffset alignment requirements.
     // YUV420/422 dimensions are always even, so alignment is naturally satisfied.
     let plane0_raw = (params.width * params.height * bytes_per_component) as usize;
-    let plane0_size = match params.pixel_format {
-        PixelFormat::Yuv444 => crate::align4(plane0_raw) as u32,
+    let plane0_size = match params.chroma_format {
+        ChromaFormat::Yuv444 => crate::align4(plane0_raw) as u32,
         _ => plane0_raw as u32,
     };
-    let plane1_size = match params.pixel_format {
+    let plane1_size = match params.chroma_format {
         // YUV 4:2:0 (e.g., NV12): UV plane is half width, half height, 2 components per pixel.
-        PixelFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
+        ChromaFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
         // YUV 4:2:2: UV plane is half width, full height, 2 components per pixel.
-        PixelFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
+        ChromaFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
         // YUV 4:4:4 (e.g., NV24): UV plane is full width, full height, 2 components per pixel.
-        PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
+        ChromaFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
     };
     // Every RGB input format is 4 bytes a pixel in one plane.
     let rgb_size = params.width * params.height * 4;
@@ -222,7 +222,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("staging buffer: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
     let mem_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
     let memory_type_index = find_memory_type(
@@ -231,7 +231,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for staging buffer".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for staging buffer".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -239,15 +239,15 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         .memory_type_index(memory_type_index);
 
     let staging_memory = unsafe { device.allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
     // Map and zero-fill.
     let data_ptr =
         unsafe { device.map_memory(staging_memory, 0, total_size, vk::MemoryMapFlags::empty()) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(format!("map staging buffer: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkMapMemory"))?;
     unsafe { ptr::write_bytes(data_ptr as *mut u8, 0, total_size as usize) };
     unsafe { device.unmap_memory(staging_memory) };
 
@@ -255,12 +255,12 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     unsafe {
         device.reset_command_buffer(params.command_buffer, vk::CommandBufferResetFlags::empty())
     }
-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+    .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { device.begin_command_buffer(params.command_buffer, &begin_info) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
     // Transition image from UNDEFINED to TRANSFER_DST.
     let barrier = vk::ImageMemoryBarrier::default()
@@ -292,9 +292,9 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     }
 
     // Copy from staging buffer to image planes.
-    let (uv_width, uv_height) = match params.pixel_format {
-        PixelFormat::Yuv420 => (params.width / 2, params.height / 2),
-        PixelFormat::Yuv444 => (params.width, params.height),
+    let (uv_width, uv_height) = match params.chroma_format {
+        ChromaFormat::Yuv420 => (params.width / 2, params.height / 2),
+        ChromaFormat::Yuv444 => (params.width, params.height),
         _ => (params.width / 2, params.height / 2),
     };
 
@@ -387,25 +387,19 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     }
 
     unsafe { device.end_command_buffer(params.command_buffer) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
     // Submit and wait.
     let submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
     unsafe { device.reset_fences(&[params.fence]) }
-        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
-    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }.map_err(|e| {
-        PixelForgeError::vk(e, |e| {
-            PixelForgeError::CommandBuffer(format!("submit clear: {e}"))
-        })
-    })?;
-    unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }.map_err(|e| {
-        PixelForgeError::vk(e, |e| {
-            PixelForgeError::CommandBuffer(format!("wait clear: {e}"))
-        })
-    })?;
+        .map_err(PixelForgeError::vk("vkResetFences"))?;
+    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
+        .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
+    unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
+        .map_err(PixelForgeError::vk("vkWaitForFences"))?;
     unsafe { device.reset_fences(&[params.fence]) }
-        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkResetFences"))?;
 
     // Clean up staging buffer.
     unsafe {
@@ -430,8 +424,8 @@ pub(crate) struct UploadParams<'a> {
     pub width: u32,
     /// The height of the image.
     pub height: u32,
-    /// The pixel format of the image.
-    pub pixel_format: PixelFormat,
+    /// The chroma format of the image.
+    pub chroma_format: ChromaFormat,
     /// The current layout of the input image.
     pub input_image_layout: vk::ImageLayout,
     /// Whether both images are single-plane RGB rather than YUV.
@@ -460,12 +454,12 @@ pub(crate) fn upload_image_to_input(
     let command_buffer = params.upload_command_buffer;
 
     unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
     let color = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -527,9 +521,9 @@ pub(crate) fn upload_image_to_input(
     };
 
     // Copy UV plane (plane 1).
-    let (uv_width, uv_height) = match params.pixel_format {
-        PixelFormat::Yuv420 => (params.width / 2, params.height / 2),
-        PixelFormat::Yuv444 => (params.width, params.height),
+    let (uv_width, uv_height) = match params.chroma_format {
+        ChromaFormat::Yuv420 => (params.width / 2, params.height / 2),
+        ChromaFormat::Yuv444 => (params.width, params.height),
         _ => (params.width / 2, params.height / 2),
     };
 
@@ -616,7 +610,7 @@ pub(crate) fn upload_image_to_input(
     }
 
     unsafe { device.end_command_buffer(command_buffer) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
     let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
     let submit_info = vk::SubmitInfo2::default()
@@ -629,7 +623,7 @@ pub(crate) fn upload_image_to_input(
             .sync2()
             .queue_submit2(params.upload_queue, &[submit_info], vk::Fence::null())
     }
-    .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
+    .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
 
     Ok(())
 }
@@ -747,7 +741,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
     unsafe {
         device
             .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
     }
 
     let begin_info =
@@ -755,7 +749,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
     unsafe {
         device
             .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
     }
 
     unsafe {
@@ -846,13 +840,13 @@ pub(crate) unsafe fn submit_encode_only(
     unsafe {
         device
             .reset_fences(&[fence])
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkResetFences"))?;
     }
 
     unsafe {
         sync2
             .queue_submit2(encode_queue, &[submit_info], fence)
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
+            .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
     }
 
     Ok(())
@@ -882,7 +876,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
     unsafe {
         device
             .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::CommandBuffer))?;
+            .map_err(PixelForgeError::vk("vkWaitForFences"))?;
     }
 
     // Read query results (offset + bytes_written).
@@ -905,15 +899,15 @@ pub(crate) unsafe fn wait_and_read_bitstream(
                 &mut query_results,
                 vk::QueryResultFlags::WAIT,
             )
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::QueryPool))?;
+            .map_err(PixelForgeError::vk("vkGetQueryPoolResults"))?;
     }
 
     let offset = query_results[0].offset as usize;
     let size = query_results[0].bytes_written as usize;
 
     if size == 0 {
-        return Err(PixelForgeError::QueryPool(
-            "Encoder produced 0 bytes".to_string(),
+        return Err(PixelForgeError::Driver(
+            "the encoder produced 0 bytes".to_string(),
         ));
     }
 
@@ -1028,8 +1022,8 @@ pub(crate) fn get_encoded_session_params(
         match result {
             vk::Result::SUCCESS => {
                 if data_size == 0 {
-                    return Err(PixelForgeError::SessionParametersCreation(
-                        "Encoded session parameters size is 0".to_string(),
+                    return Err(PixelForgeError::Driver(
+                        "encoded session parameters size is 0".to_string(),
                     ));
                 }
                 data.truncate(data_size);
@@ -1043,9 +1037,10 @@ pub(crate) fn get_encoded_session_params(
                 data_size = data.len();
             }
             err => {
-                return Err(PixelForgeError::SessionParametersCreation(format!(
-                    "Failed to get encoded session parameters: {err:?}"
-                )));
+                return Err(PixelForgeError::vulkan(
+                    "vkGetEncodedVideoSessionParametersKHR",
+                    err,
+                ));
             }
         }
     }
@@ -1152,7 +1147,7 @@ pub(crate) struct ClearImageParams {
     pub image: vk::Image,
     pub width: u32,
     pub height: u32,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     /// Whether the image is a single-plane, 4-bytes-per-pixel RGB input
     /// image rather than a YUV one.

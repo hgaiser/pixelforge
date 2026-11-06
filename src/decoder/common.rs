@@ -22,93 +22,18 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::decoder::DecodedFrame;
-use crate::decoder::frames::SlotPins;
+use crate::decoder::frames::{DecodedPicture, SlotPins};
 use crate::decoder::pipeline::DecodePipeline;
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::decoder::plan::SessionPlan;
+use crate::decoder::profile::DecodeProfile;
+use crate::decoder::record::{DecodeRecord, RecordCodec};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::{
     VideoImageParams, allocate_session_memory, create_command_pool, create_dpb_images,
     create_video_image,
 };
 use crate::vulkan::VideoContext;
-
-/// Annex B start code prefixed to each slice handed to the driver.
-///
-/// Three bytes, not four. The leading zero byte of a 4-byte start code is legal
-/// Annex B, and RADV decodes either form, but Intel's ANV decodes almost nothing
-/// when a slice offset points at that extra zero: it reports no error and
-/// returns a picture with a handful of macroblocks in it. ffmpeg's Vulkan
-/// decoder uses three bytes for the same reason.
-pub(crate) const START_CODE: [u8; 3] = [0, 0, 1];
-
-/// Query decode capabilities for a profile.
-///
-/// `caps` is supplied by the caller already chained with the codec-specific
-/// capability struct, since only the codec knows which one applies.
-pub(crate) fn query_decode_caps(
-    context: &VideoContext,
-    profile_info: &vk::VideoProfileInfoKHR,
-    caps: &mut vk::VideoCapabilitiesKHR,
-) -> Result<()> {
-    let video_queue_instance =
-        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
-    let result = unsafe {
-        (video_queue_instance
-            .fp()
-            .get_physical_device_video_capabilities_khr)(
-            context.physical_device(),
-            profile_info,
-            caps,
-        )
-    };
-    if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::CodecNotSupported(format!(
-            "decode profile not supported: {:?}",
-            result
-        )));
-    }
-    Ok(())
-}
-
-/// What a codec decided the session should look like.
-///
-/// The codec derives these from its own parameter sets and the device caps; the
-/// generic layer turns them into Vulkan objects.
-pub(crate) struct SessionPlan {
-    /// Coded dimensions, already aligned to the device's picture granularity.
-    pub coded_width: u32,
-    pub coded_height: u32,
-    pub picture_format: vk::Format,
-    pub bit_depth: BitDepth,
-    pub pixel_format: PixelFormat,
-    /// DPB slots: references, the picture being decoded, and `spare_slots`.
-    pub slot_count: usize,
-    /// How many of `slot_count` are spare capacity for pictures pinned past the
-    /// decode that produced them: those held for display-order reordering, and
-    /// those handed to the caller. Zero means every emitted picture has to be
-    /// copied out instead of pinned in place.
-    pub spare_slots: usize,
-    /// References the driver may use for a single picture, which is
-    /// `slot_count` minus the current picture and the output reservation.
-    pub max_active_references: u32,
-    /// Driver decodes straight into the DPB image (`DPB_AND_OUTPUT_COINCIDE`).
-    pub coincide: bool,
-    /// A decoded picture may be handed to the caller in place, pinned in its
-    /// DPB slot, rather than copied out. See [`DecodeSession::pinnable`].
-    pub pinnable: bool,
-    /// `dpb_usage` includes `SAMPLED`, so handed-out frames can be sampled.
-    pub sampleable: bool,
-    /// Picture images are created with `MUTABLE_FORMAT`, so a consumer can view
-    /// their planes separately. See [`DecodeSession::plane_views`].
-    pub plane_views: bool,
-    /// Creation flags for picture images, from what the driver reported.
-    pub image_flags: vk::ImageCreateFlags,
-    /// Formats views of a picture image may use. Empty unless `plane_views`.
-    pub view_formats: Vec<vk::Format>,
-    /// One layered DPB image rather than one image per slot.
-    pub use_layered_dpb: bool,
-    pub dpb_usage: vk::ImageUsageFlags,
-}
 
 /// One DPB image and everything that lives and dies with it.
 ///
@@ -166,7 +91,7 @@ pub(crate) struct DecodeSession {
     pub coded_height: u32,
     pub picture_format: vk::Format,
     pub bit_depth: BitDepth,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
 
     /// DPB images. One image per slot, or a single layered image.
     /// One entry per slot, or a single shared entry when the DPB is layered.
@@ -211,6 +136,17 @@ pub(crate) struct DecodeSession {
     pub plane_views: bool,
     /// Distinct decode output image, only when `!coincide`.
     pub output_image: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    /// One film grain output image per DPB slot, or none.
+    ///
+    /// Vulkan applies AV1 film grain only to a decode output that is not the
+    /// DPB slot, since the reference must stay grain-free. A frame with grain
+    /// is therefore decoded into its slot's grain image as well, and handed
+    /// out from there. One per slot rather than one in all, because
+    /// `show_existing_frame` can show a frame again long after its decode, and
+    /// it has to show the same grain.
+    pub grain_outputs: Vec<Arc<DpbImage>>,
+    /// The profile everything in this session was created with.
+    pub profile: DecodeProfile,
 }
 impl DecodeSession {
     /// The image and array layer holding DPB slot `slot`.
@@ -219,6 +155,17 @@ impl DecodeSession {
     pub fn dpb_image_for_slot(&self, slot: u8) -> (vk::Image, u32) {
         let (entry, layer, _) = self.dpb_entry(slot);
         (entry.image, layer)
+    }
+
+    /// The film grain output image of `slot`. Only for a session with film
+    /// grain.
+    pub fn grain_entry(&self, slot: u8) -> &Arc<DpbImage> {
+        &self.grain_outputs[slot as usize]
+    }
+
+    /// The view of `slot`'s film grain output image.
+    pub fn grain_view(&self, slot: u8) -> vk::ImageView {
+        self.grain_outputs[slot as usize].views[0]
     }
 
     /// The image backing `slot`, the array layer within it, and its view.
@@ -301,9 +248,8 @@ impl DecoderCommon {
         let video_decode_fn =
             ash::khr::video_decode_queue::Device::load(context.instance(), context.device());
 
-        let command_pool = create_command_pool(&context, decode_queue_family, "decode")?;
-        let transfer_pool =
-            create_command_pool(&context, context.transfer_queue_family(), "decode transfer")?;
+        let command_pool = create_command_pool(&context, decode_queue_family)?;
+        let transfer_pool = create_command_pool(&context, context.transfer_queue_family())?;
         let (pipeline, frames_rx) = DecodePipeline::new(&context, command_pool, transfer_pool)?;
 
         Ok(Self {
@@ -383,11 +329,13 @@ impl DecoderCommon {
     pub fn create_session(
         &mut self,
         plan: &SessionPlan,
-        profile_info: &vk::VideoProfileInfoKHR,
-        std_header_version: &vk::ExtensionProperties,
+        profile: DecodeProfile,
         make_params: impl FnOnce(&Self, vk::VideoSessionKHR) -> Result<vk::VideoSessionParametersKHR>,
     ) -> Result<()> {
         self.destroy_session();
+        let profile_info = profile.info();
+        self.bitstream_offset_alignment = plan.bitstream_offset_alignment;
+        self.bitstream_size_alignment = plan.bitstream_size_alignment;
 
         let session_create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(self.decode_queue_family)
@@ -401,13 +349,13 @@ impl DecoderCommon {
             .reference_picture_format(plan.picture_format)
             .max_dpb_slots(plan.slot_count as u32)
             .max_active_reference_pictures(plan.max_active_references)
-            .std_header_version(std_header_version);
+            .std_header_version(&plan.std_header_version);
 
         let session = unsafe {
             self.video_queue_fn
                 .create_video_session(&session_create_info, None)
         }
-        .map_err(|e| PixelForgeError::VideoSessionCreation(format!("{:?}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateVideoSessionKHR"))?;
 
         let session_memory = allocate_session_memory(&self.context, session, &self.video_queue_fn)?;
 
@@ -475,6 +423,32 @@ impl DecoderCommon {
             )?)
         };
 
+        let grain_outputs = if plan.film_grain {
+            let mut usage =
+                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::TRANSFER_SRC;
+            if plan.sampleable {
+                usage |= vk::ImageUsageFlags::SAMPLED;
+            }
+            let grain_params = VideoImageParams {
+                usage,
+                ..dpb_params
+            };
+            (0..plan.slot_count)
+                .map(|_| {
+                    let (image, memory, view) =
+                        create_video_image(&self.context, &grain_params, profile_info)?;
+                    Ok(Arc::new(DpbImage {
+                        context: self.context.clone(),
+                        image,
+                        memory,
+                        views: vec![view],
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
         let session_params = make_params(self, session)?;
 
         // A new set of images, so a new generation. Frames from the previous
@@ -488,7 +462,7 @@ impl DecoderCommon {
             coded_height: plan.coded_height,
             picture_format: plan.picture_format,
             bit_depth: plan.bit_depth,
-            pixel_format: plan.pixel_format,
+            chroma_format: plan.chroma_format,
             dpb,
             slot_pins: Arc::new(SlotPins::default()),
             dpb_slot_active: vec![false; plan.slot_count],
@@ -499,7 +473,28 @@ impl DecoderCommon {
             sampleable: plan.sampleable,
             plane_views: plan.plane_views,
             output_image,
+            grain_outputs,
+            profile,
         });
+
+        tracing::debug!(
+            "{} decode session: {}x{} {:?}, {} DPB slots ({} spare), \
+             layered={}, coincide={}, pinnable={}, sampleable={}, \
+             plane_views={}, bitstream alignment {}/{} (offset/size)",
+            plan.codec,
+            plan.coded_width,
+            plan.coded_height,
+            plan.picture_format,
+            plan.slot_count,
+            plan.spare_slots,
+            plan.use_layered_dpb,
+            plan.coincide,
+            plan.pinnable,
+            plan.sampleable,
+            plan.plane_views,
+            plan.bitstream_offset_alignment,
+            plan.bitstream_size_alignment
+        );
         Ok(())
     }
 
@@ -539,18 +534,22 @@ impl DecoderCommon {
         }
     }
 
-    /// Copy a picture's slices into the staging buffer, each prefixed with a
-    /// start code, and report the buffer range plus each slice's offset.
-    pub fn stage_slices(
-        &mut self,
-        slices: &[&[u8]],
-        profile_info: &vk::VideoProfileInfoKHR,
-    ) -> Result<(u64, Vec<u32>)> {
-        let total: usize = slices.iter().map(|s| s.len() + START_CODE.len()).sum();
+    /// Copy a picture's slices into the staging buffer, each preceded by
+    /// `prefix` (a start code for H.26x, nothing for AV1), and report the
+    /// buffer range plus each slice's offset.
+    pub fn stage_slices(&mut self, slices: &[&[u8]], prefix: &[u8]) -> Result<(u64, Vec<u32>)> {
+        let total: usize = slices.iter().map(|s| s.len() + prefix.len()).sum();
         let aligned_total =
             crate::video::align_up(total as u32, self.bitstream_size_alignment as u32) as usize;
-        self.pipeline
-            .ensure_bitstream_capacity(&self.context, aligned_total, profile_info)?;
+        // Borrow the session by field, so the pipeline can be borrowed mutably.
+        let session = self.session.as_ref().ok_or_else(|| {
+            PixelForgeError::InvalidInput("decode: no active session".to_string())
+        })?;
+        self.pipeline.ensure_bitstream_capacity(
+            &self.context,
+            aligned_total,
+            session.profile.info(),
+        )?;
         let dst = self.pipeline.current().bitstream_ptr;
 
         let mut offsets = Vec::with_capacity(slices.len());
@@ -558,12 +557,8 @@ impl DecoderCommon {
         for slice in slices {
             offsets.push(cursor as u32);
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    START_CODE.as_ptr(),
-                    dst.add(cursor),
-                    START_CODE.len(),
-                );
-                cursor += START_CODE.len();
+                std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst.add(cursor), prefix.len());
+                cursor += prefix.len();
                 std::ptr::copy_nonoverlapping(slice.as_ptr(), dst.add(cursor), slice.len());
                 cursor += slice.len();
             }
@@ -636,6 +631,49 @@ impl DecoderCommon {
         unsafe { sync2.cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency) };
     }
 
+    /// Transition `slot`'s film grain output image into the layout
+    /// `vkCmdDecodeVideo` writes it in. Its old contents are discarded: the
+    /// slot is free, so nothing still shows them.
+    pub fn record_grain_barrier(&self, slot: u8) {
+        let session = self.session.as_ref().expect("active session");
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+            .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(self.output_layout())
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(session.grain_entry(slot).image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let barriers = [barrier];
+        let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        unsafe {
+            self.context
+                .sync2()
+                .cmd_pipeline_barrier2(self.decode_command_buffer(), &dependency)
+        };
+    }
+
+    /// Point `picture` at its slot's film grain output image instead of the
+    /// slot itself.
+    pub fn use_grain_output(&self, picture: &mut DecodedPicture) {
+        let session = self.session.as_ref().expect("active session");
+        let entry = session.grain_entry(picture.slot);
+        picture.image = entry.image;
+        picture.image_view = entry.views[0];
+        picture.layout = self.output_layout();
+        picture.array_layer = 0;
+        picture.film_grain = true;
+    }
+
     /// The decode command buffer of the picture currently being recorded.
     pub fn decode_command_buffer(&self) -> vk::CommandBuffer {
         self.pipeline.current().decode_command_buffer
@@ -657,12 +695,12 @@ impl DecoderCommon {
         unsafe {
             device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device
                 .begin_command_buffer(command_buffer, &begin_info)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
         }
         Ok(())
     }
@@ -676,6 +714,80 @@ impl DecoderCommon {
         let queue = self.decode_queue;
         self.pipeline
             .submit_decode(&device, self.context.sync2(), queue)
+    }
+
+    /// Record `vkCmdBeginVideoCoding`, `vkCmdDecodeVideo` and
+    /// `vkCmdEndVideoCoding` from a linked `record`, resetting the session
+    /// first if this is its first decode.
+    pub fn record_coding<C: RecordCodec>(&self, record: &DecodeRecord<C>) {
+        let command_buffer = self.decode_command_buffer();
+        // A session's first decode sees no active slot.
+        let first_use = self
+            .session
+            .as_ref()
+            .is_none_or(|s| !s.dpb_slot_active.iter().any(|&a| a));
+        unsafe {
+            self.video_queue_fn
+                .cmd_begin_video_coding(command_buffer, record.begin_info());
+            // On the first use of the session, all DPB slots must be reset.
+            if first_use {
+                let control = vk::VideoCodingControlInfoKHR::default()
+                    .flags(vk::VideoCodingControlFlagsKHR::RESET);
+                self.video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control);
+            }
+            self.video_decode_fn
+                .cmd_decode_video(command_buffer, record.decode_info());
+            self.video_queue_fn
+                .cmd_end_video_coding(command_buffer, &vk::VideoEndCodingInfoKHR::default());
+        }
+    }
+
+    /// Mark `slot` as decoded into, and describe the picture now in it for
+    /// output. Call after the picture's decode is submitted.
+    ///
+    /// `width` and `height` are the visible (cropped) size.
+    pub fn decoded_picture(
+        &mut self,
+        slot: u8,
+        width: u32,
+        height: u32,
+        pts: u64,
+        display_order: i32,
+        is_keyframe: bool,
+    ) -> DecodedPicture {
+        let picture_layout = self.picture_layout();
+        let output_layout = self.output_layout();
+        let generation = self.generation;
+        let session = self.session.as_mut().expect("a picture was just decoded");
+        session.dpb_slot_active[slot as usize] = true;
+        let (image, image_view, layout, array_layer) = if session.coincide {
+            let (image, layer) = session.dpb_image_for_slot(slot);
+            (image, session.dpb_entry(slot).2, picture_layout, layer)
+        } else {
+            let (image, _, view) = session
+                .output_image
+                .expect("non-coincide implies output image");
+            (image, view, output_layout, 0)
+        };
+        DecodedPicture {
+            slot,
+            image,
+            image_view,
+            layout,
+            array_layer,
+            chroma_format: session.chroma_format,
+            bit_depth: session.bit_depth,
+            generation,
+            width,
+            height,
+            coded_width: session.coded_width,
+            coded_height: session.coded_height,
+            pts,
+            display_order,
+            is_keyframe,
+            film_grain: false,
+        }
     }
 
     /// Close off the current picture and hand `frames` to the completion thread.

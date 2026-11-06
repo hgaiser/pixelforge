@@ -1,18 +1,48 @@
 //! Image utilities for creating and uploading video frames.
 //!
-//! This module provides [`InputImage`], a helper for uploading YUV data from the CPU
+//! This module provides [`YuvUploader`], a helper for uploading YUV data from the CPU
 //! to the GPU. The image it creates is a transfer-only staging image (not a Vulkan Video
 //! image) and must be copied into an encoder's input image before encoding.
-//! Use [`InputImage::upload_yuv420`] to upload to the internal image, then submit
-//! [`InputImage::source`] with [`Frame::image`](crate::Frame::image).
-//! Alternatively, use [`InputImage::upload_yuv420_to`] / [`InputImage::upload_yuv444_to`]
-//! to upload directly into an encoder's [`InputSlot`] (from
+//! Use [`YuvUploader::upload`] to upload to the internal image, then submit
+//! [`YuvUploader::source`] with [`Frame::image`](crate::Frame::image).
+//! Alternatively, use [`YuvUploader::upload_to`] to upload directly into an
+//! encoder's [`InputSlot`] (from
 //! [`Encoder::input_slot`](crate::encoder::Encoder::input_slot)).
 
-use crate::encoder::{BitDepth, Codec, Handoff, InputSlot, PixelFormat, SourceImage};
+use crate::encoder::{BitDepth, ChromaFormat, Encoder, Handoff, InputSlot, Source, SourceImage};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+
+/// How the YUV samples handed to [`YuvUploader::upload`] are laid out in
+/// memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvLayout {
+    /// 8-bit 4:2:0 planes: Y, then U, then V (yuv420p). For a 10-bit image,
+    /// each sample becomes the high 8 bits of the 10.
+    I420,
+    /// 8-bit 4:2:0: a Y plane, then an interleaved UV plane. For an 8-bit
+    /// image only.
+    Nv12,
+    /// 10-bit 4:2:0 planes: Y, then U, then V, each sample a little-endian
+    /// 16-bit word with the value in its low 10 bits (yuv420p10le). For a
+    /// 10-bit image only.
+    I420P10,
+    /// 8-bit 4:4:4 planes: Y, then U, then V (yuv444p). For a 10-bit image,
+    /// each sample becomes the high 8 bits of the 10.
+    I444,
+}
+
+impl YuvLayout {
+    /// The size of one `width` by `height` frame in this layout, in bytes.
+    pub fn frame_size(&self, width: u32, height: u32) -> usize {
+        let luma = (width * height) as usize;
+        match self {
+            Self::I420 | Self::Nv12 => luma * 3 / 2,
+            Self::I420P10 | Self::I444 => luma * 3,
+        }
+    }
+}
 
 /// A GPU image for staging YUV frame data before encoding.
 ///
@@ -23,13 +53,12 @@ use ash::vk;
 ///
 /// The image is **not** directly usable as a Vulkan Video encode source. To
 /// encode, either:
-/// - Upload to this image and submit [`Self::source`] with
+/// - [`upload`](Self::upload) to this image and submit [`Self::source`] with
 ///   [`Frame::image`](crate::Frame::image), which copies it into the encoder's
 ///   input image, or
-/// - Use [`upload_yuv420_to`](Self::upload_yuv420_to) /
-///   [`upload_yuv444_to`](Self::upload_yuv444_to) to upload directly into the
-///   encoder's input image, through an [`InputSlot`].
-pub struct InputImage {
+/// - [`upload_to`](Self::upload_to) the encoder's input image directly,
+///   through an [`InputSlot`].
+pub struct YuvUploader {
     /// Keeps track of the frames that read `image`.
     source: SourceImage,
     context: VideoContext,
@@ -48,10 +77,30 @@ pub struct InputImage {
     width: u32,
     height: u32,
     bit_depth: BitDepth,
-    pixel_format: PixelFormat,
+    chroma_format: ChromaFormat,
 }
 
-impl InputImage {
+impl YuvUploader {
+    /// A staging image for the frames of `encoder`: its size, chroma format
+    /// and bit depth.
+    ///
+    /// An error for an encoder with an RGB [`Source`]: this uploads YUV.
+    pub fn for_encoder(encoder: &Encoder) -> Result<Self> {
+        let config = encoder.config();
+        if config.source != Source::Yuv {
+            return Err(PixelForgeError::InvalidInput(
+                "a YuvUploader uploads YUV, and the encoder's source is RGB".to_string(),
+            ));
+        }
+        Self::new(
+            encoder.context().clone(),
+            config.dimensions.width,
+            config.dimensions.height,
+            config.bit_depth,
+            config.chroma_format,
+        )
+    }
+
     /// Create a new staging image for uploading YUV frame data.
     ///
     /// Creates a transfer-only image suitable for staging YUV data before
@@ -60,36 +109,34 @@ impl InputImage {
     ///
     /// # Arguments
     /// * `context` - The Vulkan video context
-    /// * `codec` - Unused. Kept for API compatibility.
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `bit_depth` - Bit depth for the image (8-bit or 10-bit)
-    /// * `pixel_format` - Pixel format (YUV420 or YUV444)
+    /// * `chroma_format` - Chroma format (YUV420 or YUV444)
     pub fn new(
         context: VideoContext,
-        _codec: Codec,
         width: u32,
         height: u32,
         bit_depth: BitDepth,
-        pixel_format: PixelFormat,
+        chroma_format: ChromaFormat,
     ) -> Result<Self> {
         let device = context.device();
 
-        // Select format based on pixel format and bit depth.
+        // Select format based on chroma format and bit depth.
         // Use 2-plane semi-planar formats for both YUV420 and YUV444.
-        let format = match (pixel_format, bit_depth) {
-            (PixelFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            (PixelFormat::Yuv420, BitDepth::Ten) => {
+        let format = match (chroma_format, bit_depth) {
+            (ChromaFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            (ChromaFormat::Yuv420, BitDepth::Ten) => {
                 vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
             }
-            (PixelFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-            (PixelFormat::Yuv444, BitDepth::Ten) => {
+            (ChromaFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
+            (ChromaFormat::Yuv444, BitDepth::Ten) => {
                 vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
             }
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "Unsupported pixel format / bit depth combination: {:?} / {:?}",
-                    pixel_format, bit_depth
+                    "Unsupported chroma format / bit depth combination: {:?} / {:?}",
+                    chroma_format, bit_depth
                 )));
             }
         };
@@ -114,7 +161,7 @@ impl InputImage {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         let image = unsafe { device.create_image(&image_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
         // Get memory requirements and allocate.
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -125,7 +172,7 @@ impl InputImage {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .ok_or_else(|| {
-                PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
+                PixelForgeError::NoSuitableDevice("No suitable memory type for image".to_string())
             })?;
 
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -133,25 +180,25 @@ impl InputImage {
             .memory_type_index(memory_type_index);
 
         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         unsafe { device.bind_image_memory(image, memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBindImageMemory"))?;
 
         // Create staging buffer for uploads.
-        // Size depends on pixel format, bit depth, and alignment padding between planes.
+        // Size depends on chroma format, bit depth, and alignment padding between planes.
         let bytes_per_sample_init = match bit_depth {
             BitDepth::Eight => 1usize,
             BitDepth::Ten => 2,
         };
         let luma_pixels = (width * height) as usize;
-        let staging_size = match pixel_format {
-            PixelFormat::Yuv444 => {
+        let staging_size = match chroma_format {
+            ChromaFormat::Yuv444 => {
                 // Y plane (aligned to 4 bytes) + UV interleaved plane.
                 let y_bytes = luma_pixels * bytes_per_sample_init;
                 crate::align4(y_bytes) + luma_pixels * 2 * bytes_per_sample_init
             }
-            _ => pixel_format.frame_size(width, height) * bytes_per_sample_init,
+            _ => chroma_format.frame_size(width, height) * bytes_per_sample_init,
         };
         let buffer_create_info = vk::BufferCreateInfo::default()
             .size(staging_size as vk::DeviceSize)
@@ -159,7 +206,7 @@ impl InputImage {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
         let staging_mem_requirements =
             unsafe { device.get_buffer_memory_requirements(staging_buffer) };
@@ -170,7 +217,7 @@ impl InputImage {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
             .ok_or_else(|| {
-                PixelForgeError::MemoryAllocation(
+                PixelForgeError::NoSuitableDevice(
                     "No suitable memory type for staging buffer".to_string(),
                 )
             })?;
@@ -180,10 +227,10 @@ impl InputImage {
             .memory_type_index(staging_memory_type);
 
         let staging_memory = unsafe { device.allocate_memory(&staging_alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
         // Create command pool and buffer for transfers.
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -191,7 +238,7 @@ impl InputImage {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkCreateCommandPool"))?;
 
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
@@ -199,13 +246,13 @@ impl InputImage {
             .command_buffer_count(1);
 
         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkAllocateCommandBuffers"))?;
         let command_buffer = command_buffers[0];
 
         // Create fence for synchronization.
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("fence creation: {}", e)))?;
+            .map_err(PixelForgeError::vk("vkCreateFence"))?;
 
         let source = SourceImage::new(
             &context,
@@ -229,7 +276,7 @@ impl InputImage {
             width,
             height,
             bit_depth,
-            pixel_format,
+            chroma_format,
         };
         // Start from zeroed planes in GENERAL, so the image is a valid source
         // before the first upload.
@@ -242,7 +289,7 @@ impl InputImage {
                     staging_size as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
-                .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+                .map_err(PixelForgeError::vk("vkMapMemory"))?;
             std::ptr::write_bytes(ptr as *mut u8, 0, staging_size);
             device.unmap_memory(staging_memory);
         }
@@ -250,322 +297,68 @@ impl InputImage {
         Ok(input)
     }
 
-    /// Upload YUV420 (I420) data to this image.
+    /// Upload a frame of `layout` data to this image.
     ///
-    /// The data is expected in I420 format (Y plane, then U plane, then V plane).
-    /// This method converts it to NV12 (8-bit) or P010 (10-bit) format and uploads
-    /// it to the GPU.
-    ///
-    /// For 10-bit images, 8-bit input data is expanded to 10-bit by left-shifting
-    /// each sample by 6 bits (filling in the 6 lower bits with the high bits).
-    pub fn upload_yuv420(&mut self, yuv_data: &[u8]) -> Result<()> {
-        let expected_size = (self.width * self.height * 3 / 2) as usize;
-        if yuv_data.len() < expected_size {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "YUV data too small: expected {} bytes, got {}",
-                expected_size,
-                yuv_data.len()
-            )));
-        }
-
-        let device = self.context.device();
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let y_size = width * height;
-
-        // Map staging buffer and convert I420 to NV12/P010.
-        let data_ptr = unsafe {
-            device.map_memory(
-                self.staging_memory,
-                0,
-                self.staging_size as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        unsafe {
-            match self.bit_depth {
-                BitDepth::Eight => {
-                    // 8-bit NV12 format
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
-
-                    // Copy Y plane directly.
-                    dst[..y_size].copy_from_slice(&yuv_data[..y_size]);
-
-                    // Interleave U and V planes to create NV12 UV plane.
-                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
-                    let v_plane = &yuv_data[y_size + y_size / 4..];
-                    for i in 0..y_size / 4 {
-                        dst[y_size + i * 2] = u_plane[i];
-                        dst[y_size + i * 2 + 1] = v_plane[i];
-                    }
-                }
-                BitDepth::Ten => {
-                    // 10-bit P010 format: each sample is stored as 16-bit little-endian
-                    // with the 10-bit value in the high bits (bits 6-15), and bits 0-5 as padding.
-                    //
-                    // To convert 8-bit (0-255) to 10-bit (0-1023):
-                    // - Multiply by ~4 to scale the range: (val * 1023) / 255 ≈ val * 4
-                    // - This is equivalent to: (val << 2) to get 10-bit value
-                    // - Then shift left by 6 to place in P010 format: (val << 2) << 6 = val << 8
-                    //
-                    // For better precision, we can also fill in the 2 LSBs of the 10-bit value
-                    // using the 2 MSBs of the original 8-bit value: (val << 8) | (val >> 6 << 6)
-                    // Simplified: val << 8 puts the 8-bit value in bits 8-15, which is correct for P010.
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u16, self.staging_size / 2);
-
-                    // Convert and copy Y plane (expand 8-bit to 10-bit P010).
-                    for i in 0..y_size {
-                        let val = yuv_data[i] as u16;
-                        // Shift left by 8 to place 8-bit value in bits 8-15 (P010 format).
-                        // This effectively scales 0-255 to 0-65280 with proper bit alignment.
-                        dst[i] = val << 8;
-                    }
-
-                    // Interleave U and V planes to create P010 UV plane.
-                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
-                    let v_plane = &yuv_data[y_size + y_size / 4..];
-                    for i in 0..y_size / 4 {
-                        let u_val = u_plane[i] as u16;
-                        let v_val = v_plane[i] as u16;
-                        dst[y_size + i * 2] = u_val << 8;
-                        dst[y_size + i * 2 + 1] = v_val << 8;
-                    }
-                }
-            }
-
-            device.unmap_memory(self.staging_memory);
-        }
-
-        // Record and submit copy commands.
-        self.copy_staging_to_image()?;
-
-        Ok(())
+    /// Submit it afterwards with [`Frame::image`](crate::Frame::image) and
+    /// [`Self::source`]. This waits until the frames submitted from the image
+    /// before are done with it.
+    pub fn upload(&mut self, layout: YuvLayout, data: &[u8]) -> Result<()> {
+        self.write_staging(layout, data)?;
+        self.copy_staging_to_image()
     }
 
-    /// Upload NV12 data directly to this image.
+    /// Upload a frame of `layout` data into an encoder's input image, so the
+    /// encode reads it with no further copy.
     ///
-    /// The data is expected in NV12 format (Y plane, then interleaved UV plane).
-    pub fn upload_nv12(&mut self, nv12_data: &[u8]) -> Result<()> {
-        let expected_size = (self.width * self.height * 3 / 2) as usize;
-        if nv12_data.len() < expected_size {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "NV12 data too small: expected {} bytes, got {}",
-                expected_size,
-                nv12_data.len()
-            )));
-        }
-
-        let device = self.context.device();
-
-        // Map staging buffer and copy directly.
-        let data_ptr = unsafe {
-            device.map_memory(
-                self.staging_memory,
-                0,
-                self.staging_size as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
-            dst.copy_from_slice(&nv12_data[..self.staging_size]);
-            device.unmap_memory(self.staging_memory);
-        }
-
-        // Record and submit copy commands.
-        self.copy_staging_to_image()?;
-
-        Ok(())
-    }
-
-    /// Upload native 10-bit YUV420 (I420 10-bit) data to this image.
-    ///
-    /// The data is expected in yuv420p10le format:
-    /// - Y plane: width * height * 2 bytes (16-bit little-endian samples)
-    /// - U plane: (width/2) * (height/2) * 2 bytes (16-bit little-endian samples)
-    /// - V plane: (width/2) * (height/2) * 2 bytes (16-bit little-endian samples)
-    ///
-    /// The 10-bit values are stored in the lower 10 bits of each 16-bit sample.
-    /// This method converts them to P010 format (10-bit in upper bits) for the encoder.
-    ///
-    /// This method is only valid for 10-bit InputImage instances.
-    pub fn upload_yuv420_10bit(&mut self, yuv_data: &[u8]) -> Result<()> {
-        if self.bit_depth != BitDepth::Ten {
-            return Err(PixelForgeError::InvalidInput(
-                "upload_yuv420_10bit can only be used with 10-bit InputImage".to_string(),
-            ));
-        }
-
-        // 10-bit YUV420 size: Y (w*h*2) + U (w*h/4*2) + V (w*h/4*2) = w*h*3 bytes
-        let expected_size = (self.width * self.height * 3) as usize;
-        if yuv_data.len() < expected_size {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "YUV420 10-bit data too small: expected {} bytes, got {}",
-                expected_size,
-                yuv_data.len()
-            )));
-        }
-
-        let device = self.context.device();
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let y_size = width * height; // Number of Y samples
-
-        // Map staging buffer.
-        let data_ptr = unsafe {
-            device.map_memory(
-                self.staging_memory,
-                0,
-                self.staging_size as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        unsafe {
-            // Source is yuv420p10le (10-bit in lower bits of 16-bit words)
-            // Destination is P010 (10-bit in upper bits of 16-bit words)
-            let src =
-                std::slice::from_raw_parts(yuv_data.as_ptr() as *const u16, expected_size / 2);
-            let dst = std::slice::from_raw_parts_mut(data_ptr as *mut u16, self.staging_size / 2);
-
-            // Convert and copy Y plane (shift 10-bit values to upper bits for P010).
-            for i in 0..y_size {
-                // yuv420p10le has 10-bit value in bits 0-9, P010 needs it in bits 6-15
-                dst[i] = src[i] << 6;
-            }
-
-            // Convert and interleave U and V planes to create P010 UV plane.
-            // Source U plane starts at y_size, V plane at y_size + y_size/4
-            let u_offset = y_size;
-            let v_offset = y_size + y_size / 4;
-            for i in 0..y_size / 4 {
-                let u_val = src[u_offset + i];
-                let v_val = src[v_offset + i];
-                dst[y_size + i * 2] = u_val << 6;
-                dst[y_size + i * 2 + 1] = v_val << 6;
-            }
-
-            device.unmap_memory(self.staging_memory);
-        }
-
-        // Record and submit copy commands.
-        self.copy_staging_to_image()?;
-
-        Ok(())
-    }
-
-    /// Upload YUV420 (I420) data to an external image.
-    ///
-    /// Same as `upload_yuv420()` but copies the data into an encoder's input
-    /// image instead of this InputImage's own image, so the encode reads it
-    /// with no further copy. Submit the slot with
-    /// [`Frame::input`](crate::Frame::input) afterwards.
-    pub fn upload_yuv420_to(&mut self, slot: &InputSlot, yuv_data: &[u8]) -> Result<()> {
-        if self.pixel_format != PixelFormat::Yuv420 {
-            return Err(PixelForgeError::InvalidInput(
-                "upload_yuv420_to can only be used with YUV420 InputImage".to_string(),
-            ));
-        }
-
-        let expected_size = (self.width * self.height * 3 / 2) as usize;
-        if yuv_data.len() < expected_size {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "YUV data too small: expected {} bytes, got {}",
-                expected_size,
-                yuv_data.len()
-            )));
-        }
-
-        let device = self.context.device();
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let y_size = width * height;
-
-        // Map staging buffer and convert I420 to NV12/P010.
-        let data_ptr = unsafe {
-            device.map_memory(
-                self.staging_memory,
-                0,
-                self.staging_size as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
-
-        unsafe {
-            match self.bit_depth {
-                BitDepth::Eight => {
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
-                    dst[..y_size].copy_from_slice(&yuv_data[..y_size]);
-                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
-                    let v_plane = &yuv_data[y_size + y_size / 4..];
-                    for i in 0..y_size / 4 {
-                        dst[y_size + i * 2] = u_plane[i];
-                        dst[y_size + i * 2 + 1] = v_plane[i];
-                    }
-                }
-                BitDepth::Ten => {
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u16, self.staging_size / 2);
-                    for i in 0..y_size {
-                        let val = yuv_data[i] as u16;
-                        dst[i] = val << 8;
-                    }
-                    let u_plane = &yuv_data[y_size..y_size + y_size / 4];
-                    let v_plane = &yuv_data[y_size + y_size / 4..];
-                    for i in 0..y_size / 4 {
-                        let u_val = u_plane[i] as u16;
-                        let v_val = v_plane[i] as u16;
-                        dst[y_size + i * 2] = u_val << 8;
-                        dst[y_size + i * 2 + 1] = v_val << 8;
-                    }
-                }
-            }
-
-            device.unmap_memory(self.staging_memory);
-        }
-
-        // Record and submit copy commands to the target image.
+    /// Submit the slot with [`Frame::input`](crate::Frame::input) afterwards.
+    pub fn upload_to(&mut self, slot: &InputSlot, layout: YuvLayout, data: &[u8]) -> Result<()> {
+        self.write_staging(layout, data)?;
         self.copy_staging_to_image_internal(
             slot.image(),
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-        )?;
-
-        Ok(())
+        )
     }
 
-    /// Upload YUV444 (planar) data into an encoder's input image, like
-    /// [`Self::upload_yuv420_to`].
-    pub fn upload_yuv444_to(&mut self, slot: &InputSlot, yuv_data: &[u8]) -> Result<()> {
-        if self.pixel_format != PixelFormat::Yuv444 {
-            return Err(PixelForgeError::InvalidInput(
-                "upload_yuv444_to can only be used with YUV444 InputImage".to_string(),
-            ));
-        }
-
-        let plane_size = (self.width * self.height) as usize;
-        let expected_size = plane_size * 3; // Y + U + V at full resolution
-        if yuv_data.len() < expected_size {
+    /// Convert `data` into the staging buffer, in the image's format.
+    fn write_staging(&mut self, layout: YuvLayout, data: &[u8]) -> Result<()> {
+        let fits = matches!(
+            (layout, self.chroma_format, self.bit_depth),
+            (YuvLayout::I420, ChromaFormat::Yuv420, _)
+                | (YuvLayout::Nv12, ChromaFormat::Yuv420, BitDepth::Eight)
+                | (YuvLayout::I420P10, ChromaFormat::Yuv420, BitDepth::Ten)
+                | (YuvLayout::I444, ChromaFormat::Yuv444, _)
+        );
+        if !fits {
             return Err(PixelForgeError::InvalidInput(format!(
-                "YUV444 data too small: expected {} bytes, got {}",
-                expected_size,
-                yuv_data.len()
+                "{layout:?} data cannot be uploaded to a {:?} {:?}-bit image",
+                self.chroma_format, self.bit_depth
+            )));
+        }
+        let expected_size = layout.frame_size(self.width, self.height);
+        if data.len() < expected_size {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "{layout:?} data too small: expected {expected_size} bytes, got {}",
+                data.len()
             )));
         }
 
-        let device = self.context.device();
+        let luma = (self.width * self.height) as usize;
+        let chroma = match self.chroma_format {
+            ChromaFormat::Yuv444 => luma,
+            _ => luma / 4,
+        };
+        let ten_bit = self.bit_depth == BitDepth::Ten;
+        let luma_bytes = if ten_bit { luma * 2 } else { luma };
+        // The UV plane of a 4:4:4 image starts 4-byte aligned, as
+        // `copy_staging_to_image_internal` copies it.
+        let uv_offset = match self.chroma_format {
+            ChromaFormat::Yuv444 => crate::align4(luma_bytes),
+            _ => luma_bytes,
+        };
 
-        // Map staging buffer.
-        let data_ptr = unsafe {
+        let device = self.context.device();
+        let ptr = unsafe {
             device.map_memory(
                 self.staging_memory,
                 0,
@@ -573,62 +366,55 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkMapMemory"))?;
+        // SAFETY: the mapping covers `staging_size` bytes and nothing else
+        // uses it until it is unmapped below.
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, self.staging_size) };
+        let put16 = |dst: &mut [u8], index: usize, value: u16| {
+            dst[index * 2..index * 2 + 2].copy_from_slice(&value.to_ne_bytes());
+        };
 
-        unsafe {
-            match self.bit_depth {
-                BitDepth::Eight => {
-                    // 8-bit semi-planar YUV444: Y plane, then interleaved UV plane.
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
-
-                    // Copy Y plane directly.
-                    dst[..plane_size].copy_from_slice(&yuv_data[..plane_size]);
-
-                    // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
-                    let uv_offset = crate::align4(plane_size);
-
-                    // Interleave U and V planes for semi-planar format.
-                    let u_plane = &yuv_data[plane_size..plane_size * 2];
-                    let v_plane = &yuv_data[plane_size * 2..plane_size * 3];
-                    for i in 0..plane_size {
-                        dst[uv_offset + i * 2] = u_plane[i];
-                        dst[uv_offset + i * 2 + 1] = v_plane[i];
+        match layout {
+            YuvLayout::Nv12 => dst[..expected_size].copy_from_slice(&data[..expected_size]),
+            YuvLayout::I420 | YuvLayout::I444 => {
+                let (y, rest) = data.split_at(luma);
+                let (u, v) = rest.split_at(chroma);
+                if ten_bit {
+                    // An 8-bit sample in the high byte is the same value in
+                    // P010's 10 high bits.
+                    for (i, &s) in y.iter().enumerate() {
+                        put16(dst, i, (s as u16) << 8);
                     }
-                }
-                BitDepth::Ten => {
-                    // 10-bit semi-planar YUV444: Expand 8-bit to 16-bit and interleave UV.
-                    let dst =
-                        std::slice::from_raw_parts_mut(data_ptr as *mut u16, self.staging_size / 2);
-
-                    // Convert Y plane.
-                    for i in 0..plane_size {
-                        dst[i] = (yuv_data[i] as u16) << 8;
+                    let uv = &mut dst[uv_offset..];
+                    for i in 0..chroma {
+                        put16(uv, i * 2, (u[i] as u16) << 8);
+                        put16(uv, i * 2 + 1, (v[i] as u16) << 8);
                     }
-
-                    // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
-                    let uv_offset_u16 = crate::align4(plane_size * 2) / 2;
-
-                    // Interleave and convert U and V planes.
-                    let u_plane = &yuv_data[plane_size..plane_size * 2];
-                    let v_plane = &yuv_data[plane_size * 2..plane_size * 3];
-                    for i in 0..plane_size {
-                        dst[uv_offset_u16 + i * 2] = (u_plane[i] as u16) << 8;
-                        dst[uv_offset_u16 + i * 2 + 1] = (v_plane[i] as u16) << 8;
+                } else {
+                    dst[..luma].copy_from_slice(y);
+                    let uv = &mut dst[uv_offset..];
+                    for i in 0..chroma {
+                        uv[i * 2] = u[i];
+                        uv[i * 2 + 1] = v[i];
                     }
                 }
             }
-
-            device.unmap_memory(self.staging_memory);
+            YuvLayout::I420P10 => {
+                // The source has the 10 bits in the low bits of each sample,
+                // P010 in the high bits.
+                let sample = |i: usize| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]) << 6;
+                for i in 0..luma {
+                    put16(dst, i, sample(i));
+                }
+                let uv = &mut dst[uv_offset..];
+                for i in 0..chroma {
+                    put16(uv, i * 2, sample(luma + i));
+                    put16(uv, i * 2 + 1, sample(luma + chroma + i));
+                }
+            }
         }
 
-        // Record and submit copy commands.
-        self.copy_staging_to_image_internal(
-            slot.image(),
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-        )?;
-
+        unsafe { device.unmap_memory(self.staging_memory) };
         Ok(())
     }
 
@@ -663,20 +449,20 @@ impl InputImage {
         // YUV420 dimensions are always even (required for 4:2:0), so alignment is
         // naturally satisfied and must not pad to stay consistent with upload functions.
         let y_plane_bytes = (width * height) as usize * bytes_per_sample;
-        let y_plane_size_bytes = match self.pixel_format {
-            PixelFormat::Yuv444 => crate::align4(y_plane_bytes) as vk::DeviceSize,
+        let y_plane_size_bytes = match self.chroma_format {
+            ChromaFormat::Yuv444 => crate::align4(y_plane_bytes) as vk::DeviceSize,
             _ => y_plane_bytes as vk::DeviceSize,
         };
 
         unsafe {
             device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
         }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
         // Transition image to transfer destination.
         let barrier = vk::ImageMemoryBarrier::default()
@@ -707,9 +493,9 @@ impl InputImage {
             );
         }
 
-        // Build copy regions based on pixel format.
-        let copy_regions = match self.pixel_format {
-            PixelFormat::Yuv420 => {
+        // Build copy regions based on chroma format.
+        let copy_regions = match self.chroma_format {
+            ChromaFormat::Yuv420 => {
                 // NV12/P010: Y plane (PLANE_0) + interleaved UV plane (PLANE_1)
                 vec![
                     // Y plane.
@@ -748,7 +534,7 @@ impl InputImage {
                         }),
                 ]
             }
-            PixelFormat::Yuv444 => {
+            ChromaFormat::Yuv444 => {
                 // 2-plane semi-planar YUV444: Y (PLANE_0), UV interleaved (PLANE_1) at full resolution.
                 vec![
                     // Y plane.
@@ -789,8 +575,8 @@ impl InputImage {
             }
             _ => {
                 return Err(PixelForgeError::InvalidInput(format!(
-                    "Unsupported pixel format: {:?}",
-                    self.pixel_format
+                    "Unsupported chroma format: {:?}",
+                    self.chroma_format
                 )));
             }
         };
@@ -835,24 +621,20 @@ impl InputImage {
         }
 
         unsafe { device.end_command_buffer(self.command_buffer) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
         // Submit and wait.
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(|e| {
-            PixelForgeError::vk(e, |e| {
-                PixelForgeError::CommandBuffer(format!("Queue submit failed: {e}"))
-            })
-        })?;
+            .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| PixelForgeError::vk(e, PixelForgeError::Synchronization))?;
+            .map_err(PixelForgeError::vk("vkWaitForFences"))?;
 
         unsafe { device.reset_fences(&[self.fence]) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(PixelForgeError::vk("vkResetFences"))?;
 
         Ok(())
     }
@@ -875,7 +657,7 @@ impl InputImage {
     }
 }
 
-impl Drop for InputImage {
+impl Drop for YuvUploader {
     fn drop(&mut self) {
         let device = self.context.device();
         unsafe {

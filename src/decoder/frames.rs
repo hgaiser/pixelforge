@@ -15,7 +15,7 @@ use ash::vk::{self, TaggedStructure as _};
 
 use crate::decoder::DecodedFrame;
 use crate::decoder::common::{DecoderCommon, DpbImage};
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::video::find_memory_type;
 use crate::vulkan::VideoContext;
@@ -32,7 +32,7 @@ pub(crate) struct DecodedPicture {
     pub image_view: vk::ImageView,
     pub layout: vk::ImageLayout,
     pub array_layer: u32,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     pub generation: u64,
     pub width: u32,
@@ -42,6 +42,8 @@ pub(crate) struct DecodedPicture {
     pub pts: u64,
     pub display_order: i32,
     pub is_keyframe: bool,
+    /// The picture is in its slot's film grain output image, not in the slot.
+    pub film_grain: bool,
 }
 
 /// An image in the frame pool, by index.
@@ -54,48 +56,69 @@ pub(crate) struct PoolIndex(usize);
 /// so the codec must not decode over it. Releases come from [`FramePin::drop`]
 /// on whatever thread the frame died on, which is why the decoder waits on the
 /// condition variable rather than polling.
+///
+/// A slot can be pinned more than once: AV1 can show the same picture again
+/// (`show_existing_frame`), and each frame that shows it holds its own pin.
+/// The slot stays pinned until the last of them is released.
 #[derive(Debug, Default)]
 pub(crate) struct SlotPins {
-    /// One bit per DPB slot.
-    pinned: Mutex<u32>,
+    state: Mutex<PinState>,
     released: Condvar,
 }
 
+#[derive(Debug, Default)]
+struct PinState {
+    /// Pins held on each DPB slot.
+    counts: [u16; MAX_PINNABLE_SLOTS],
+    /// Releases so far, so a waiter can tell that one happened.
+    releases: u64,
+}
+
+/// The most DPB slots any codec uses: 16 references plus the current picture
+/// for H.264 and H.265, with room to spare.
+const MAX_PINNABLE_SLOTS: usize = 32;
+
 impl SlotPins {
     pub fn is_pinned(&self, slot: u8) -> bool {
-        *self.pinned.lock().unwrap() & (1 << slot) != 0
+        self.state.lock().unwrap().counts[slot as usize] != 0
     }
 
     pub fn any_pinned(&self) -> bool {
-        *self.pinned.lock().unwrap() != 0
+        self.state.lock().unwrap().counts.iter().any(|&c| c != 0)
     }
 
     /// How many slots are pinned right now, across everything holding one:
     /// pictures awaiting their turn in display order, frames on their way to
-    /// the caller, and frames the caller has not dropped.
+    /// the caller, and frames the caller has not dropped. A slot pinned more
+    /// than once counts once, since it holds one slot.
     pub fn count(&self) -> usize {
-        self.pinned.lock().unwrap().count_ones() as usize
+        let state = self.state.lock().unwrap();
+        state.counts.iter().filter(|&&c| c != 0).count()
     }
 
     pub fn pin(&self, slot: u8) {
-        *self.pinned.lock().unwrap() |= 1 << slot;
+        self.state.lock().unwrap().counts[slot as usize] += 1;
     }
 
     pub fn release(&self, slot: u8) {
-        *self.pinned.lock().unwrap() &= !(1 << slot);
+        let mut state = self.state.lock().unwrap();
+        let count = &mut state.counts[slot as usize];
+        debug_assert!(*count > 0, "released slot {slot} was not pinned");
+        *count = count.saturating_sub(1);
+        state.releases += 1;
         self.released.notify_all();
     }
 
-    /// Block until at least one pinned slot is released. Returns immediately if
+    /// Block until at least one pin is released. Returns immediately if
     /// nothing is pinned, since then no release can ever come.
     pub fn wait_for_release(&self) {
-        let mut pinned = self.pinned.lock().unwrap();
-        let before = *pinned;
-        if before == 0 {
+        let mut state = self.state.lock().unwrap();
+        if state.counts.iter().all(|&c| c == 0) {
             return;
         }
-        while *pinned == before {
-            pinned = self.released.wait(pinned).unwrap();
+        let before = state.releases;
+        while state.releases == before {
+            state = self.released.wait(state).unwrap();
         }
     }
 }
@@ -329,7 +352,7 @@ struct ReorderEntry {
     height: u32,
     coded_width: u32,
     coded_height: u32,
-    pixel_format: PixelFormat,
+    chroma_format: ChromaFormat,
     bit_depth: BitDepth,
 }
 
@@ -405,7 +428,7 @@ impl ReorderBuffer {
             height: picture.height,
             coded_width: picture.coded_width,
             coded_height: picture.coded_height,
-            pixel_format: picture.pixel_format,
+            chroma_format: picture.chroma_format,
             bit_depth: picture.bit_depth,
         });
 
@@ -429,7 +452,11 @@ impl ReorderBuffer {
         // holds frames gets copies rather than a decoder that cannot proceed.
         if session.pinnable && session.slot_pins.count() < session.spare_slots {
             session.slot_pins.pin(picture.slot);
-            let (entry, _, _) = session.dpb_entry(picture.slot);
+            let entry = if picture.film_grain {
+                session.grain_entry(picture.slot)
+            } else {
+                session.dpb_entry(picture.slot).0
+            };
             return Ok(Retained::Slot {
                 pin: FramePin::DpbSlot {
                     slot: picture.slot,
@@ -505,7 +532,7 @@ impl ReorderBuffer {
             image_view,
             layout,
             array_layer,
-            pixel_format: entry.pixel_format,
+            chroma_format: entry.chroma_format,
             bit_depth: entry.bit_depth,
             width: entry.width,
             height: entry.height,
@@ -589,7 +616,7 @@ fn create_pool_image(
         create_info.push(&mut format_list)
     };
     let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("reorder pool image: {}", e)))?;
+        .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
     let reqs = unsafe { context.device().get_image_memory_requirements(image) };
     let memory_type_index = find_memory_type(
@@ -598,15 +625,33 @@ fn create_pool_image(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No device-local memory for reorder pool".to_string())
+        PixelForgeError::NoSuitableDevice("No device-local memory for reorder pool".to_string())
     })?;
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
         .memory_type_index(memory_type_index);
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
     unsafe { context.device().bind_image_memory(image, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(PixelForgeError::vk("vkBindImageMemory"))?;
 
     Ok((image, memory))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_pinned_twice_stays_pinned_until_both_release() {
+        let pins = SlotPins::default();
+        pins.pin(3);
+        pins.pin(3);
+        assert_eq!(pins.count(), 1, "one slot is held, however often");
+        pins.release(3);
+        assert!(pins.is_pinned(3));
+        pins.release(3);
+        assert!(!pins.is_pinned(3));
+        assert!(!pins.any_pinned());
+    }
 }

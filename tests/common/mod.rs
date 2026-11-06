@@ -309,10 +309,13 @@ impl Readback {
 
         // Crop to the visible region on the way out: the image is coded-size,
         // which is padded up to the codec's macroblock granularity.
+        // An odd size rounds the chroma up: the last chroma sample covers
+        // the last luma column (and row) on its own.
         let visible_y_stride = frame.width as usize * bytes;
-        let visible_uv_stride = visible_y_stride;
+        let visible_uv_stride = frame.width.div_ceil(2) as usize * 2 * bytes;
+        let uv_rows = frame.height.div_ceil(2) as usize;
         let mut y = Vec::with_capacity(visible_y_stride * frame.height as usize);
-        let mut uv = Vec::with_capacity(visible_uv_stride * frame.height as usize / 2);
+        let mut uv = Vec::with_capacity(visible_uv_stride * uv_rows);
         unsafe {
             // Map the whole allocation: a sub-range map has to respect
             // nonCoherentAtomSize, and WHOLE_SIZE sidesteps that.
@@ -326,7 +329,7 @@ impl Readback {
                     visible_y_stride,
                 ));
             }
-            for row in 0..frame.height as usize / 2 {
+            for row in 0..uv_rows {
                 uv.extend_from_slice(std::slice::from_raw_parts(
                     ptr.add(y_size + row * uv_stride),
                     visible_uv_stride,

@@ -1,10 +1,10 @@
 //! A Vulkan-based video encoding and decoding library for Rust, supporting H.264,
-//! H.265 and AV1 encode, and H.264 decode.
+//! H.265 and AV1, for both encode and decode.
 //!
 //! # Features
 //!
 //! - **Hardware-accelerated** video encoding and decoding using Vulkan Video extensions.
-//! - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1 encode; H.264 decode.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC and AV1, encode and decode.
 //! - **Asynchronous pipelines**: both directions submit without waiting.
 //!   Encoding hands back an [`EncodeFuture`]; decoding delivers frames through a
 //!   [`DecodeSource`] as the GPU finishes with them.
@@ -19,7 +19,7 @@
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 //! - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
 //! - **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
-//! - **Utility helpers**: [`InputImage`] for easy YUV data upload to GPU.
+//! - **Utility helpers**: [`YuvUploader`] for easy YUV data upload to GPU.
 //! - **Optional DMA-BUF input**: import a producer's buffers, or allocate buffers
 //!   for it, read with no copy where the driver allows, with sync_file fences
 //!   (Linux only).
@@ -31,11 +31,12 @@
 //! | Codec | Encode | Decode |
 //! |-------|--------|--------|
 //! | H.264/AVC | ✓ | ✓ |
-//! | H.265/HEVC | ✓ | |
-//! | AV1 | ✓ | |
+//! | H.265/HEVC | ✓ | ✓ |
+//! | AV1 | ✓ | ✓ |
 //!
 //! H.264 decoding is verified byte-identical to `ffmpeg -pix_fmt nv12` on AMD
-//! (RADV), NVIDIA and Intel (ANV).
+//! (RADV), NVIDIA and Intel (ANV). H.265 decoding is verified byte-identical to
+//! ffmpeg, and AV1 decoding (film grain included) to dav1d, on NVIDIA so far.
 //!
 //! # Requirements
 //!
@@ -90,10 +91,7 @@
 //! ## Encoding Video
 //!
 //! ```rust,no_run
-//! use pixelforge::{
-//!     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControl,
-//!     VideoContextBuilder,
-//! };
+//! use pixelforge::{Codec, EncodeConfig, Encoder, YuvUploader, RateControl, VideoContextBuilder};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let context = VideoContextBuilder::new()
@@ -109,20 +107,13 @@
 //!         .with_frame_rate(30, 1)
 //!         .with_gop_size(60);
 //!
-//!     // Create an InputImage helper for uploading YUV data to the GPU.
-//!     let mut input_image = InputImage::new(
-//!         context.clone(),
-//!         Codec::H264,
-//!         1920,
-//!         1080,
-//!         EncodeBitDepth::Eight,
-//!         PixelFormat::Yuv420,
-//!     )?;
 //!     let mut encoder = Encoder::new(context, config)?;
+//!     // Create a YuvUploader helper for uploading YUV data to the GPU.
+//!     let mut input_image = YuvUploader::for_encoder(&encoder)?;
 //!
 //!     // For each frame: upload YUV data and encode.
 //!     // let yuv_data: &[u8] = ...;  // YUV420 frame data
-//!     // input_image.upload_yuv420(yuv_data)?;
+//!     // input_image.upload(YuvLayout::I420, yuv_data)?;
 //!     // let packet = encoder.submit(Frame::image(input_image.source()))?;
 //!
 //!     Ok(())
@@ -156,7 +147,7 @@
 //!
 //!     // A file can cut anywhere, so let the decoder frame it. Input that
 //!     // arrives already framed (RTP, a container) skips `with_byte_stream`.
-//!     let config = DecodeConfig::h264().with_byte_stream();
+//!     let config = DecodeConfig::new(Codec::H264).with_byte_stream();
 //!     let mut decoder = Decoder::new(context, config)?;
 //!     let stream: Vec<u8> = std::fs::read("input.264")?;
 //!
@@ -199,7 +190,7 @@
 //!
 //! ```rust,no_run
 //! use pixelforge::{
-//!     Codec, ColorRange, ColorSpec, EncodeConfig, Encoder, InputFormat, RgbSource, Source,
+//!     Codec, ColorRange, ColorSpec, EncodeConfig, Encoder, RgbFormat, RgbSource, Source,
 //!     StreamColor, VideoContextBuilder,
 //! };
 //!
@@ -210,8 +201,8 @@
 //!
 //! // SDR desktop content, encoded as HDR10 for an HDR streaming session.
 //! let config = EncodeConfig::h265(1920, 1080)
-//!     .with_bit_depth(pixelforge::EncodeBitDepth::Ten)
-//!     .with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, ColorSpec::Srgb)))
+//!     .with_bit_depth(pixelforge::BitDepth::Ten)
+//!     .with_source(Source::Rgb(RgbSource::new(RgbFormat::BGRx, ColorSpec::Srgb)))
 //!     .with_color(StreamColor::Hdr10 {
 //!         range: ColorRange::Full,
 //!     });
@@ -267,9 +258,9 @@
 //! - a [`SourceImage`], an image of the caller's. Pixelforge copies or
 //!   converts it into the input image after the call returns, and the
 //!   `SourceImage` keeps track of that: write the image again only after
-//!   [`SourceImage::released`]. [`InputImage`], for frames uploaded from the
+//!   [`SourceImage::released`]. [`YuvUploader`], for frames uploaded from the
 //!   CPU, waits for that itself.
-//! - an `ExternalImage`, a DMA-BUF (see below).
+//! - a `DmaBufImage`, a DMA-BUF (see below).
 //!
 //! ## Encoding on your own device
 //!
@@ -278,9 +269,10 @@
 //! the device: no external memory, no import, and no CPU wait between the
 //! application's work and pixelforge's.
 //!
-//! [`VideoContextBuilder::encode_device_requirements`] lists the queue
-//! families, extensions and features to create the device with, and
-//! [`VideoContextBuilder::build_from_existing_encode`] adopts it. A `VkQueue`
+//! [`VideoContextBuilder::device_requirements`] lists the queue
+//! families, extensions and features to create the device with, for the
+//! codecs asked for with `require_encode` and `require_decode`, and
+//! [`VideoContextBuilder::build_from_existing`] adopts it. A `VkQueue`
 //! may not be submitted to from two threads at once, so give pixelforge queues
 //! the application does not use, with
 //! [`VideoContextBuilder::with_encode_queue`] and friends.
@@ -312,12 +304,12 @@
 //! ## DMA-BUF input
 //!
 //! With the `dmabuf` feature, an encoder reads DMA-BUFs from another process.
-//! `Encoder::input_formats` gives the DRM format it wants and, per DRM
+//! `Encoder::dmabuf_format` gives the DRM format it wants and, per DRM
 //! modifier, whether it reads such a buffer with no copy. Offer those
 //! modifiers to the producer first. `Encoder::import` takes a producer's
 //! buffer; `Encoder::allocate_input` makes one for a producer that writes
 //! into buffers the consumer supplies, such as `ext-image-copy-capture`.
-//! Either is checked once and gives an `ExternalImage`, which
+//! Either is checked once and gives a `DmaBufImage`, which
 //! `Frame::external` submits. A buffer the encoder cannot read directly is
 //! copied on the GPU instead.
 //!
@@ -400,24 +392,23 @@ pub(crate) const fn align4(size: usize) -> usize {
     (size + 3) & !3
 }
 
-pub use converter::{ColorRange, ColorSpec, InputFormat};
+pub use converter::{ColorRange, ColorSpec, RgbFormat};
 pub use decoder::{
     DecodeConfig, DecodeSink, DecodeSource, DecodeStatus, DecodedFrame, Decoder, FramePoll, Framing,
 };
 #[cfg(feature = "dmabuf")]
-pub use encoder::external::{DmaBuf, DmaBufPlane, ExternalImage, InputFormats, InputModifier};
+pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, DmaBufPlane};
 pub use encoder::{
-    BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_AV1_Q_INDEX, DEFAULT_FRAME_RATE,
-    DEFAULT_GOP_SIZE, DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_REFERENCE_FRAMES, EncodeConfig,
-    EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode,
-    Frame, FrameType, PixelFormat, RateControl,
+    BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions, EncodeConfig, EncodeContentHint,
+    EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode, Frame, FrameRate,
+    FrameType, RateControl,
 };
 pub use encoder::{
     Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,
     StreamColor,
 };
 pub use error::PixelForgeError;
-pub use image::InputImage;
+pub use image::{YuvLayout, YuvUploader};
 pub use sync::TimelinePoint;
 pub use vulkan::VideoContextBuilder;
 
