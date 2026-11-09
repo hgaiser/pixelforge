@@ -184,13 +184,13 @@ impl H264Decoder {
         let (profile, chroma_format, bit_depth) = Self::profile_for(sps)?;
 
         // The stream needs max_num_ref_frames references plus the current
-        // picture. Reorder depth comes from the stream (VUI); without it, bound
-        // by the reference count, which is never smaller than the reorder depth
-        // in practice.
-        let reorder_depth = sps
-            .max_num_reorder_frames
-            .map(|v| v as usize)
-            .unwrap_or(sps.max_num_ref_frames as usize);
+        // picture. The reorder depth comes from the VUI, and is inferred when
+        // the stream has none.
+        let (reorder_depth, reorder_source) = sps.reorder_depth();
+        debug!(
+            "H.264 decode: reorder depth {} (from {:?})",
+            reorder_depth, reorder_source
+        );
         let needs = StreamNeeds {
             codec: "H.264",
             width: sps.coded_width(),

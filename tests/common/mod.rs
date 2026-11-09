@@ -37,6 +37,7 @@ use std::io::Write;
 pub fn init_logging() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        keep_driver_loaded();
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
         let _ = tracing_subscriber::fmt()
@@ -44,6 +45,26 @@ pub fn init_logging() {
             .with_test_writer()
             .try_init();
     });
+}
+
+/// Keep the Vulkan driver loaded for the life of the test process.
+///
+/// The loader loads a driver's libraries when an instance is created and
+/// unloads them with the last instance, so a binary whose tests each build a
+/// context loads the driver once per test. The NVIDIA driver (615.78.08) can
+/// be loaded only about 26 times in one process: after that the loader finds
+/// no driver. One instance that is never destroyed holds the libraries.
+fn keep_driver_loaded() {
+    let Ok(entry) = (unsafe { ash::Entry::load() }) else {
+        return;
+    };
+    let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    // The instance is never destroyed, and the entry must not unload the
+    // loader under it.
+    if unsafe { entry.create_instance(&create_info, None) }.is_ok() {
+        std::mem::forget(entry);
+    }
 }
 
 /// Bytes handed to the decoder per call, standing in for a network read.
