@@ -622,7 +622,7 @@ pub struct EncodedPacket {
     /// Presentation timestamp.
     pub pts: u64,
     /// Decode timestamp.
-    pub dts: u64,
+    pub dts: i64,
     /// Stats about the packet.
     pub stats: EncodedPacketStats,
 }

@@ -1,19 +1,22 @@
 //! Asynchronous (push) encode pipelining, shared by all codecs.
 //!
-//! Each in-flight frame owns an [`EncodeSlot`] (its own input image, bitstream
-//! buffer, encode command buffer, fence and query pool). [`EncodePipeline`]
-//! rotates through the slots so that the CPU can record and submit frame N+1
-//! while the GPU is still encoding frame N, instead of blocking on a fence after
-//! every frame.
+//! Each frame owns an [`EncodeSlot`] (its own input image, bitstream buffer,
+//! encode command buffer, fence and query pool) from the moment it is submitted
+//! until its bitstream is read back. [`EncodePipeline`] hands the slots out
+//! oldest-free first, so that the CPU can record and submit frame N+1 while the
+//! GPU is still encoding frame N, instead of blocking on a fence after every
+//! frame. A frame that is encoded later than it was submitted (a B-frame) keeps
+//! its slot, and with it its pixels, until then.
 //!
 //! Bitstream readback is performed off the calling thread: a single background
 //! *completion thread* waits on each submission's fence, copies the bitstream
 //! out, and resolves that frame's [`EncodeFuture`] the moment the GPU signals —
 //! rather than deferring readback until the slot is reused. This delivers each
 //! packet at roughly the GPU encode time instead of one or two `encode()` calls
-//! later. Each `encode()` returns its own future (backed by a oneshot channel),
-//! so packet delivery is paired with its submission by construction rather than
-//! by a shared channel and a separate ordering convention.
+//! later. Each `submit()` returns its own future (backed by a oneshot channel).
+//! The futures resolve in the order they were made: the k-th future gets the
+//! k-th packet, whichever frame that packet holds. The senders wait in a queue
+//! until an encode takes the oldest one.
 //!
 //! The DPB images and video session are shared across slots, so encode
 //! submissions must still run in DPB order on the GPU. That ordering is enforced
@@ -22,13 +25,13 @@
 //! the timeline; the completion thread only waits on fences and reads bitstream
 //! buffers, so the two never race on the same Vulkan object.
 //!
-//! Slot reuse is coordinated with a per-slot "busy" flag
-//! ([`SlotSync`](crate::video::SlotSync)): a slot
-//! is busy from submit until the completion thread has finished reading its
-//! bitstream. The calling thread waits for the current slot to be free before
-//! converting into / recording over it, which also covers the write-after-read
-//! hazard on the shared input image.
+//! Slot reuse is coordinated with a queue of free slots (`FreeSlots`): a
+//! slot leaves it when a frame takes it and comes back once the completion
+//! thread has finished reading its bitstream. The calling thread waits for a
+//! free slot before converting into / recording over it, which also covers the
+//! write-after-read hazard on the slot's input image.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,17 +51,15 @@ use crate::encoder::resources::{
 use crate::encoder::{BitDepth, ChromaFormat, EncodedPacket, FrameType};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
-use crate::video::{SlotSync, TimelineChain};
+use crate::video::TimelineChain;
 use crate::vulkan::VideoContext;
 
-/// A handle to the packet a single `EncodePipeline::submit_current` will
-/// eventually produce.
+/// A handle to one packet of the stream.
 ///
 /// Returned by `Encoder::submit`, one per submitted frame. Awaiting it yields
-/// that frame's [`EncodedPacket`] once the GPU finishes encoding and the
-/// completion thread reads the bitstream back. Futures resolve in submission
-/// order (one submission → one readback → one packet) as long as you await them
-/// in the order `encode` returned them.
+/// an [`EncodedPacket`] once the GPU finishes encoding and the completion
+/// thread reads the bitstream back. The futures resolve in the order `submit`
+/// returned them, and the k-th one yields the k-th packet of the stream.
 ///
 /// Dropping the future before it resolves is harmless: the completion thread
 /// still reads the slot back (its send simply finds no receiver) and frees it.
@@ -103,11 +104,12 @@ impl Future for EncodeFuture {
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(result)) => Poll::Ready(result.map(|mut packet| {
                 packet.pts += offset;
-                packet.dts += offset;
+                packet.dts += offset as i64;
                 packet
             })),
             // The sender was dropped without sending. The completion thread only
-            // drops a sender after sending, so this indicates encoder teardown.
+            // drops a sender after sending, so the encoder was torn down, or an
+            // encode failed before this frame's.
             Poll::Ready(Err(oneshot::Canceled)) => Poll::Ready(Err(PixelForgeError::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
@@ -126,7 +128,7 @@ pub(crate) const ENCODE_PIPELINE_DEPTH: usize = 2;
 pub(crate) struct SlotPacketMetadata {
     pub frame_type: FrameType,
     pub pts: u64,
-    pub dts: u64,
+    pub dts: i64,
     /// Codec header (SPS/PPS, VPS/SPS/PPS, or AV1 sequence header) to prepend.
     /// `Some` only for frames that carry one (e.g. the IDR/key frame).
     pub header: Option<Vec<u8>>,
@@ -144,8 +146,9 @@ struct SendPtr(*const u8);
 // until the slot is marked free again (after this read completes).
 unsafe impl Send for SendPtr {}
 
-/// A submission handed from the calling thread to the completion thread.
-struct WorkItem {
+/// An encode handed from the calling thread to the completion thread, to
+/// read its bitstream back.
+struct Readback {
     slot_index: usize,
     fence: vk::Fence,
     query_pool: vk::QueryPool,
@@ -158,11 +161,95 @@ struct WorkItem {
     timestamp_valid_bits: u32,
     timestamp_query_pool: vk::QueryPool,
     submit_time: std::time::Instant,
-    /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
-    result_tx: oneshot::Sender<Result<EncodedPacket>>,
 }
 
-/// All per-frame resources that must be private to a single in-flight encode.
+/// Where an encode's bitstream goes.
+pub(crate) enum Delivery {
+    /// Into a packet of its own, which resolves the oldest waiting future.
+    Packet,
+    /// In front of the next packet, in the same temporal unit: an AV1 frame
+    /// that is not shown. It resolves no future.
+    #[allow(dead_code)]
+    Carry,
+}
+
+/// What the completion thread does with an encode's bitstream.
+enum Deliver {
+    /// Resolves a frame's [`EncodeFuture`] once the bitstream is read back.
+    Packet(oneshot::Sender<Result<EncodedPacket>>),
+    Carry,
+}
+
+/// Work for the completion thread, handled in the order it was sent.
+enum WorkItem {
+    /// An encode on the GPU.
+    Encoded(Readback, Deliver),
+    /// A packet made on the CPU, with no encode and no slot: an AV1
+    /// `show_existing_frame` header.
+    Synthetic {
+        packet: EncodedPacket,
+        result_tx: oneshot::Sender<Result<EncodedPacket>>,
+    },
+}
+
+/// The slots no frame owns, oldest first.
+///
+/// The calling thread takes from the front and the completion thread puts
+/// back at the end, so the front does not change under the calling thread
+/// once there is one.
+struct FreeSlots {
+    queue: std::sync::Mutex<VecDeque<usize>>,
+    cv: std::sync::Condvar,
+    slot_count: usize,
+}
+
+impl FreeSlots {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            queue: std::sync::Mutex::new((0..slot_count).collect()),
+            cv: std::sync::Condvar::new(),
+            slot_count,
+        }
+    }
+
+    /// Wait for a free slot and return the oldest, without taking it.
+    fn wait_front(&self) -> usize {
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = self
+            .cv
+            .wait_while(queue, |q| q.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        queue[0]
+    }
+
+    /// Take the oldest free slot, waiting for one.
+    fn take_front(&self) -> usize {
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = self
+            .cv
+            .wait_while(queue, |q| q.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        queue.pop_front().expect("waited for a free slot")
+    }
+
+    fn put_back(&self, slot: usize) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push_back(slot);
+        self.cv.notify_all();
+    }
+
+    /// Wait until every slot is free. Only returns if no frame holds a slot
+    /// without an encode in flight.
+    fn wait_all(&self) {
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let _queue = self
+            .cv
+            .wait_while(queue, |q| q.len() < self.slot_count)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// All per-frame resources that must be private to a single frame.
 pub(crate) struct EncodeSlot {
     pub input_image: vk::Image,
     pub input_image_memory: vk::DeviceMemory,
@@ -204,21 +291,27 @@ pub(crate) struct PipelineConfig<'a> {
     /// input images, bitstream buffers and feedback query pools.
     pub profile_info: &'a vk::VideoProfileInfoKHR<'a>,
     pub command_pool: vk::CommandPool,
+    /// How many frames can wait for their encode, on top of
+    /// [`ENCODE_PIPELINE_DEPTH`]: the B-frames between two reference frames.
+    pub held_frames: usize,
     /// Transfer command buffer/fence reused to zero-initialize each input image.
     pub upload_command_buffer: vk::CommandBuffer,
     pub upload_fence: vk::Fence,
 }
 
-/// Rotating set of [`EncodeSlot`]s plus the timeline semaphore that orders their
-/// encode submissions and the completion thread that reads bitstreams back.
+/// The [`EncodeSlot`]s, plus the timeline semaphore that orders their encode
+/// submissions and the completion thread that reads bitstreams back.
 pub(crate) struct EncodePipeline {
     slots: Vec<EncodeSlot>,
+    /// The slot of the frame being encoded.
     current_slot: usize,
     /// Orders encode submissions that share DPB state.
     timeline: TimelineChain,
 
-    /// Per-slot busy flags shared with the completion thread.
-    slot_sync: Arc<SlotSync>,
+    /// The free slots, shared with the completion thread.
+    free_slots: Arc<FreeSlots>,
+    /// The senders of the futures no packet was assigned to yet, oldest first.
+    senders: VecDeque<oneshot::Sender<Result<EncodedPacket>>>,
     /// Sends submitted work to the completion thread. Dropped on shutdown to end
     /// the thread.
     work_tx: Option<Sender<WorkItem>>,
@@ -227,14 +320,15 @@ pub(crate) struct EncodePipeline {
 }
 
 impl EncodePipeline {
-    /// Allocate the timeline semaphore, `ENCODE_PIPELINE_DEPTH` slots and spawn
-    /// the bitstream-readback completion thread.
+    /// Allocate the timeline semaphore and the slots, and spawn the
+    /// bitstream-readback completion thread.
     pub(crate) fn new(config: &PipelineConfig) -> Result<Self> {
         let context = config.context;
         let device = context.device();
 
+        let slot_count = ENCODE_PIPELINE_DEPTH + config.held_frames;
         let command_buffers =
-            allocate_command_buffers(context, config.command_pool, ENCODE_PIPELINE_DEPTH as u32)?;
+            allocate_command_buffers(context, config.command_pool, slot_count as u32)?;
 
         // Timestamp queries are only legal on a queue family with non-zero
         // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
@@ -253,7 +347,7 @@ impl EncodePipeline {
             );
         }
 
-        let mut slots = Vec::with_capacity(ENCODE_PIPELINE_DEPTH);
+        let mut slots = Vec::with_capacity(slot_count);
         for &encode_command_buffer in &command_buffers {
             let (input_image, input_image_memory, input_image_view) = create_image(
                 context,
@@ -325,18 +419,18 @@ impl EncodePipeline {
             });
         }
 
-        let slot_sync = Arc::new(SlotSync::new(slots.len()));
+        let free_slots = Arc::new(FreeSlots::new(slots.len()));
         let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
 
         // The completion thread only needs a handle to the device; the Vulkan
         // device handle is internally shared and safe to use from this thread
         // for fence waits, query reads and host-coherent buffer reads.
         let thread_device = device.clone();
-        let thread_sync = slot_sync.clone();
+        let thread_free = free_slots.clone();
         let completion_thread = std::thread::Builder::new()
             .name("pixelforge-encode-readback".to_string())
             .spawn(move || {
-                run_completion_thread(thread_device, work_rx, thread_sync);
+                run_completion_thread(thread_device, work_rx, thread_free);
             })
             .map_err(|source| PixelForgeError::Io {
                 what: "spawning the readback thread",
@@ -347,38 +441,88 @@ impl EncodePipeline {
             slots,
             current_slot: 0,
             timeline: TimelineChain::new(context)?,
-            slot_sync,
+            free_slots,
+            senders: VecDeque::new(),
             work_tx: Some(work_tx),
             completion_thread: Some(completion_thread),
         })
     }
 
-    /// The slot the next frame will be encoded into.
+    /// The slot of the frame being encoded, see [`Self::begin_encode`].
     pub(crate) fn current(&self) -> &EncodeSlot {
         &self.slots[self.current_slot]
     }
 
-    pub(crate) fn current_mut(&mut self) -> &mut EncodeSlot {
-        &mut self.slots[self.current_slot]
+    /// The slot at `index`.
+    pub(crate) fn slot(&self, index: usize) -> &EncodeSlot {
+        &self.slots[index]
     }
 
-    /// Return the current slot's input image, first waiting until the slot is
-    /// free so it is safe to use as a convert/upload target (write-after-read on
-    /// the shared input image).
+    pub(crate) fn slot_mut(&mut self, index: usize) -> &mut EncodeSlot {
+        &mut self.slots[index]
+    }
+
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The slot the next submitted frame takes, first waiting until there is
+    /// a free one. A free slot's last encode was read back, so its input image
+    /// is safe to use as a convert/upload target and its command buffers and
+    /// semaphores are free.
+    pub(crate) fn next_index(&self) -> usize {
+        self.free_slots.wait_front()
+    }
+
+    /// The input image of the slot the next submitted frame takes, see
+    /// [`Self::next_index`].
     pub(crate) fn input_image(&self) -> vk::Image {
-        self.slot_sync.wait_free(self.current_slot);
-        self.slots[self.current_slot].input_image
+        self.slots[self.next_index()].input_image
     }
 
-    /// Wait until the current slot is free to record over and submit.
-    pub(crate) fn wait_current_free(&self) {
-        self.slot_sync.wait_free(self.current_slot);
+    /// Give the slot [`Self::next_index`] names to a frame. The frame owns it
+    /// until its encode was read back, or until [`Self::release`].
+    pub(crate) fn take_slot(&mut self) -> usize {
+        self.free_slots.take_front()
+    }
+
+    /// Give back the slot of a frame that will not be encoded.
+    pub(crate) fn release(&mut self, slot: usize) {
+        self.slots[slot].pending_metadata = None;
+        self.free_slots.put_back(slot);
+    }
+
+    /// Make the future of the next packet. Its sender waits until an encode
+    /// takes it.
+    pub(crate) fn new_future(&mut self) -> EncodeFuture {
+        let (result_tx, result_rx) = oneshot::channel::<Result<EncodedPacket>>();
+        self.senders.push_back(result_tx);
+        EncodeFuture {
+            rx: result_rx,
+            // A wait for 0 is satisfied at once: nothing to release yet.
+            released: TimelinePoint::new(self.timeline.semaphore(), 0),
+            pts_offset: 0,
+            #[cfg(feature = "dmabuf")]
+            release_sync_file: None,
+        }
+    }
+
+    /// Drop the newest future's sender: its frame was not accepted.
+    pub(crate) fn drop_newest_future(&mut self) {
+        self.senders.pop_back();
     }
 
     /// Wait until every in-flight submission has been read back. Used before
-    /// mutating shared session state and at teardown.
+    /// mutating shared session state and at teardown. No frame may wait for
+    /// its encode.
     pub(crate) fn wait_all_free(&self) {
-        self.slot_sync.wait_all_free();
+        self.free_slots.wait_all();
+    }
+
+    /// Encode into `slot` from here on: the slot of the frame whose turn it
+    /// is.
+    pub(crate) fn begin_encode(&mut self, slot: usize) {
+        self.current_slot = slot;
     }
 
     /// Record the metadata for the packet that the current slot will produce.
@@ -390,9 +534,8 @@ impl EncodePipeline {
     /// Submit the current slot's recorded command buffer without waiting, and
     /// hand the slot to the completion thread for bitstream readback.
     ///
-    /// Chains onto the timeline semaphore so the GPU keeps encodes in DPB order,
-    /// and marks the slot busy until the completion thread reads it back. Returns
-    /// the [`EncodeFuture`] that resolves with this frame's packet.
+    /// Chains onto the timeline semaphore so the GPU keeps encodes in DPB
+    /// order. Returns the point the encode signals.
     pub(crate) fn submit_current(
         &mut self,
         device: &ash::Device,
@@ -400,24 +543,20 @@ impl EncodePipeline {
         encode_queue: vk::Queue,
         external_waits: &[vk::SemaphoreSubmitInfo<'static>],
         extra_signals: &[vk::SemaphoreSubmitInfo<'static>],
-    ) -> Result<EncodeFuture> {
+        delivery: Delivery,
+    ) -> Result<TimelinePoint> {
         let wait = self.timeline.wait();
         let signal = self.timeline.pending_signal();
         let slot_index = self.current_slot;
+        if matches!(delivery, Delivery::Packet) && self.senders.is_empty() {
+            return Err(PixelForgeError::InvalidInput(
+                "submit_current called with no future waiting for the packet".to_string(),
+            ));
+        }
 
         // Capture the Copy handles + metadata, releasing the slot borrow before
         // touching the cross-thread channels.
-        let (
-            command_buffer,
-            fence,
-            query_pool,
-            bitstream_ptr,
-            bitstream_buffer_size,
-            timestamp_period,
-            timestamp_valid_bits,
-            timestamp_query_pool,
-            metadata,
-        ) = {
+        let (command_buffer, readback) = {
             let slot = &mut self.slots[slot_index];
             let metadata = slot.pending_metadata.take().ok_or_else(|| {
                 PixelForgeError::InvalidInput(
@@ -426,14 +565,20 @@ impl EncodePipeline {
             })?;
             (
                 slot.encode_command_buffer,
-                slot.encode_fence,
-                slot.query_pool,
-                slot.bitstream_buffer_ptr as *const u8,
-                slot.bitstream_buffer_size,
-                slot.timestamp_period,
-                slot.timestamp_valid_bits,
-                slot.timestamp_query_pool,
-                metadata,
+                Readback {
+                    slot_index,
+                    fence: slot.encode_fence,
+                    query_pool: slot.query_pool,
+                    bitstream_ptr: SendPtr(slot.bitstream_buffer_ptr as *const u8),
+                    bitstream_buffer_size: slot.bitstream_buffer_size,
+                    timestamp_period: slot.timestamp_period,
+                    timestamp_valid_bits: slot.timestamp_valid_bits,
+                    timestamp_query_pool: slot.timestamp_query_pool,
+                    // Before the submit, not after: the driver can block in
+                    // the submit while the GPU already runs the work.
+                    submit_time: std::time::Instant::now(),
+                    metadata,
+                },
             )
         };
 
@@ -460,15 +605,12 @@ impl EncodePipeline {
         )
         .chain(extra_signals.iter().copied())
         .collect();
-        // Before the submit, not after: the driver can block in the submit
-        // while the GPU already runs the work.
-        let submit_time = std::time::Instant::now();
         unsafe {
             submit_encode_only(
                 device,
                 sync2,
                 command_buffer,
-                fence,
+                readback.fence,
                 encode_queue,
                 &waits,
                 &signals,
@@ -477,47 +619,36 @@ impl EncodePipeline {
 
         self.timeline.commit();
 
-        // Mark busy *before* handing the work off, so the completion thread can
-        // never clear the flag before it is set.
-        self.slot_sync.set_busy(slot_index);
-
-        let (result_tx, result_rx) = oneshot::channel::<Result<EncodedPacket>>();
-        let work = WorkItem {
-            slot_index,
-            fence,
-            query_pool,
-            bitstream_ptr: SendPtr(bitstream_ptr),
-            bitstream_buffer_size,
-            timestamp_period,
-            timestamp_valid_bits,
-            timestamp_query_pool,
-            submit_time,
-            metadata,
-            result_tx,
+        let deliver = match delivery {
+            Delivery::Packet => Deliver::Packet(
+                self.senders
+                    .pop_front()
+                    .expect("checked before the submission"),
+            ),
+            Delivery::Carry => Deliver::Carry,
         };
         if let Some(tx) = &self.work_tx {
             // The receiver only disconnects during shutdown, after the queue is
             // idle; a failed send there is benign.
-            let _ = tx.send(work);
+            let _ = tx.send(WorkItem::Encoded(readback, deliver));
         }
 
-        Ok(EncodeFuture {
-            rx: result_rx,
-            released: TimelinePoint::new(signal.0, signal.1),
-            pts_offset: 0,
-            #[cfg(feature = "dmabuf")]
-            release_sync_file: None,
-        })
+        Ok(TimelinePoint::new(signal.0, signal.1))
     }
 
-    /// The slot at `index`.
-    pub(crate) fn slot(&self, index: usize) -> &EncodeSlot {
-        &self.slots[index]
-    }
-
-    /// Index of the slot the next frame will be encoded into.
-    pub(crate) fn current_index(&self) -> usize {
-        self.current_slot
+    /// Resolve the oldest waiting future with a packet made on the CPU, after
+    /// every packet submitted before it.
+    #[allow(dead_code)]
+    pub(crate) fn submit_synthetic(&mut self, packet: EncodedPacket) -> Result<()> {
+        let result_tx = self.senders.pop_front().ok_or_else(|| {
+            PixelForgeError::InvalidInput(
+                "submit_synthetic called with no future waiting for the packet".to_string(),
+            )
+        })?;
+        if let Some(tx) = &self.work_tx {
+            let _ = tx.send(WorkItem::Synthetic { packet, result_tx });
+        }
+        Ok(())
     }
 
     /// The timeline the encodes signal. Retired to the context rather than
@@ -526,19 +657,14 @@ impl EncodePipeline {
         self.timeline.semaphore()
     }
 
-    /// Advance to the next slot after a frame has been submitted.
-    pub(crate) fn advance(&mut self) {
-        self.current_slot = (self.current_slot + 1) % self.slots.len();
-    }
-
     /// Barrier: wait for every in-flight frame to be read back.
     ///
     /// The completion thread resolves each frame's [`EncodeFuture`] before it
-    /// marks the slot free, so once every slot is free every outstanding future
-    /// has already been resolved. Callers await the futures `encode` returned to
-    /// obtain the packets themselves.
+    /// frees the slot, so once every slot is free every outstanding future
+    /// has already been resolved. Callers await the futures `submit` returned
+    /// to obtain the packets themselves.
     pub(crate) fn flush(&mut self) {
-        self.slot_sync.wait_all_free();
+        self.free_slots.wait_all();
     }
 
     /// Stop the completion thread and wait for it to finish any in-flight
@@ -588,17 +714,34 @@ impl EncodePipeline {
 }
 
 /// Completion-thread body: wait on each submission's fence, copy its bitstream
-/// out, resolve the frame's future, then mark the slot free.
+/// out, resolve the oldest waiting future, then free the slot.
 fn run_completion_thread(
     device: ash::Device,
     work_rx: Receiver<WorkItem>,
-    slot_sync: Arc<SlotSync>,
+    free_slots: Arc<FreeSlots>,
 ) {
+    // The bitstream of the encodes that go in front of the next packet.
+    let mut carried: Option<Result<Vec<u8>>> = None;
     for work in work_rx {
+        let (work, deliver) = match work {
+            WorkItem::Encoded(work, deliver) => (work, deliver),
+            WorkItem::Synthetic { packet, result_tx } => {
+                let _ = result_tx.send(Ok(packet));
+                continue;
+            }
+        };
         // Start the packet from any codec header, then read the encoded bitstream
         // straight onto it — a single copy out of the mapped buffer.
         let mut data = work.metadata.header.unwrap_or_default();
-        let result = unsafe {
+        let mut result = Ok(());
+        if matches!(deliver, Deliver::Packet(_)) {
+            match carried.take() {
+                Some(Ok(bytes)) => data.extend_from_slice(&bytes),
+                Some(Err(e)) => result = Err(e),
+                None => {}
+            }
+        }
+        let read = unsafe {
             wait_and_read_bitstream(
                 &device,
                 work.fence,
@@ -608,7 +751,24 @@ fn run_completion_thread(
                 &mut data,
             )
         };
+        let result = result.and(read);
         let bitstream_ready_time = std::time::Instant::now();
+
+        let result_tx = match deliver {
+            Deliver::Packet(result_tx) => result_tx,
+            Deliver::Carry => {
+                carried = Some(match (carried.take(), result) {
+                    (Some(Ok(mut bytes)), Ok(())) => {
+                        bytes.extend_from_slice(&data);
+                        Ok(bytes)
+                    }
+                    (Some(Err(e)), _) | (_, Err(e)) => Err(e),
+                    (None, Ok(())) => Ok(data),
+                });
+                free_slots.put_back(work.slot_index);
+                continue;
+            }
+        };
 
         let stats = super::EncodedPacketStats {
             gpu_time_ns: unsafe {
@@ -638,7 +798,7 @@ fn run_completion_thread(
         // once all slots are observed free, every packet has already been
         // delivered, which `flush` relies on for completeness. A dropped
         // receiver (future cancelled) makes the send a no-op, which is fine.
-        let _ = work.result_tx.send(packet);
-        slot_sync.set_free(work.slot_index);
+        let _ = result_tx.send(packet);
+        free_slots.put_back(work.slot_index);
     }
 }

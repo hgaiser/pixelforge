@@ -4,7 +4,6 @@
 use super::H264;
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
-use crate::encoder::pipeline::EncodeFuture;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::Result;
 use ash::vk;
@@ -12,11 +11,7 @@ use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl H264 {
-    pub(super) fn record(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
         let pic_order_cnt = plan.pic_order_cnt();
@@ -379,7 +374,7 @@ impl H264 {
             .idr_period(common.config.gop_size);
 
         let first_frame = plan.is_first_frame();
-        let future = common.record_encode(EncodeCommands {
+        common.record_encode(EncodeCommands {
             begin_slots: &reference_slots_for_begin,
             encode_info: &encode_info,
             rate_control: &rc,
@@ -396,6 +391,6 @@ impl H264 {
         if use_adaptive_marking {
             self.pending_unmark_frame_nums.clear();
         }
-        Ok(future)
+        Ok(())
     }
 }

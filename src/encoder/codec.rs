@@ -19,7 +19,7 @@ use crate::converter::RgbFormat;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
 use crate::encoder::pipeline::{
-    ENCODE_PIPELINE_DEPTH, EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata,
+    Delivery, EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::resources::{
@@ -89,17 +89,19 @@ pub(crate) struct EncoderCommon {
     pub upload_command_buffers: Vec<vk::CommandBuffer>,
     /// Signalled by each upload; the encode of the same frame waits on it.
     pub upload_timeline: TimelineChain,
-    /// What the current frame's encode submission waits for.
+    /// What the encode submission of the frame being encoded waits for.
     pub pending_waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
-    /// What the current frame's encode submission signals besides its
-    /// timeline: a release the caller asked for, when the encode is what
+    /// What the encode submission of the frame being encoded signals besides
+    /// its timeline: a release the caller asked for, when the encode is what
     /// reads the source last.
     pub pending_signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
-    /// What the current frame's encode reads.
+    /// What the encode of the frame being encoded reads.
     pub source: SourceBinding,
-    /// When the current frame's source is free again, if something before
-    /// the encode was the last to read it.
-    pub source_released: Option<TimelinePoint>,
+    /// Where the bitstream of the frame being encoded goes.
+    pub delivery: Delivery,
+    /// The point the last encode submission signals. `None` until the frame
+    /// being encoded was submitted.
+    pub encode_point: Option<TimelinePoint>,
     /// The session's video profile, for images made after creation.
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub profile: EncodeProfile,
@@ -108,30 +110,22 @@ pub(crate) struct EncoderCommon {
 }
 
 impl EncoderCommon {
-    /// Prologue: wait until the slot we are about to record over has been read
-    /// back, pull the next GOP position, and snapshot the counters this frame
-    /// will encode with.
-    pub fn begin_frame(&mut self) -> FramePlan {
-        self.pipeline.wait_current_free();
-        let gop = self.gop.get_next_frame();
-        let display_order = self.input_frame_num;
-        self.input_frame_num += 1;
-        FramePlan {
-            gop,
-            display_order,
-            encode_index: self.encode_frame_num,
-        }
-    }
-
-    /// Set up what the current frame's encode reads, copying the source into
-    /// the slot's input image first when it has to.
+    /// Set up what a frame's encode reads, copying the source into the input
+    /// image of `slot` first when it has to. Returns the frame, ready to wait
+    /// for its encode, and the point where its source is free again if
+    /// something before the encode is the last to read it.
     ///
     /// `sync.waits` go to the frame's first submission and
     /// `sync.release_signals` to the one that is last to read the source:
     /// the copy when there is one, the encode otherwise.
-    pub fn prepare_source(&mut self, input: FrameInput, sync: FrameSync) -> Result<()> {
+    pub fn prepare_source(
+        &mut self,
+        slot: usize,
+        input: FrameInput,
+        sync: FrameSync,
+    ) -> Result<(HeldFrame, Option<TimelinePoint>)> {
         let (slot_image, slot_view, slot_layout) = {
-            let slot = self.pipeline.current();
+            let slot = self.pipeline.slot(slot);
             (
                 slot.input_image,
                 slot.input_image_view,
@@ -144,14 +138,9 @@ impl EncoderCommon {
             extent: None,
             ownership: None,
         };
-        self.source_released = None;
-        self.pending_signals.clear();
-        match input {
-            FrameInput::InPlace => {
-                self.source = slot_binding;
-                self.pending_waits = sync.waits;
-                self.pending_signals = sync.release_signals;
-            }
+        let mut released = None;
+        let (source, waits, signals) = match input {
+            FrameInput::InPlace => (slot_binding, sync.waits, sync.release_signals),
             FrameInput::Copy { image, ownership } => {
                 let (semaphore, value) = self.upload_timeline.pending_signal();
                 let done = vk::SemaphoreSubmitInfo::default()
@@ -161,8 +150,7 @@ impl EncoderCommon {
                 let mut signals = vec![done];
                 signals.extend(sync.release_signals);
                 let params = UploadParams {
-                    upload_command_buffer: self.upload_command_buffers
-                        [self.pipeline.current_index()],
+                    upload_command_buffer: self.upload_command_buffers[slot],
                     src_image: image,
                     src_ownership: ownership,
                     dst_image: slot_image,
@@ -177,30 +165,49 @@ impl EncoderCommon {
                 };
                 upload_image_to_input(&self.context, &params)?;
                 self.upload_timeline.commit();
-                self.pipeline.current_mut().input_image_layout =
+                self.pipeline.slot_mut(slot).input_image_layout =
                     vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
                 let point = TimelinePoint::new(semaphore, value);
-                self.pending_waits = vec![point.wait_info()];
-                self.source_released = Some(point);
-                self.source = slot_binding;
+                released = Some(point);
+                (slot_binding, vec![point.wait_info()], Vec::new())
             }
             FrameInput::Direct {
                 image,
                 view,
                 extent,
                 ownership,
-            } => {
-                self.source = SourceBinding {
+            } => (
+                SourceBinding {
                     image,
                     view,
                     extent: Some(extent),
                     ownership: Some(ownership),
-                };
-                self.pending_waits = sync.waits;
-                self.pending_signals = sync.release_signals;
-            }
-        }
-        Ok(())
+                },
+                sync.waits,
+                sync.release_signals,
+            ),
+        };
+        Ok((
+            HeldFrame {
+                slot,
+                source,
+                waits,
+                signals,
+                submitted: std::time::Instant::now(),
+            },
+            released,
+        ))
+    }
+
+    /// Make `frame` the frame being encoded: the codec hooks record into its
+    /// slot and read its source from here on.
+    pub fn begin_encode(&mut self, frame: HeldFrame, delivery: Delivery) {
+        self.pipeline.begin_encode(frame.slot);
+        self.source = frame.source;
+        self.pending_waits = frame.waits;
+        self.pending_signals = frame.signals;
+        self.delivery = delivery;
+        self.encode_point = None;
     }
 
     /// The view the current frame's encode reads.
@@ -293,26 +300,26 @@ impl EncoderCommon {
         self.pipeline.set_pending_metadata(metadata);
     }
 
-    /// Submit the recorded command buffer for the current slot, mark its DPB
-    /// slot active, and return the future that resolves with its packet.
-    pub fn submit_frame(&mut self) -> Result<EncodeFuture> {
+    /// Submit the recorded command buffer for the current slot and mark its
+    /// DPB slot active. [`Self::encode_point`] is what the submission signals.
+    pub fn submit_frame(&mut self) -> Result<()> {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
         let waits = std::mem::take(&mut self.pending_waits);
         let signals = std::mem::take(&mut self.pending_signals);
-        let mut future = self.pipeline.submit_current(
+        let delivery = std::mem::replace(&mut self.delivery, Delivery::Packet);
+        let point = self.pipeline.submit_current(
             self.context.device(),
             self.context.sync2(),
             encode_queue,
             &waits,
             &signals,
+            delivery,
         )?;
-        if let Some(point) = self.source_released.take() {
-            future.set_released(point);
-        }
+        self.encode_point = Some(point);
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
-        Ok(future)
+        Ok(())
     }
 
     /// Record one frame's encode into the current slot's command buffer,
@@ -320,7 +327,7 @@ impl EncoderCommon {
     ///
     /// The codec builds what differs: the reference slots, the encode info
     /// with its picture info, and its rate control structs.
-    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<EncodeFuture>
+    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<()>
     where
         R: for<'x> vk::Extends<vk::VideoBeginCodingInfoKHR<'x>>
             + for<'x> vk::Extends<vk::VideoCodingControlInfoKHR<'x>>
@@ -425,11 +432,6 @@ impl EncoderCommon {
         self.submit_frame()
     }
 
-    /// Epilogue: advance to the next pipeline slot.
-    pub fn advance(&mut self) {
-        self.pipeline.advance();
-    }
-
     /// The `ash` device handle.
     pub fn device(&self) -> &ash::Device {
         self.context.device()
@@ -449,8 +451,22 @@ pub(crate) struct SourceBinding {
     pub ownership: Option<SourceOwnership>,
 }
 
-/// Everything a single frame needs to know about its schedule, snapshotted by
-/// [`EncoderCommon::begin_frame`] so the codec hooks all see a consistent view.
+/// A submitted frame that waits for its encode: its pipeline slot, which holds
+/// the pixels unless the encode reads the source directly, and what the encode
+/// submission needs.
+pub(crate) struct HeldFrame {
+    pub slot: usize,
+    pub source: SourceBinding,
+    /// What the encode submission waits for.
+    pub waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// What the encode submission signals besides its timeline.
+    pub signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// When the frame was submitted, for the packet's latency.
+    pub submitted: std::time::Instant,
+}
+
+/// Everything a single frame needs to know about its schedule, so the codec
+/// hooks all see a consistent view.
 pub(crate) struct FramePlan {
     pub gop: GopPosition,
     /// Presentation order (PTS).
@@ -573,11 +589,8 @@ pub(crate) trait VideoCodec: Sized + Send {
     /// Record the codec-specific encode commands and submit the frame. Builds
     /// the StdVideo* graph on its own stack (so the FFI pointers stay valid until
     /// `cmd_encode_video`) and finishes via [`EncoderCommon::submit_frame`].
-    fn record_picture(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture>;
+    /// An error means that nothing was submitted.
+    fn record_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()>;
 
     /// Per-frame epilogue: advance reference lists, syntax counters and the next
     /// DPB slot. Runs after submission.
@@ -627,8 +640,8 @@ pub struct CodecEncoder<C: VideoCodec> {
 unsafe impl<C: VideoCodec> Send for CodecEncoder<C> {}
 
 impl<C: VideoCodec> CodecEncoder<C> {
-    /// The internal input image for the current slot (a `ColorConverter::convert`
-    /// target that avoids an intermediate copy).
+    /// The input image of the slot the next frame takes (a
+    /// `ColorConverter::convert` target that avoids an intermediate copy).
     pub fn input_image(&self) -> vk::Image {
         self.common.pipeline.input_image()
     }
@@ -636,24 +649,57 @@ impl<C: VideoCodec> CodecEncoder<C> {
     /// Encode one frame from `input`, returning a future for its packet.
     /// See [`crate::Encoder::submit`].
     pub fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
-        let plan = self.common.begin_frame();
-        self.common.prepare_source(input, sync)?;
+        // Waits until the slot we are about to record over was read back.
+        let slot = self.common.pipeline.next_index();
+        let (frame, released) = self.common.prepare_source(slot, input, sync)?;
+        self.common.pipeline.take_slot();
+        let mut future = self.common.pipeline.new_future();
 
-        let setup = self.codec.begin_picture(&mut self.common, &plan)?;
+        let plan = FramePlan {
+            gop: self.common.gop.get_next_frame(),
+            display_order: self.common.input_frame_num,
+            encode_index: self.common.encode_frame_num,
+        };
+        self.common.input_frame_num += 1;
+        match self.encode_planned(frame, &plan) {
+            Ok(point) => {
+                future.set_released(released.unwrap_or(point));
+                Ok(future)
+            }
+            Err(e) => {
+                self.common.pipeline.release(slot);
+                self.common.pipeline.drop_newest_future();
+                // The codec may have reset its references for this frame.
+                self.common.gop.request_idr();
+                Err(e)
+            }
+        }
+    }
+
+    /// Encode `frame` now, as `plan` says. Returns the point its encode
+    /// submission signals. An error means that nothing was submitted.
+    fn encode_planned(&mut self, frame: HeldFrame, plan: &FramePlan) -> Result<TimelinePoint> {
+        let submitted = frame.submitted;
+        self.common.begin_encode(frame, Delivery::Packet);
+
+        let setup = self.codec.begin_picture(&mut self.common, plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
             frame_type: plan.frame_type(),
             pts: plan.display_order,
-            dts: plan.encode_index,
+            dts: plan.encode_index as i64,
             header: setup.header,
             timestamps: [0; 2],
-            now: std::time::Instant::now(),
+            now: submitted,
         });
 
-        let future = self.codec.record_picture(&mut self.common, &plan)?;
+        self.codec.record_picture(&mut self.common, plan)?;
         self.common.encode_frame_num += 1;
-        self.codec.end_picture(&mut self.common, &plan);
-        self.common.advance();
-        Ok(future)
+        self.codec.end_picture(&mut self.common, plan);
+        Ok(self
+            .common
+            .encode_point
+            .take()
+            .expect("record_picture submits the frame"))
     }
 
     /// End-of-stream barrier: wait for all in-flight frames to be read back.
@@ -1072,6 +1118,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         bitstream_buffer_size: req.bitstream_buffer_size,
         profile_info,
         command_pool: cmd.command_pool,
+        held_frames: 0,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
     })?;
@@ -1080,6 +1127,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     // wrap (no-op for AV1, which keys off order hints).
     let mut gop = GopStructure::new(config.gop_size);
     gop.set_max_poc_lsb(4);
+
+    let upload_command_buffers = allocate_command_buffers(
+        context,
+        cmd.upload_command_pool,
+        pipeline.slot_count() as u32,
+    )?;
 
     let common = EncoderCommon {
         context: context.clone(),
@@ -1105,16 +1158,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         command_pool: cmd.command_pool,
         upload_command_pool: cmd.upload_command_pool,
         upload_fence: cmd.upload_fence,
-        upload_command_buffers: allocate_command_buffers(
-            context,
-            cmd.upload_command_pool,
-            ENCODE_PIPELINE_DEPTH as u32,
-        )?,
+        upload_command_buffers,
         upload_timeline: TimelineChain::new(context)?,
         pending_waits: Vec::new(),
         pending_signals: Vec::new(),
         source: SourceBinding::default(),
-        source_released: None,
+        delivery: Delivery::Packet,
+        encode_point: None,
         profile: req.profile,
         rgb_input: req.rgb_input,
     };

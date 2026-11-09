@@ -4,7 +4,6 @@
 use super::H265;
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
-use crate::encoder::pipeline::EncodeFuture;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::Result;
 use ash::vk;
@@ -12,11 +11,7 @@ use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl H265 {
-    pub(super) fn record(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
         let pic_order_cnt = plan.pic_order_cnt();

@@ -201,7 +201,7 @@ impl Encoder {
             FrameSource::External(external) => external.fills_input_image(),
             _ => true,
         };
-        let frame_slot = self.inner.common().pipeline.current_index();
+        let frame_slot = self.inner.common().pipeline.next_index();
 
         #[cfg_attr(not(feature = "dmabuf"), allow(unused_mut))]
         let mut sync = FrameSync {
@@ -212,12 +212,14 @@ impl Encoder {
         #[cfg(feature = "dmabuf")]
         let slot = {
             // The slot's semaphores are free once the slot is.
-            let _ = self.inner.input_image();
-            let slot = self.inner.common().pipeline.current_index();
+            let slot = frame_slot;
             if frame.wait_sync_file.is_some() || frame.signal_sync_file {
                 let files = match &mut self.sync_files {
                     Some(files) => files,
-                    files @ None => files.insert(super::external::SyncFiles::new(&self.context)?),
+                    files @ None => files.insert(super::external::SyncFiles::new(
+                        &self.context,
+                        self.inner.common().pipeline.slot_count(),
+                    )?),
                 };
                 if let Some(fence) = frame.wait_sync_file {
                     sync.waits.push(files.import_wait(slot, fence)?);
@@ -330,7 +332,7 @@ impl Encoder {
         let common = self.inner.common();
         // The encode writes nothing into its own slot's image, so the frame
         // stays where it is for the next repeat.
-        let other_slot = last != common.pipeline.current_index();
+        let other_slot = last != common.pipeline.next_index();
         let input = if other_slot {
             let slot = common.pipeline.slot(last);
             FrameInput::Direct {

@@ -17,7 +17,6 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::pipeline::EncodeFuture;
 use crate::error::Result;
 use ash::vk;
 
@@ -109,11 +108,7 @@ impl VideoCodec for Av1 {
         })
     }
 
-    fn record_picture(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    fn record_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         self.record(common, plan)
     }
 

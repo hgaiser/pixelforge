@@ -946,14 +946,13 @@ pub(crate) struct SyncFiles {
 }
 
 impl SyncFiles {
-    pub(crate) fn new(context: &VideoContext) -> Result<Self> {
+    pub(crate) fn new(context: &VideoContext, slots: usize) -> Result<Self> {
         if !context.external().sync_file {
             return Err(PixelForgeError::NoSuitableDevice(
                 "sync_file fences need VK_KHR_external_semaphore_fd".to_string(),
             ));
         }
         let device = context.device();
-        let slots = crate::encoder::pipeline::ENCODE_PIPELINE_DEPTH;
         let mut files = Self {
             context: context.clone(),
             fd_fn: ash::khr::external_semaphore_fd::Device::load(context.instance(), device),

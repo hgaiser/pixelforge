@@ -4,7 +4,6 @@
 use super::Av1;
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
-use crate::encoder::pipeline::EncodeFuture;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::Result;
 use ash::vk;
@@ -12,11 +11,7 @@ use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl Av1 {
-    pub(super) fn record(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_key_frame = plan.is_idr();
         // All frames need a setup reference slot (DPB write) per the Vulkan spec
         // when maxDpbSlots > 0.
