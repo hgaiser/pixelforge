@@ -449,6 +449,14 @@ impl Encoder {
     /// The window does not depend on how many references the device can
     /// predict from per frame. A device that predicts from one or two still
     /// keeps the whole window, and recovers from the older frames in it.
+    ///
+    /// With B-frames, packets come in decode order, so the client lost every
+    /// frame encoded after the lost one, also B-frames shown before it. The
+    /// encoder drops every reference from the first frame it encoded that is
+    /// shown at or after `first_lost_display_order`. The frames that wait for
+    /// their group are encoded later from the references that survive. If
+    /// none survives, the oldest frame that waits is encoded at once as the
+    /// IDR.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         let local = first_lost_display_order.saturating_sub(self.pts_offset);
         self.inner.invalidate_reference_frames(local)

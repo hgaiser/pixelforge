@@ -108,12 +108,27 @@ pub struct GopPlanner<T> {
     /// The frames that wait for the reference frame after them, in display
     /// order, with their display position since the last IDR.
     waiting: Vec<(T, u32)>,
+    /// See [`Self::b_reference_count`].
+    b_reference_count: usize,
+    /// See [`Self::reorder_delay`].
+    reorder_delay: u32,
+}
+
+/// The reference pattern of the B-frames, as the rate control is told it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferencePattern {
+    /// No B-frame is a reference.
+    Flat,
+    /// Each B-frame reference is in the middle of the two references it
+    /// predicts from, which only `2^n - 1` B-frames give.
+    Dyadic,
 }
 
 impl<T> GopPlanner<T> {
     /// A planner with an IDR every `idr_period` frames (0 for none) and
     /// `b_frames` B-frames between two reference frames.
     pub fn new(idr_period: u32, b_frames: u32, references: BFrameReferences) -> Self {
+        let order = b_frame_order(b_frames as usize, references);
         Self {
             idr_period,
             b_frames,
@@ -121,6 +136,8 @@ impl<T> GopPlanner<T> {
             next_position: None,
             force_idr: false,
             waiting: Vec::new(),
+            b_reference_count: b_reference_count(&order),
+            reorder_delay: reorder_delay(&order),
         }
     }
 
@@ -208,40 +225,74 @@ impl<T> GopPlanner<T> {
         self.waiting.drain(..).map(|(frame, _)| frame).collect()
     }
 
+    /// Make the oldest frame that waits an IDR now, and keep the others
+    /// waiting after it. Returns the IDR, or nothing if no frame waits, and
+    /// then the next frame is an IDR. For when the reference state is lost:
+    /// the frames that wait are then never encoded from it.
+    pub fn restart(&mut self) -> Vec<(T, GopPosition)> {
+        self.force_idr = true;
+        let waiting: Vec<T> = self.waiting.drain(..).map(|(frame, _)| frame).collect();
+        let mut out = Vec::new();
+        for frame in waiting {
+            out.extend(self.push(frame));
+        }
+        out
+    }
+
     /// How many B-frames are held as references at once at most: one for
     /// each pyramid level that has references. 0 for flat groups.
     pub fn b_reference_count(&self) -> usize {
-        b_frame_order(self.b_frames as usize, self.references)
-            .into_iter()
-            .filter(|&(_, is_reference, _)| is_reference)
-            .map(|(_, _, level)| level as usize)
-            .max()
-            .unwrap_or(0)
+        self.b_reference_count
     }
 
     /// The largest number of frames that are encoded before a frame and
     /// shown after it: how far decode order runs ahead of display order. 0
     /// without B-frames, 1 for a flat group, more for a pyramid.
     pub fn reorder_delay(&self) -> u32 {
-        let count = self.b_frames as usize;
-        if count == 0 {
-            return 0;
-        }
-        // Display positions in encode order: the reference frame after the
-        // group, then the group. A shorter group never delays more.
-        let mut encode_order = vec![count];
-        encode_order.extend(
-            b_frame_order(count, self.references)
-                .into_iter()
-                .map(|(index, _, _)| index),
-        );
-        encode_order
-            .iter()
-            .enumerate()
-            .map(|(e, &shown)| encode_order[..e].iter().filter(|&&d| d > shown).count())
-            .max()
-            .unwrap_or(0) as u32
+        self.reorder_delay
     }
+
+    /// The reference pattern to tell the rate control, or `None` for a
+    /// pyramid that is not dyadic.
+    pub fn reference_pattern(&self) -> Option<ReferencePattern> {
+        if self.b_reference_count == 0 {
+            Some(ReferencePattern::Flat)
+        } else if (self.b_frames + 1).is_power_of_two() {
+            Some(ReferencePattern::Dyadic)
+        } else {
+            None
+        }
+    }
+}
+
+/// See [`GopPlanner::b_reference_count`]; `order` is the encode order of a
+/// whole group.
+fn b_reference_count(order: &[GroupEntry]) -> usize {
+    order
+        .iter()
+        .filter(|&&(_, is_reference, _)| is_reference)
+        .map(|&(_, _, level)| level as usize)
+        .max()
+        .unwrap_or(0)
+}
+
+/// See [`GopPlanner::reorder_delay`]; `order` is the encode order of a
+/// whole group.
+fn reorder_delay(order: &[GroupEntry]) -> u32 {
+    let count = order.len();
+    if count == 0 {
+        return 0;
+    }
+    // Display positions in encode order: the reference frame after the
+    // group, then the group. A shorter group never delays more.
+    let mut encode_order = vec![count];
+    encode_order.extend(order.iter().map(|&(index, _, _)| index));
+    encode_order
+        .iter()
+        .enumerate()
+        .map(|(e, &shown)| encode_order[..e].iter().filter(|&&d| d > shown).count())
+        .max()
+        .unwrap_or(0) as u32
 }
 
 /// The POC of the frame at `position` since the last IDR.
@@ -482,6 +533,51 @@ mod tests {
             }
             assert!(gop.close().is_empty());
         }
+    }
+
+    #[test]
+    fn restart_makes_the_oldest_waiting_frame_the_idr() {
+        let mut gop = GopPlanner::new(0, 3, BFrameReferences::Flat);
+        run(&mut gop, 0..4);
+        let out: Vec<_> = gop
+            .restart()
+            .into_iter()
+            .map(|(f, p)| (f, p.frame_type, p.pic_order_cnt, p.is_reference))
+            .collect();
+        assert_eq!(types(&out), "I1");
+        assert_eq!(out[0].2, 0);
+        // The others wait after it, with POCs from it.
+        let out = run(&mut gop, 4..6);
+        assert_eq!(types(&out), "P5 b2 b3 b4");
+        assert_eq!(out[0].2, 8);
+
+        // Nothing waits: the next frame is the IDR.
+        assert!(gop.restart().is_empty());
+        assert_eq!(types(&run(&mut gop, 6..7)), "I6");
+    }
+
+    #[test]
+    fn only_full_pyramids_are_dyadic() {
+        let pattern = |b_frames, references| {
+            GopPlanner::<u32>::new(0, b_frames, references).reference_pattern()
+        };
+        assert_eq!(
+            pattern(3, BFrameReferences::Flat),
+            Some(ReferencePattern::Flat)
+        );
+        assert_eq!(
+            pattern(2, BFrameReferences::Pyramid),
+            Some(ReferencePattern::Flat)
+        );
+        assert_eq!(
+            pattern(3, BFrameReferences::Pyramid),
+            Some(ReferencePattern::Dyadic)
+        );
+        assert_eq!(pattern(5, BFrameReferences::Pyramid), None);
+        assert_eq!(
+            pattern(7, BFrameReferences::Pyramid),
+            Some(ReferencePattern::Dyadic)
+        );
     }
 
     #[test]

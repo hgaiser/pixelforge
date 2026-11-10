@@ -181,6 +181,13 @@ PIXELFORGE_MAX_ACTIVE_REFERENCES=1 cargo test --test rfi -- --ignored --nocaptur
 `RUST_LOG=pixelforge::encoder::codec=debug` reports the negotiated window and
 per-frame count, on the `Reference window` line.
 
+`tests/rfi.rs` runs each codec without B-frames and with the B-frames the
+device has. It checks each frame's PSNR against the frames before the loss,
+not only the average: a decoder that predicts from other pictures than the
+encoder did loses a few dB from there on, which the average hides. That is
+how the H.264 P-frame after an invalidation was found to predict from the
+lost frames in a decoder (it had MMCO operations and no list modification).
+
 B-frames (`EncodeConfig::with_b_frames`, `tests/b_frames.rs`, the `_b_frames`
 tests in `tests/roundtrip.rs`) are encoded later than they are submitted. The
 planner (`src/encoder/gop.rs`) is pure code and has the unit tests for the
@@ -226,12 +233,22 @@ What the drivers do with B-frames, as far as it was checked:
   pixelforge's. H.265 and AV1 B-frames save bits there.
 - RADV and ANV were not available when B-frames were written. Nothing about
   B-frames is checked on them.
+- NVIDIA (615.78.08) writes its own value for some syntax, whatever
+  pixelforge asks for: `sps_temporal_mvp_enabled_flag = 0` (H.265),
+  `enable_ref_frame_mvs = 0`, `enable_jnt_comp = 0` and
+  `skip_mode_present = 0` (AV1). Those tools would help B-frames most, so
+  they are worth trying on another driver, with
+  `ffmpeg -c copy -bsf:v trace_headers` to see whether it writes them.
 
 `scripts/compare_b0.sh` builds v0.11.0 in a worktree and compares its output
-with the working tree's for each codec, with CQP and CBR. Without B-frames the
-streams must be the same, except `h265-*-gop0`: there v0.11.0 gave the driver
+with the working tree's for each codec, with CQP and CBR. Without B-frames all
+streams now differ from v0.11.0, for four reasons, all intended: H.264 has its
+deblocking filter on, H.264 CBR has no QP bounds, H.265 has 8x8 as its
+smallest coding block, and AV1 uses CDEF and loop restoration. Before those
+changes, `h265-*-gop0` was the only difference: there v0.11.0 gave the driver
 a picture order count that wrapped at 512, and the count no longer wraps. Run
-it after a change to the encode flow.
+it after a change to the encode flow, with a base revision that has those
+changes (`scripts/compare_b0.sh <revision>`), for an exact comparison.
 
 A test binary that builds many contexts must call `common::init_logging()`
 first, also for another reason than logging: the NVIDIA driver can be loaded

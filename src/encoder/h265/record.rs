@@ -5,6 +5,7 @@ use super::{H265, ReferenceInfo};
 
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::gop::ReferencePattern;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -62,13 +63,7 @@ impl H265 {
         } else {
             ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
         };
-        let picture_type = if is_idr {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else if is_b {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
-        } else {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
+        let picture_type = super::picture_type(plan);
 
         let slice_header_flags = ash::vk::native::StdVideoEncodeH265SliceSegmentHeaderFlags {
             _bitfield_align_1: [],
@@ -241,7 +236,7 @@ impl H265 {
             },
             pShortTermRefPicSet: if is_idr {
                 &empty_rps
-            } else if !self.l0_references.is_empty() {
+            } else if !self.references.is_empty() {
                 &frame_rps
             } else {
                 &empty_rps
@@ -326,8 +321,7 @@ impl H265 {
                 );
                 let mut std_info = std_reference_info;
                 std_info.PicOrderCntVal = ref_info.poc;
-                std_info.pic_type =
-                    ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
+                std_info.pic_type = ref_info.codec.pic_type;
                 std_ref_infos.push(std_info);
             }
         }
@@ -369,8 +363,7 @@ impl H265 {
         let codec_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .min_qp(min_qp)
             .max_qp(max_qp);
-        let codec_rate_control =
-            rate_control_info(&common.config, common.gop.b_reference_count() > 0);
+        let codec_rate_control = rate_control_info(&common.config, common.gop.reference_pattern());
 
         let encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
@@ -386,7 +379,7 @@ impl H265 {
             "h265 submit frame {}: idr={}, num_refs={}, cur_slot={}",
             plan.encode_index,
             is_idr,
-            self.l0_references.len(),
+            self.references.len(),
             common.current_dpb_slot
         );
 
@@ -407,15 +400,10 @@ impl H265 {
     /// those shown after it, each nearest first. None for an IDR, which has
     /// emptied the list.
     fn references_around(&self, current: i32) -> (Vec<ReferenceInfo>, Vec<ReferenceInfo>) {
-        // A reference picture set holds 16 pictures at most.
-        let held = &self.l0_references[..self.l0_references.len().min(15)];
-        let mut before: Vec<ReferenceInfo> =
-            held.iter().filter(|r| r.poc < current).copied().collect();
-        let mut after: Vec<ReferenceInfo> =
-            held.iter().filter(|r| r.poc > current).copied().collect();
-        before.sort_by_key(|r| std::cmp::Reverse(r.poc));
-        after.sort_by_key(|r| r.poc);
-        (before, after)
+        // A reference picture set holds 16 pictures at most. The window and
+        // the B-frame references are never more than that.
+        debug_assert!(self.references.len() <= 16);
+        self.references.around(current)
     }
 
     /// How many of the `before` references shown before it and of the
@@ -441,7 +429,7 @@ impl H265 {
 /// The GOP the rate control is told to expect.
 fn rate_control_info(
     config: &EncodeConfig,
-    pyramid: bool,
+    pattern: Option<ReferencePattern>,
 ) -> vk::VideoEncodeH265RateControlInfoKHR<'static> {
     let info = vk::VideoEncodeH265RateControlInfoKHR::default()
         .gop_frame_count(config.gop_size)
@@ -456,14 +444,16 @@ fn rate_control_info(
     } else {
         config.gop_size
     };
+    let pattern = match pattern {
+        Some(ReferencePattern::Flat) => {
+            vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+        }
+        Some(ReferencePattern::Dyadic) => {
+            vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+        }
+        None => vk::VideoEncodeH265RateControlFlagsKHR::empty(),
+    };
     info.gop_frame_count(gop_frame_count)
         .consecutive_b_frame_count(config.b_frames.min(gop_frame_count - 1))
-        .flags(
-            vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP
-                | if pyramid {
-                    vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
-                } else {
-                    vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
-                },
-        )
+        .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP | pattern)
 }

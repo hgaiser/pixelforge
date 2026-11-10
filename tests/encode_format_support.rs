@@ -76,3 +76,35 @@ fn unsupported_codec_or_format_is_false() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn quality_levels_match_encoder_creation() {
+    common::init_logging();
+    let context = VideoContextBuilder::new()
+        .app_name("pixelforge-test")
+        .build()
+        .expect("no Vulkan video device");
+
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        let levels = context.encode_quality_levels(codec, ChromaFormat::Yuv420, BitDepth::Eight);
+        eprintln!("{codec:?}: {levels} quality levels");
+        if !context.supports_encode(codec) {
+            assert_eq!(levels, 0, "{codec:?}: no encode, but quality levels");
+            continue;
+        }
+        assert!(levels > 0, "{codec:?}: encode, but no quality levels");
+        let at = |level| {
+            Encoder::new(
+                context.clone(),
+                config(codec, ChromaFormat::Yuv420, BitDepth::Eight).with_quality_level(level),
+            )
+        };
+        assert!(
+            at(levels - 1).is_ok(),
+            "{codec:?}: the top level {} fails",
+            levels - 1
+        );
+        assert!(at(levels).is_err(), "{codec:?}: level {levels} is accepted");
+    }
+}

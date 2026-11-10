@@ -5,6 +5,7 @@ use super::references::{FrameReferences, ref_frame_idx};
 use super::{Av1, order_hint};
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::gop::ReferencePattern;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::Result;
 use ash::vk;
@@ -23,7 +24,7 @@ impl Av1 {
         // when maxDpbSlots > 0, also a frame that no frame predicts from.
         let has_setup_slot = true;
         let current_dpb_slot = common.current_dpb_slot;
-        let order_hint = order_hint(plan);
+        let order_hint = order_hint(plan.pic_order_cnt());
         let (references, used_references) = self.frame_references(plan)?;
 
         let slot = common.pipeline.current();
@@ -135,9 +136,9 @@ impl Av1 {
         for ref_info in &distinct_refs {
             ref_std_infos.push(ash::vk::native::StdVideoEncodeAV1ReferenceInfo {
                 flags: reference_info_flags,
-                frame_type: ref_info.frame_type,
+                frame_type: ref_info.codec.frame_type,
                 RefFrameId: ref_info.dpb_slot as u32,
-                OrderHint: ref_info.order_hint as u8,
+                OrderHint: super::order_hint(ref_info.poc) as u8,
                 reserved1: [0; 3],
                 pExtensionHeader: std::ptr::null(),
             });
@@ -191,14 +192,44 @@ impl Av1 {
             qm_v: 0,
         };
 
-        let cdef = ash::vk::native::StdVideoAV1CDEF {
-            cdef_damping_minus_3: 0,
-            cdef_bits: 0,
-            cdef_y_pri_strength: [0; 8],
-            cdef_y_sec_strength: [0; 8],
-            cdef_uv_pri_strength: [0; 8],
-            cdef_uv_sec_strength: [0; 8],
+        // CDEF and loop restoration. A lossless frame (quantizer index 0)
+        // codes neither. The encoder picks one of four CDEF strengths for each
+        // block; the strengths are those of the Vulkan Video samples. NVIDIA
+        // (615.78.08) ignores the chroma strengths and writes its own.
+        let lossless = rc.is_disabled() && qp == 0;
+        let cdef = if lossless {
+            ash::vk::native::StdVideoAV1CDEF {
+                cdef_damping_minus_3: 0,
+                cdef_bits: 0,
+                cdef_y_pri_strength: [0; 8],
+                cdef_y_sec_strength: [0; 8],
+                cdef_uv_pri_strength: [0; 8],
+                cdef_uv_sec_strength: [0; 8],
+            }
+        } else {
+            ash::vk::native::StdVideoAV1CDEF {
+                cdef_damping_minus_3: 2,
+                cdef_bits: 2,
+                cdef_y_pri_strength: [0, 2, 4, 9, 0, 0, 0, 0],
+                cdef_y_sec_strength: [0; 8],
+                cdef_uv_pri_strength: [0; 8],
+                cdef_uv_sec_strength: [0; 8],
+            }
         };
+        // Loop restoration on luma, with 64x64 restoration units
+        // (`LoopRestorationSize` is the log2 of the size, less 5). NVIDIA
+        // (615.78.08) writes SGRPROJ, whatever type it gets.
+        let loop_restoration = ash::vk::native::StdVideoAV1LoopRestoration {
+            FrameRestorationType: [
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_SGRPROJ,
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
+            ],
+            LoopRestorationSize: [1, 1, 1],
+        };
+        if !lossless {
+            picture_info_flags.set_UsesLr(1);
+        }
 
         let loop_filter = ash::vk::native::StdVideoAV1LoopFilter {
             flags: ash::vk::native::StdVideoAV1LoopFilterFlags {
@@ -240,7 +271,11 @@ impl Av1 {
             pSegmentation: std::ptr::null(),
             pLoopFilter: &loop_filter,
             pCDEF: &cdef,
-            pLoopRestoration: std::ptr::null(),
+            pLoopRestoration: if lossless {
+                std::ptr::null()
+            } else {
+                &loop_restoration
+            },
             pGlobalMotion: std::ptr::null(),
             pExtensionHeader: std::ptr::null(),
             pBufferRemovalTimes: std::ptr::null(),
@@ -323,18 +358,20 @@ impl Av1 {
             } else {
                 common.config.gop_size
             };
+            let pattern = match common.gop.reference_pattern() {
+                Some(ReferencePattern::Flat) => {
+                    vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+                }
+                Some(ReferencePattern::Dyadic) => {
+                    vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+                }
+                None => vk::VideoEncodeAV1RateControlFlagsKHR::empty(),
+            };
             codec_rate_control = codec_rate_control
                 .gop_frame_count(gop_frames)
                 .key_frame_period(gop_frames)
                 .consecutive_bipredictive_frame_count(b_frames.min(gop_frames - 1))
-                .flags(
-                    vk::VideoEncodeAV1RateControlFlagsKHR::REGULAR_GOP
-                        | if common.gop.b_reference_count() > 0 {
-                            vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
-                        } else {
-                            vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
-                        },
-                );
+                .flags(vk::VideoEncodeAV1RateControlFlagsKHR::REGULAR_GOP | pattern);
         }
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
@@ -401,8 +438,8 @@ impl Av1 {
         let names = references.names;
         let ref_frame_idx = ref_frame_idx(references);
         // Order hints keyed by DPB slot, for every reference still held.
-        for r in &self.references {
-            ref_order_hint[r.dpb_slot as usize] = r.order_hint as u8;
+        for r in self.references.as_slice() {
+            ref_order_hint[r.dpb_slot as usize] = super::order_hint(r.poc) as u8;
         }
         // Load the frame context from the most recent reference, under the
         // first name it took, and refresh only the current slot so this frame

@@ -10,40 +10,47 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::gop::obsolete_b_references;
+use crate::encoder::references::{Reference, ReferenceSet};
 use crate::error::Result;
 use ash::vk;
 
 /// H.265 Coding Tree Block (CTB) size in pixels.
 pub const CTB_SIZE: u32 = 32;
 
+/// What H.265 needs to know about a reference besides what every codec
+/// does.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReferenceInfo {
-    pub dpb_slot: u8,
-    pub poc: i32,
-    /// Display order (`pts`) of this reference, for reference frame invalidation.
-    pub display_order: u64,
-    /// 0 for an IDR or P-frame, and the pyramid level of a B-frame.
-    pub level: u8,
+pub(crate) struct H265Reference {
+    pub pic_type: ash::vk::native::StdVideoH265PictureType,
 }
+
+pub(crate) type ReferenceInfo = Reference<H265Reference>;
 
 /// H.265-specific encoder state.
 pub(crate) struct H265 {
     /// Cached VPS/SPS/PPS header (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-    /// References held in the DPB, most-recent first. Each frame predicts
-    /// from the first `active_reference_count`; the rest stay in its
-    /// reference picture set, unused, for reference frame invalidation to fall
-    /// back on.
-    l0_references: Vec<ReferenceInfo>,
-    /// How many references stay in the DPB.
-    reference_window: u32,
+    /// References held in the DPB. Each frame predicts from the newest
+    /// `active_reference_count`; the rest stay in its reference picture set,
+    /// unused, for reference frame invalidation to fall back on.
+    references: ReferenceSet<H265Reference>,
     /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
     /// How many references shown before it a B-frame predicts from. It
     /// predicts from one shown after it.
     b_l0_reference_count: u32,
     profile_idc: u32,
+}
+
+/// The picture type of the frame `plan`.
+fn picture_type(plan: &FramePlan) -> ash::vk::native::StdVideoH265PictureType {
+    if plan.is_idr() {
+        ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+    } else if plan.is_b() {
+        ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
+    } else {
+        ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+    }
 }
 
 impl VideoCodec for H265 {
@@ -53,20 +60,14 @@ impl VideoCodec for H265 {
         plan: &FramePlan,
     ) -> Result<PictureSetup> {
         if plan.is_idr() {
-            self.l0_references.clear();
+            self.references.clear();
             // All DPB slots become inactive at the start of a coded video sequence.
             common.dpb_slot_active.fill(false);
         } else if plan.is_reference() {
             // A reference frame makes the B-frame references of its level
             // and below of no more use. Its reference picture set leaves
             // them out, which is what makes a decoder drop them.
-            let levels: Vec<u8> = self.l0_references.iter().map(|r| r.level).collect();
-            for index in obsolete_b_references(&levels, plan.pyramid_level())
-                .into_iter()
-                .rev()
-            {
-                self.l0_references.remove(index);
-            }
+            self.references.drop_obsolete(plan.pyramid_level());
         }
 
         let header = if plan.is_idr() {
@@ -89,33 +90,17 @@ impl VideoCodec for H265 {
         if !plan.is_reference() {
             return;
         }
-        let pic_order_cnt = plan.pic_order_cnt();
-
-        self.l0_references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: common.current_dpb_slot,
-                poc: pic_order_cnt,
-                display_order: plan.display_order,
-                level: plan.pyramid_level(),
+        self.references.insert(Reference {
+            dpb_slot: common.current_dpb_slot,
+            poc: plan.pic_order_cnt(),
+            display_order: plan.display_order,
+            encode_index: plan.encode_index,
+            level: plan.pyramid_level(),
+            codec: H265Reference {
+                pic_type: picture_type(plan),
             },
-        );
-        // The window counts the P-frames. The B-frame references on top of
-        // it go when a later reference frame replaces them.
-        while self.l0_references.iter().filter(|r| r.level == 0).count()
-            > self.reference_window as usize
-        {
-            let oldest = self.l0_references.iter().rposition(|r| r.level == 0);
-            self.l0_references.remove(oldest.expect("counted above"));
-        }
-
-        let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
-        for i in 0..common.dpb_slot_count as u8 {
-            if !used_slots.contains(&i) {
-                common.current_dpb_slot = i;
-                break;
-            }
-        }
+        });
+        common.current_dpb_slot = self.references.free_slot(common.dpb_slot_count, None);
     }
 
     fn invalidate_references(
@@ -123,14 +108,12 @@ impl VideoCodec for H265 {
         _common: &mut EncoderCommon,
         first_lost_display_order: u64,
     ) -> bool {
-        // Every reference at or after the first lost frame is transitively
-        // undecodable on the client; keep only older survivors. H.265 declares
-        // its short-term reference picture set explicitly every frame from
-        // `l0_references` (see `record`), so dropping entries here is enough for
-        // the decoder to follow — no extra bitstream marking is required.
-        self.l0_references
-            .retain(|r| r.display_order < first_lost_display_order);
-        !self.l0_references.is_empty()
+        // H.265 declares its short-term reference picture set explicitly every
+        // frame from `references` (see `record`), so dropping entries here is
+        // enough for the decoder to follow: no extra bitstream marking is
+        // required.
+        self.references.invalidate(first_lost_display_order);
+        !self.references.is_empty()
     }
 
     fn create_session_params(

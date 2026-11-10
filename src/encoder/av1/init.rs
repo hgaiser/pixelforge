@@ -1,9 +1,10 @@
 use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
+use crate::encoder::references::ReferenceSet;
 
 use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, build_encoder_common, check_quality_level, query_video_caps,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::rgb::RgbConversionCaps;
@@ -43,6 +44,7 @@ impl Av1 {
             capabilities = capabilities.push(&mut rgb_caps);
         }
         let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
+        check_quality_level(&config, encode_caps.max_quality_levels)?;
         let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         let init = build_encoder_common(CommonInitRequest {
@@ -100,8 +102,7 @@ impl Av1 {
         let codec = Av1 {
             frame_num: 0,
             header_data: None,
-            references: Vec::new(),
-            reference_window,
+            references: ReferenceSet::new(reference_window),
             active_reference_count,
             single_reference_name_mask: av1_caps.single_reference_name_mask,
             bidirectional_reference_name_mask: av1_caps.bidirectional_compound_reference_name_mask,

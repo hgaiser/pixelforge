@@ -1,13 +1,14 @@
 //! H.264 parameter-set generation: SPS/PPS construction and header retrieval.
 
-use super::H264;
+use super::{H264, level};
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription, RateControl};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
+use ash::vk::native::StdVideoH264LevelIdc;
 use std::ptr;
 
 impl H264 {
@@ -75,6 +76,11 @@ impl H264 {
         // With B-frames a decoder has to hold frames back to show them in
         // order, and the POC no longer follows from the decode order.
         let reorder_delay = common.gop.reorder_delay() as u8;
+        // The DPB holds the references, and one frame more than the reorder
+        // delay: a frame that is not a reference waits there to be shown
+        // only while that many frames shown after it are held.
+        let dpb_frames = window.max(reorder_delay + 1);
+        let level_idc = self.level_idc(common, dpb_frames);
         let pic_order_cnt_type = if config.b_frames > 0 {
             ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_0
         } else {
@@ -109,7 +115,7 @@ impl H264 {
             num_units_in_tick: 0,
             time_scale: 0,
             max_num_reorder_frames: reorder_delay,
-            max_dec_frame_buffering: (window + 1).max(reorder_delay),
+            max_dec_frame_buffering: dpb_frames,
             chroma_sample_loc_type_top_field: 0,
             chroma_sample_loc_type_bottom_field: 0,
             reserved1: 0,
@@ -119,7 +125,7 @@ impl H264 {
         let sps = ash::vk::native::StdVideoH264SequenceParameterSet {
             flags: sps_flags,
             profile_idc: self.profile_idc(),
-            level_idc: ash::vk::native::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_1,
+            level_idc,
             chroma_format_idc,
             seq_parameter_set_id: 0,
             bit_depth_luma_minus8,
@@ -187,7 +193,8 @@ impl H264 {
                 .parameters_add_info(&h264_add_info);
 
         // Chain quality level info (required by AMD RADV; matches FFmpeg).
-        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(common.config.quality_level);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)
@@ -213,6 +220,38 @@ impl H264 {
             ));
         }
         Ok(session_params)
+    }
+
+    /// The level of the stream: the lowest from level 4.1 that allows its
+    /// size, frame rate, DPB of `dpb_frames` and peak bitrate, and at most
+    /// the highest level the device has.
+    fn level_idc(&self, common: &EncoderCommon, dpb_frames: u8) -> StdVideoH264LevelIdc {
+        let config = &common.config;
+        let rate = config.frame_rate;
+        let max_bitrate = match config.rate_control {
+            RateControl::Cqp { .. } => 0,
+            RateControl::Cbr { bitrate } => u64::from(bitrate),
+            RateControl::Vbr { max, .. } => u64::from(max),
+        };
+        let high_444 = self.profile_idc()
+            == ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE;
+        let needed = level::level_for(&level::Needs {
+            width_in_mbs: common.aligned_width / 16,
+            height_in_mbs: common.aligned_height / 16,
+            frame_rate: rate.numerator.div_ceil(rate.denominator.max(1)),
+            dpb_frames: u32::from(dpb_frames),
+            max_bitrate,
+            bitrate_factor: if high_444 { 4000 } else { 1250 },
+        });
+        if needed > self.max_level_idc {
+            tracing::warn!(
+                "H.264: the stream needs level {needed} (as StdVideoH264LevelIdc), and the \
+                 device encodes up to {}, so the stream says that",
+                self.max_level_idc
+            );
+            return self.max_level_idc;
+        }
+        needed
     }
 
     /// Retrieve the encoded SPS/PPS NAL units to prepend to an IDR frame.

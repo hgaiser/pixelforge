@@ -389,8 +389,8 @@ impl EncoderCommon {
         // FFmpeg; required for AMD RADV).
         if cmd.reset {
             let mut codec_rc = cmd.codec_rate_control;
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(self.config.quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET
@@ -617,8 +617,7 @@ impl RateControlPlan {
     /// The decision for the frame `plan`. With a constant quantizer, a
     /// B-frame gets a coarser one: no frame, or fewer frames, predict from
     /// it, so its bits buy less. `b_offset` is what is added for a B-frame
-    /// that is not a reference, and half of it for one that is; `max` is
-    /// the largest quantizer the codec has.
+    /// that is not a reference; `max` is the largest quantizer the codec has.
     pub fn for_frame(
         config: &EncodeConfig,
         controller_default_qp: u32,
@@ -628,18 +627,28 @@ impl RateControlPlan {
     ) -> Self {
         let mut rc = Self::new(config, controller_default_qp);
         if rc.is_disabled() && plan.is_b() {
-            let offset = if plan.is_reference() {
-                b_offset / 2
-            } else {
-                b_offset
-            };
-            rc.qp = (rc.qp + offset).min(max);
+            rc.qp = (rc.qp + b_frame_qp_offset(plan, b_offset)).min(max);
         }
         rc
     }
 
     pub fn is_disabled(&self) -> bool {
         self.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
+    }
+}
+
+/// What a constant quantizer is raised by for the B-frame `plan`.
+///
+/// Each level of a pyramid is a step of half `b_offset` more than the level
+/// above it: fewer frames predict from a deeper frame. A B-frame that is not
+/// a reference gets `b_offset` at least, also in a flat group, where it is at
+/// level 1.
+fn b_frame_qp_offset(plan: &FramePlan, b_offset: u32) -> u32 {
+    let by_level = u32::from(plan.pyramid_level()) * (b_offset / 2);
+    if plan.is_reference() {
+        by_level
+    } else {
+        by_level.max(b_offset)
     }
 }
 
@@ -687,11 +696,12 @@ pub(crate) trait VideoCodec: Sized + Send {
     /// one.
     ///
     /// `first_lost_display_order` is the display order (the `pts` reported on
-    /// encoded packets) of the earliest frame the client lost. In a linear P
-    /// chain every reference at or after that frame is transitively undecodable,
-    /// so all of them are dropped. Returns `true` if a usable reference survives
-    /// (the next P-frame can be predicted from it); `false` if none remain and
-    /// the caller must fall back to an IDR.
+    /// encoded packets) of the earliest frame the client lost. The client
+    /// lost every frame encoded after it too, so every reference from the
+    /// first one encoded that is shown at or after it is dropped (see
+    /// [`ReferenceSet::invalidate`](crate::encoder::references::ReferenceSet::invalidate)).
+    /// Returns `true` if a usable reference survives; `false` if none remain
+    /// and the caller must fall back to an IDR.
     fn invalidate_references(
         &mut self,
         common: &mut EncoderCommon,
@@ -943,18 +953,19 @@ impl<C: VideoCodec> CodecEncoder<C> {
     /// the next frame from a surviving reference, falling back to an IDR when no
     /// reference survives. See [`crate::Encoder::invalidate_reference_frames`].
     ///
-    /// With B-frames this is an IDR: the references a lost frame takes with it
-    /// do not follow from display order.
+    /// For the IDR, the oldest frame that waits for its group is encoded as
+    /// one at once, so no frame is encoded from the lost references.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        if self.common.config.b_frames > 0 {
-            self.request_idr();
-            return;
-        }
-        if !self
+        if self
             .codec
             .invalidate_references(&mut self.common, first_lost_display_order)
         {
-            self.common.gop.request_idr();
+            return;
+        }
+        let ready = self.common.gop.restart();
+        if let Err(e) = self.encode_ready(ready) {
+            // Its future resolves with the error, and the next frame is an IDR.
+            tracing::warn!("Encoding the IDR after lost references failed: {e}");
         }
     }
 
@@ -1078,6 +1089,23 @@ pub(crate) struct DeviceVideoCaps {
     pub max_active_reference_pictures: u32,
     pub flags: vk::VideoCapabilityFlagsKHR,
     pub std_header_version: vk::ExtensionProperties,
+}
+
+/// Check `config.quality_level` against the device's
+/// `VkVideoEncodeCapabilitiesKHR::maxQualityLevels`.
+///
+/// Call it before anything else uses the level: a quality level query for a
+/// level the device does not have is invalid usage.
+pub(crate) fn check_quality_level(config: &EncodeConfig, max_quality_levels: u32) -> Result<()> {
+    if config.quality_level >= max_quality_levels {
+        return Err(PixelForgeError::NoSuitableDevice(format!(
+            "{:?} encode: quality level {} is not available, the device has levels 0 to {}",
+            config.codec,
+            config.quality_level,
+            max_quality_levels.saturating_sub(1)
+        )));
+    }
+    Ok(())
 }
 
 /// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
@@ -1439,4 +1467,37 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         active_reference_count: max_active_reference_pictures as u32,
         session_active_references: session_active_references as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn b_frame(is_reference: bool, pyramid_level: u8) -> FramePlan {
+        FramePlan {
+            gop: GopPosition {
+                frame_type: GopFrameType::B,
+                pic_order_cnt: 2,
+                is_reference,
+                pyramid_level,
+            },
+            display_order: 1,
+            encode_index: 2,
+            reorder_delay: 1,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn b_frame_qp_offset_grows_with_the_level() {
+        // A flat group, and a pyramid of 3, as before levels counted.
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 1), 2), 2);
+        assert_eq!(b_frame_qp_offset(&b_frame(true, 1), 2), 1);
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 2), 2), 2);
+        // A pyramid of 7: one more for each level.
+        assert_eq!(b_frame_qp_offset(&b_frame(true, 2), 2), 2);
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 2), 3);
+        // AV1 steps by 4.
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 8), 12);
+    }
 }

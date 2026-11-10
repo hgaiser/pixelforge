@@ -102,7 +102,7 @@ impl Av1 {
                 0, // frame_id_numbers_present_flag
                 0, // enable_superres
                 1, // enable_cdef
-                0, // enable_restoration
+                1, // enable_restoration
                 0, // film_grain_params_present
                 0, // timing_info_present_flag
                 0, // initial_display_delay_present_flag
@@ -157,7 +157,8 @@ impl Av1 {
                 .std_decoder_model_info(&decoder_model_info)
                 .std_operating_points(std::slice::from_ref(&operating_point));
 
-        let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(common.config.quality_level);
         let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)
             .push(&mut quality_info)

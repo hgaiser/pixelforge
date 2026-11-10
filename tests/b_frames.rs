@@ -145,6 +145,9 @@ fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
         let mut packets = Vec::new();
         // The display order of the frames that must be IDRs.
         let mut idrs = vec![0u64];
+        // The IDR after a loss of every reference: the oldest frame that
+        // waits, or the next one if none does.
+        let mut restart = 0..=0;
         let mut submitted = 0u64;
         for i in 0..40 {
             match i {
@@ -159,10 +162,12 @@ fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
                     pending.push_back(encoder.repeat()?);
                     submitted += 1;
                 }
-                // With B-frames a lost frame is answered with an IDR.
-                30 => {
-                    encoder.invalidate_reference_frames(submitted - 2);
-                    idrs.push(submitted);
+                // The references from before the loss survive: no IDR.
+                30 => encoder.invalidate_reference_frames(submitted - 2),
+                // Every reference is lost.
+                33 => {
+                    encoder.invalidate_reference_frames(0);
+                    restart = submitted - u64::from(b_frames)..=submitted;
                 }
                 // Everything submitted is encoded, and the stream goes on.
                 35 => {
@@ -188,7 +193,12 @@ fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
             .map(|p| p.pts)
             .collect();
         found.sort_unstable();
+        let last = found.pop();
         assert_eq!(found, idrs, "{codec:?}: IDRs");
+        assert!(
+            last.is_some_and(|pts| restart.contains(&pts)),
+            "{codec:?}: IDR after every reference is lost: {last:?}, expected in {restart:?}"
+        );
         assert!(
             packets.iter().any(|p| p.frame_type == FrameType::B),
             "{codec:?}: no B-frame"

@@ -39,19 +39,62 @@ const GOP: u32 = 30;
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::H264, "h264", 0, BFrameReferences::Flat).map(|_| ())
+    roundtrip(Codec::H264, "h264", 0, BFrameReferences::Flat, 0).map(|_| ())
 }
 
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_h265() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::H265, "h265", 0, BFrameReferences::Flat).map(|_| ())
+    roundtrip(Codec::H265, "h265", 0, BFrameReferences::Flat, 0).map(|_| ())
 }
 
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_av1() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::AV1, "obu", 0, BFrameReferences::Flat).map(|_| ())
+    roundtrip(Codec::AV1, "obu", 0, BFrameReferences::Flat, 0).map(|_| ())
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_h264_top_quality_level() -> Result<(), Box<dyn std::error::Error>> {
+    roundtrip_top_quality_level(Codec::H264, "h264")
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_h265_top_quality_level() -> Result<(), Box<dyn std::error::Error>> {
+    roundtrip_top_quality_level(Codec::H265, "h265")
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_av1_top_quality_level() -> Result<(), Box<dyn std::error::Error>> {
+    roundtrip_top_quality_level(Codec::AV1, "obu")
+}
+
+/// A round trip at the highest quality level the device has, with and
+/// without B-frames. A higher level only changes what the driver searches,
+/// so the stream must decode as at level 0.
+fn roundtrip_top_quality_level(
+    codec: Codec,
+    extension: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    let context = VideoContextBuilder::new().require_encode(codec).build()?;
+    let levels = context.encode_quality_levels(codec, ChromaFormat::Yuv420, BitDepth::Eight);
+    let b_frames = context.supports_b_frames(codec, ChromaFormat::Yuv420, BitDepth::Eight);
+    drop(context);
+    assert!(
+        levels > 0,
+        "{codec:?}: the device reports no quality levels"
+    );
+    let top = levels - 1;
+    eprintln!("{codec:?}: quality levels 0 to {top}");
+    roundtrip(codec, extension, 0, BFrameReferences::Flat, top)?;
+    if b_frames != BFrameSupport::None {
+        roundtrip(codec, extension, 3, BFrameReferences::Flat, top)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -83,7 +126,7 @@ fn roundtrip_b_frames(codec: Codec, extension: &str) -> Result<(), Box<dyn std::
         eprintln!("{codec:?}: no B-frames on this device, nothing to check");
         return Ok(());
     }
-    let baseline = roundtrip(codec, extension, 0, BFrameReferences::Flat)?;
+    let baseline = roundtrip(codec, extension, 0, BFrameReferences::Flat, 0)?;
     // 30 frames: none of these counts divides the 29 after the IDR, so the
     // last group is a short one, closed by the flush. A pyramid starts at
     // 3 B-frames, has a second level of references at 6, and at 7 a B-frame
@@ -100,11 +143,12 @@ fn roundtrip_b_frames(codec: Codec, extension: &str) -> Result<(), Box<dyn std::
         eprintln!("{codec:?}: no B-frame pyramid on this device");
     }
     for (b_frames, references) in cases {
-        let psnr = roundtrip(codec, extension, b_frames, references)?;
-        // B-frames get a coarser quantizer, which costs a few tenths of a
-        // dB. A B-frame predicted from the wrong picture costs 5 dB or more.
+        let psnr = roundtrip(codec, extension, b_frames, references, 0)?;
+        // B-frames get a coarser quantizer, one step more for each level
+        // of a pyramid, which costs up to about 1.6 dB at a constant QP. A
+        // B-frame predicted from the wrong picture costs 5 dB or more.
         assert!(
-            psnr > baseline - 1.5,
+            psnr > baseline - 2.0,
             "{b_frames} B-frames ({references:?}): luma PSNR {psnr:.2} dB, \
              {baseline:.2} dB without"
         );
@@ -149,13 +193,16 @@ fn roundtrip(
     extension: &str,
     b_frames: u32,
     references: BFrameReferences,
+    quality_level: u32,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     common::init_logging();
 
     let input_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv420p.yuv");
     common::ensure_test_data(WIDTH, HEIGHT, "yuv420p", &input_path)?;
 
-    let dir = common::scratch_dir(&format!("roundtrip-{extension}-b{b_frames}-{references:?}"));
+    let dir = common::scratch_dir(&format!(
+        "roundtrip-{extension}-b{b_frames}-{references:?}-q{quality_level}"
+    ));
     let bitstream_path = dir.join(format!("out.{extension}"));
 
     let context = VideoContextBuilder::new()
@@ -176,7 +223,8 @@ fn roundtrip(
         .with_frame_rate(30, 1)
         .with_gop_size(GOP)
         .with_b_frames(b_frames)
-        .with_b_frame_references(references);
+        .with_b_frame_references(references)
+        .with_quality_level(quality_level);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
     let mut input_image = YuvUploader::for_encoder(&encoder)?;

@@ -3,10 +3,11 @@ use super::{H264, MB_SIZE, ReferenceInfo};
 use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, build_encoder_common, check_quality_level, query_video_caps,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h264_profile_idc;
+use crate::encoder::references::ReferenceSet;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
 use crate::encoder::rgb::RgbConversionCaps;
 use crate::error::Result;
@@ -45,13 +46,15 @@ impl H264 {
             capabilities = capabilities.push(&mut rgb_caps);
         }
         let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
+        check_quality_level(&config, encode_caps.max_quality_levels)?;
         let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         // The driver's preferred entropy mode is H.264-specific (some require
         // CAVLC for High 4:4:4 Predictive). Only after the capability query,
         // which fails for an unsupported profile: a quality level query for one
         // is invalid (VUID-VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR-pVideoProfile-08259).
-        let preferred_entropy_cabac = query_preferred_entropy_cabac(&context, profile_info);
+        let preferred_entropy_cabac =
+            query_preferred_entropy_cabac(&context, profile_info, config.quality_level);
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
@@ -84,13 +87,14 @@ impl H264 {
         let codec = H264 {
             frame_num_syntax: 0,
             idr_pic_id: 0,
-            l0_references: Vec::new(),
+            references: ReferenceSet::new(reference_window),
             reference_window,
             active_reference_count,
             b_l0_reference_count,
             pending_unmark_frame_nums: Vec::new(),
             profile_idc,
             preferred_entropy_cabac,
+            max_level_idc: h264_caps.max_level_idc,
         };
 
         let mut encoder = CodecEncoder { common, codec };
@@ -125,19 +129,16 @@ impl H264 {
 
     /// The references this frame predicts from: the newest held ones.
     pub(super) fn used_references(&self) -> &[ReferenceInfo] {
-        let n = self
-            .l0_references
-            .len()
-            .min(self.active_reference_count as usize);
-        &self.l0_references[..n]
+        self.references.newest(self.active_reference_count as usize)
     }
 }
 
-/// Query the driver's preferred H.264 entropy coding mode for quality level 0.
+/// Query the driver's preferred H.264 entropy coding mode for `quality_level`.
 /// Defaults to CABAC if the query is unsupported.
 fn query_preferred_entropy_cabac(
     context: &VideoContext,
     profile_info: &vk::VideoProfileInfoKHR,
+    quality_level: u32,
 ) -> bool {
     let video_encode_instance =
         ash::khr::video_encode_queue::Instance::load(context.entry(), context.instance());
@@ -146,7 +147,7 @@ fn query_preferred_entropy_cabac(
         .push(&mut h264_quality_level_properties);
     let quality_level_info = vk::PhysicalDeviceVideoEncodeQualityLevelInfoKHR::default()
         .video_profile(profile_info)
-        .quality_level(0);
+        .quality_level(quality_level);
     let result = unsafe {
         (video_encode_instance
             .fp()
@@ -158,7 +159,7 @@ fn query_preferred_entropy_cabac(
     };
     if result == vk::Result::SUCCESS {
         debug!(
-            "H.264 quality level 0: preferredStdEntropyCodingModeFlag={}",
+            "H.264 quality level {quality_level}: preferredStdEntropyCodingModeFlag={}",
             h264_quality_level_properties.preferred_std_entropy_coding_mode_flag
         );
         h264_quality_level_properties.preferred_std_entropy_coding_mode_flag != 0

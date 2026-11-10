@@ -279,10 +279,10 @@ let b_frames = encoder.config().b_frames as usize;
 let mut pending = VecDeque::new();
 for frame in frames {
     pending.push_back(encoder.submit(Frame::image(frame))?);
-    // A B-frame is encoded once the frame after its group is submitted,
-    // so the oldest future is only sure to resolve this many submits
-    // later. Waiting for it sooner never returns.
-    while pending.len() > b_frames + 1 {
+    // At most `b_frames` frames wait for the frame after their group, so
+    // the oldest future is only sure to resolve once more are pending.
+    // Waiting for it sooner never returns.
+    while pending.len() > b_frames {
         let packet = pollster::block_on(pending.pop_front().unwrap())?;
         // Write `packet.data`. The packets come in decode order.
     }
@@ -307,11 +307,14 @@ What changes with B-frames:
 - [`Encoder::request_idr`], [`Encoder::flush`], [`Encoder::repeat`] and
   [`Encoder::reconfigure`] encode the frames that wait at once, as a
   shorter group.
-- [`Encoder::invalidate_reference_frames`] makes the next frame an IDR.
+- [`Encoder::invalidate_reference_frames`] drops every reference encoded
+  from the first lost frame on, also B-frames shown before it, because
+  the client lost those packets too. If no reference survives, the oldest
+  frame that waits for its group becomes the IDR at once.
+- With a constant QP, a B-frame gets a slightly higher QP than the
+  other frames, and one step more for each level of a pyramid.
 - A DMA-BUF is copied when it is submitted and never read directly, so
   the producer gets its buffer back at once.
-- With a constant QP, a B-frame gets a slightly higher QP than the
-  other frames.
 
 How much B-frames save depends on the driver. On NVIDIA (615.78.08) they
 save bits with H.265 and AV1. With H.264 that driver predicts a B-frame
@@ -404,7 +407,6 @@ See [shader/README.md](shader/README.md) for details on editing and recompiling 
 
 ## TODO's
 
-1. [] Recovery from lost frames without an IDR when B-frames are in use.
 1. [] Open GOPs.
 
 ## Contributing

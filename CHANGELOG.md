@@ -13,18 +13,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add B-frame pyramids: `EncodeConfig::with_b_frame_references` and `BFrameReferences`.
 - Add `VideoContext::supports_b_frames` and `BFrameSupport`.
 - Add `--b-frames` and `--pyramid` to the `encode` example.
+- Add `EncodeConfig::with_quality_level` and `VideoContext::encode_quality_levels`. The default stays 0, the fastest level. `Encoder::new` returns an error for a level the device does not have.
+- Add `--quality-level` to the `encode` example.
 
 ### Changed
 
 - **Breaking:** `EncodedPacket::dts` is an `i64`. With B-frames it starts below zero.
 - **Breaking:** A future from `Encoder::submit` resolves with the next packet in decode order. With B-frames that is not the packet of the submitted frame.
-- With B-frames, `Encoder::invalidate_reference_frames` makes the next frame an IDR.
+- With B-frames, `Encoder::invalidate_reference_frames` drops every reference encoded from the first lost frame on, and the next frames predict from the references that survive. If none survives, the oldest frame that waits for its group is encoded at once as the IDR.
+- With a constant QP, the B-frames of a pyramid get one QP step more for each level (a q-index step of 4 for AV1). With 7 B-frames, streams are 2% to 4% smaller at the same quality.
+- The H.264 encoder writes the lowest level from 4.1 that the stream needs, by its size, frame rate, DPB and peak bitrate. It always wrote 4.1, also where the stream needed more. `max_dec_frame_buffering` is one frame smaller (NVIDIA already wrote that value).
+- The H.264 and H.265 reference pictures carry their own picture type to the driver, not always P.
 - With B-frames, a DMA-BUF input is always copied.
 - H.265 streams with more than 256 frames between two IDR frames differ from 0.11.0: the encoder now gets the picture order count without a wrap.
+- The AV1 encoder uses CDEF and loop restoration. At the same quality, streams are 3% to 10% smaller, and each frame takes longer to encode (about 0.6 ms at 1080p on an RTX 5080).
 
 ### Fixed
 
 - Fix the H.264 decoder's reorder depth for streams without a VUI.
+- Fix the H.264 encoder, which turned the deblocking filter off. At the same quality, streams are about 10% smaller.
+- Fix the H.264 encoder's CBR and VBR, which held the QP between 18 and 42. On easy content the bitrate stayed far below the target.
+- Fix H.264 reference frame invalidation: the P-frame after it predicted from the lost frames in a decoder, because it did not reorder its reference list. The quality dropped by about 8 dB from there on.
+- Let the H.265 encoder use 8x8 coding blocks. The minimum was 16x16. At the same quality, streams are 3% to 18% smaller.
 
 ## [0.11.0] - 06-11-2026
 
