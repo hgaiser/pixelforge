@@ -484,6 +484,8 @@ pub(crate) struct QueuedFrame {
 /// hides such a frame until its turn (see [`VideoCodec::HIDDEN_FRAMES`]).
 pub(crate) struct HiddenFrame {
     pub display_order: u64,
+    /// The type of the frame, which is the type of the packet that shows it.
+    pub frame_type: FrameType,
     /// The packet that shows the frame.
     pub show_packet: Vec<u8>,
     /// When the frame was submitted, for the packet's latency.
@@ -515,6 +517,10 @@ impl FramePlan {
     }
     pub fn is_b(&self) -> bool {
         self.gop.frame_type == GopFrameType::B
+    }
+    /// 0 for IDR and P-frames, and the depth in the pyramid for a B-frame.
+    pub fn pyramid_level(&self) -> u8 {
+        self.gop.pyramid_level
     }
     pub fn is_first_frame(&self) -> bool {
         self.encode_index == 0
@@ -832,7 +838,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
             let latency = hidden.submitted.elapsed().as_nanos() as u64;
             self.common.pipeline.submit_synthetic(EncodedPacket {
                 data: hidden.show_packet,
-                frame_type: FrameType::P,
+                frame_type: hidden.frame_type,
                 pts: hidden.display_order,
                 dts: hidden.display_order as i64,
                 stats: EncodedPacketStats {
@@ -878,6 +884,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
         if plan.hidden {
             self.common.hidden_frames.push(HiddenFrame {
                 display_order: plan.display_order,
+                frame_type: plan.frame_type(),
                 show_packet: self.codec.show_packet(plan, dpb_slot),
                 submitted,
             });
@@ -1229,16 +1236,23 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     }
     // At least 1: `max_dpb_slots_supported` is at least 2, and every codec's
     // window cap and `MAX_DPB_SLOTS` are larger.
+    let gop = GopPlanner::new(config.gop_size, config.b_frames, config.b_frame_references);
+    // The B-frames of a pyramid that are references are held on top of the
+    // window, which is the P-frames.
+    let b_reference_count = gop.b_reference_count();
     let window_limit = req
         .max_reference_window
         .min(max_dpb_slots_supported - 1)
-        .min(MAX_DPB_SLOTS - 1);
+        .min(MAX_DPB_SLOTS - 1)
+        .saturating_sub(b_reference_count)
+        .max(1);
     let mut reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
     // A B-frame predicts from a reference on each side, so both have to stay.
     if config.b_frames > 0 && reference_window < 2 {
         if window_limit < 2 {
             return Err(PixelForgeError::NoSuitableDevice(format!(
-                "B-frames need a reference window of 2, and the device allows {window_limit}"
+                "B-frames need a reference window of 2, and the device allows {window_limit} \
+                 with {b_reference_count} B-frame references"
             )));
         }
         tracing::info!("B-frames: reference window raised from {reference_window} to 2");
@@ -1265,9 +1279,10 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     } else {
         max_active_reference_pictures
     };
-    // The window plus a slot for the reconstructed frame. A B-frame that is
-    // not a reference takes that slot too and leaves it free again.
-    let dpb_slot_count = reference_window + 1;
+    // The window, the B-frame references, and a slot for the reconstructed
+    // frame. A B-frame that is not a reference takes that slot too and
+    // leaves it free again.
+    let dpb_slot_count = reference_window + b_reference_count + 1;
     tracing::debug!(
         "Reference window {reference_window}, {max_active_reference_pictures} used per frame \
          (device: {max_dpb_slots_supported} DPB slots, {max_active_supported} active, \
@@ -1351,8 +1366,6 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
     })?;
-
-    let gop = GopPlanner::new(config.gop_size, config.b_frames, config.b_frame_references);
 
     let upload_command_buffers = allocate_command_buffers(
         context,

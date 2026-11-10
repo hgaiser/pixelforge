@@ -71,7 +71,7 @@ impl H264 {
         let max_active = self.active_reference_count() as u8;
         // The decoder's sliding window holds as many frames as the encoder
         // keeps, so older ones survive for reference frame invalidation.
-        let window = self.reference_window() as u8;
+        let window = self.reference_window() as u8 + common.gop.b_reference_count() as u8;
         // With B-frames a decoder has to hold frames back to show them in
         // order, and the POC no longer follows from the decode order.
         let reorder_delay = common.gop.reorder_delay() as u8;

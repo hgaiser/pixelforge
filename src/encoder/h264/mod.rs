@@ -12,6 +12,7 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
+use crate::encoder::gop::obsolete_b_references;
 use crate::error::Result;
 use ash::vk;
 
@@ -25,6 +26,8 @@ pub(crate) struct ReferenceInfo {
     pub poc: i32,
     /// Display order (`pts`) of this reference, for reference frame invalidation.
     pub display_order: u64,
+    /// 0 for an IDR or P-frame, and the pyramid level of a B-frame.
+    pub level: u8,
 }
 
 /// H.264-specific encoder state (everything the generic encoder doesn't own).
@@ -70,6 +73,20 @@ impl VideoCodec for H264 {
             self.pending_unmark_frame_nums.clear();
         }
 
+        // A reference frame makes the B-frame references of its level and
+        // below of no more use. The decoder drops what it is told to, so
+        // they are marked in this frame's slice header (see `record`).
+        if plan.is_reference() && !plan.is_idr() {
+            let levels: Vec<u8> = self.l0_references.iter().map(|r| r.level).collect();
+            for index in obsolete_b_references(&levels, plan.pyramid_level())
+                .into_iter()
+                .rev()
+            {
+                let dropped = self.l0_references.remove(index);
+                self.pending_unmark_frame_nums.push(dropped.frame_num);
+            }
+        }
+
         let header = if plan.is_idr() {
             Some(self.build_header(common)?)
         } else {
@@ -100,10 +117,16 @@ impl VideoCodec for H264 {
                     frame_num,
                     poc: pic_order_cnt,
                     display_order: plan.display_order,
+                    level: plan.pyramid_level(),
                 },
             );
-            while self.l0_references.len() > self.reference_window as usize {
-                self.l0_references.pop();
+            // The window counts the P-frames. The B-frame references on
+            // top of it go when a later reference frame replaces them.
+            while self.l0_references.iter().filter(|r| r.level == 0).count()
+                > self.reference_window as usize
+            {
+                let oldest = self.l0_references.iter().rposition(|r| r.level == 0);
+                self.l0_references.remove(oldest.expect("counted above"));
             }
 
             // Pick the next free DPB slot for the reconstructed picture.

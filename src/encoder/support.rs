@@ -119,7 +119,8 @@ impl VideoContext {
                 match query_video_capabilities(self, &profile_info, &mut caps) {
                     vk::Result::SUCCESS => {
                         let max_active = caps.max_active_reference_pictures;
-                        let support = $b_frames(&codec_caps, max_active);
+                        let vendor_id = self.device_properties().vendor_id;
+                        let support = $b_frames(vendor_id, &codec_caps, max_active);
                         Ok(then(&profile_info, support))
                     }
                     err => Err(ProfileQueryError::Query(err)),

@@ -101,36 +101,46 @@ fn drain(
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
     common::init_logging();
-    const B_FRAMES: u32 = 2;
     // With a bitrate too: the rate control is told the GOP has B-frames.
     let cqp = RateControl::Cqp { qp: 26 };
     let cbr = RateControl::Cbr { bitrate: 1_000_000 };
-    for (codec, extension, rate_control) in [
-        (Codec::H264, "h264", cqp),
-        (Codec::H264, "h264", cbr),
-        (Codec::H265, "h265", cqp),
-        (Codec::H265, "h265", cbr),
-        (Codec::AV1, "obu", cqp),
-        (Codec::AV1, "obu", cbr),
+    let flat = (2, BFrameReferences::Flat);
+    // A pyramid with two levels of references, each call cuts it short at
+    // another place.
+    let pyramid = (7, BFrameReferences::Pyramid);
+    for (codec, extension, rate_control, (b_frames, references)) in [
+        (Codec::H264, "h264", cqp, flat),
+        (Codec::H264, "h264", cbr, flat),
+        (Codec::H264, "h264", cqp, pyramid),
+        (Codec::H265, "h265", cqp, flat),
+        (Codec::H265, "h265", cbr, flat),
+        (Codec::H265, "h265", cqp, pyramid),
+        (Codec::AV1, "obu", cqp, flat),
+        (Codec::AV1, "obu", cbr, flat),
+        (Codec::AV1, "obu", cbr, pyramid),
     ] {
         let context = VideoContextBuilder::new()
             .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
             .build()?;
+        let needed = match references {
+            BFrameReferences::Flat => BFrameSupport::Flat,
+            BFrameReferences::Pyramid => BFrameSupport::Pyramid,
+        };
         if !context.supports_encode(codec)
-            || context.supports_b_frames(codec, ChromaFormat::Yuv420, BitDepth::Eight)
-                == BFrameSupport::None
+            || context.supports_b_frames(codec, ChromaFormat::Yuv420, BitDepth::Eight) < needed
         {
-            eprintln!("{codec:?}: no B-frames on this device, nothing to check");
+            eprintln!("{codec:?}: no {references:?} B-frames on this device, nothing to check");
             continue;
         }
         let config = EncodeConfig::new(codec, WIDTH, HEIGHT)
             .with_rate_control(rate_control)
             .with_gop_size(0)
-            .with_b_frames(B_FRAMES);
+            .with_b_frames(b_frames)
+            .with_b_frame_references(references);
         let mut encoder = Encoder::new(context, config)?;
         let mut input = YuvUploader::for_encoder(&encoder)?;
 
-        let keep = 2 + B_FRAMES as usize;
+        let keep = 2 + b_frames as usize;
         let mut pending = VecDeque::new();
         let mut packets = Vec::new();
         // The display order of the frames that must be IDRs.
@@ -138,7 +148,8 @@ fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
         let mut submitted = 0u64;
         for i in 0..40 {
             match i {
-                // Frame 10 waits as a B-frame: it becomes a P-frame.
+                // Frame 10 waits as a B-frame: it becomes a P-frame. With
+                // the pyramid, more frames wait before it.
                 11 => {
                     encoder.request_idr();
                     idrs.push(submitted);

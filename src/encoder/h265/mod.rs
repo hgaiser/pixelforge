@@ -10,6 +10,7 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
+use crate::encoder::gop::obsolete_b_references;
 use crate::error::Result;
 use ash::vk;
 
@@ -22,6 +23,8 @@ pub(crate) struct ReferenceInfo {
     pub poc: i32,
     /// Display order (`pts`) of this reference, for reference frame invalidation.
     pub display_order: u64,
+    /// 0 for an IDR or P-frame, and the pyramid level of a B-frame.
+    pub level: u8,
 }
 
 /// H.265-specific encoder state.
@@ -53,6 +56,17 @@ impl VideoCodec for H265 {
             self.l0_references.clear();
             // All DPB slots become inactive at the start of a coded video sequence.
             common.dpb_slot_active.fill(false);
+        } else if plan.is_reference() {
+            // A reference frame makes the B-frame references of its level
+            // and below of no more use. Its reference picture set leaves
+            // them out, which is what makes a decoder drop them.
+            let levels: Vec<u8> = self.l0_references.iter().map(|r| r.level).collect();
+            for index in obsolete_b_references(&levels, plan.pyramid_level())
+                .into_iter()
+                .rev()
+            {
+                self.l0_references.remove(index);
+            }
         }
 
         let header = if plan.is_idr() {
@@ -83,10 +97,16 @@ impl VideoCodec for H265 {
                 dpb_slot: common.current_dpb_slot,
                 poc: pic_order_cnt,
                 display_order: plan.display_order,
+                level: plan.pyramid_level(),
             },
         );
-        while self.l0_references.len() > self.reference_window as usize {
-            self.l0_references.pop();
+        // The window counts the P-frames. The B-frame references on top of
+        // it go when a later reference frame replaces them.
+        while self.l0_references.iter().filter(|r| r.level == 0).count()
+            > self.reference_window as usize
+        {
+            let oldest = self.l0_references.iter().rposition(|r| r.level == 0);
+            self.l0_references.remove(oldest.expect("counted above"));
         }
 
         let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();

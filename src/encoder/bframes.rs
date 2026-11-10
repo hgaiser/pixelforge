@@ -74,9 +74,16 @@ pub(crate) fn check_support(config: &EncodeConfig, support: BFrameSupport) -> Re
 
 /// The B-frames the encoder itself can encode for `codec`, whatever the
 /// device can.
-fn implemented(codec: Codec) -> BFrameSupport {
+///
+/// An H.264 pyramid depends on how the driver writes the slice header: the
+/// P-frame after a pyramid has to reorder its reference list, and the
+/// drivers differ in what they write for that. It is checked on NVIDIA
+/// (615.78.08) only, so it is offered there only.
+fn implemented(codec: Codec, vendor_id: u32) -> BFrameSupport {
+    const NVIDIA: u32 = 0x10de;
     match codec {
-        Codec::H264 | Codec::H265 | Codec::AV1 => BFrameSupport::Flat,
+        Codec::H264 if vendor_id != NVIDIA => BFrameSupport::Flat,
+        Codec::H264 | Codec::H265 | Codec::AV1 => BFrameSupport::Pyramid,
     }
 }
 
@@ -93,6 +100,7 @@ fn max_active_references(device: u32) -> u32 {
 /// profile, capped by what the encoder implements.
 fn support(
     codec: Codec,
+    vendor_id: u32,
     device: BFrameSupport,
     max_active_references_device: u32,
 ) -> BFrameSupport {
@@ -100,11 +108,9 @@ fn support(
     if max_active_references(max_active_references_device) < 2 {
         return BFrameSupport::None;
     }
-    let support = device.min(implemented(codec));
-    tracing::debug!(
-        "{codec:?} B-frames: the device has {device:?}, the encoder {:?}",
-        implemented(codec)
-    );
+    let implemented = implemented(codec, vendor_id);
+    let support = device.min(implemented);
+    tracing::debug!("{codec:?} B-frames: the device has {device:?}, the encoder {implemented:?}");
     support
 }
 
@@ -122,6 +128,7 @@ fn h26x_support(l0: u32, l1: u32, b_in_l0: bool, b_in_l1: bool) -> BFrameSupport
 
 /// The B-frame support of an H.264 encode profile.
 pub(crate) fn h264_support(
+    vendor_id: u32,
     caps: &vk::VideoEncodeH264CapabilitiesKHR<'_>,
     max_active_references: u32,
 ) -> BFrameSupport {
@@ -133,11 +140,12 @@ pub(crate) fn h264_support(
         caps.flags
             .contains(vk::VideoEncodeH264CapabilityFlagsKHR::B_FRAME_IN_L1_LIST),
     );
-    support(Codec::H264, device, max_active_references)
+    support(Codec::H264, vendor_id, device, max_active_references)
 }
 
 /// The B-frame support of an H.265 encode profile.
 pub(crate) fn h265_support(
+    vendor_id: u32,
     caps: &vk::VideoEncodeH265CapabilitiesKHR<'_>,
     max_active_references: u32,
 ) -> BFrameSupport {
@@ -149,7 +157,7 @@ pub(crate) fn h265_support(
         caps.flags
             .contains(vk::VideoEncodeH265CapabilityFlagsKHR::B_FRAME_IN_L1_LIST),
     );
-    support(Codec::H265, device, max_active_references)
+    support(Codec::H265, vendor_id, device, max_active_references)
 }
 
 /// The reference names that predict from the past, as bits of a Vulkan
@@ -164,6 +172,7 @@ const AV1_FUTURE_NAMES: u32 = 0b111_0000;
 /// reference name and a future one. Any AV1 frame can be a reference, so
 /// there is no further condition for pyramid.
 pub(crate) fn av1_support(
+    vendor_id: u32,
     caps: &vk::VideoEncodeAV1CapabilitiesKHR<'_>,
     max_active_references: u32,
 ) -> BFrameSupport {
@@ -178,7 +187,7 @@ pub(crate) fn av1_support(
     } else {
         BFrameSupport::None
     };
-    support(Codec::AV1, device, max_active_references)
+    support(Codec::AV1, vendor_id, device, max_active_references)
 }
 
 #[cfg(test)]
@@ -197,9 +206,18 @@ mod tests {
     #[test]
     fn support_needs_two_active_references() {
         assert_eq!(
-            support(Codec::H264, BFrameSupport::Pyramid, 1),
+            support(Codec::H264, 0x10de, BFrameSupport::Pyramid, 1),
             BFrameSupport::None
         );
+    }
+
+    #[test]
+    fn an_h264_pyramid_is_for_the_driver_it_was_checked_on() {
+        let pyramid = |codec, vendor| support(codec, vendor, BFrameSupport::Pyramid, 4);
+        assert_eq!(pyramid(Codec::H264, 0x10de), BFrameSupport::Pyramid);
+        assert_eq!(pyramid(Codec::H264, 0x1002), BFrameSupport::Flat);
+        assert_eq!(pyramid(Codec::H265, 0x1002), BFrameSupport::Pyramid);
+        assert_eq!(pyramid(Codec::AV1, 0x1002), BFrameSupport::Pyramid);
     }
 
     #[test]

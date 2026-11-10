@@ -325,7 +325,11 @@ impl Av1 {
                 .consecutive_bipredictive_frame_count(b_frames.min(gop_frames - 1))
                 .flags(
                     vk::VideoEncodeAV1RateControlFlagsKHR::REGULAR_GOP
-                        | vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+                        | if common.gop.b_reference_count() > 0 {
+                            vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+                        } else {
+                            vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+                        },
                 );
         }
 

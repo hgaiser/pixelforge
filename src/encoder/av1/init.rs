@@ -69,6 +69,7 @@ impl Av1 {
             allow_layered_dpb: true,
             rgb_caps,
             b_frame_support: crate::encoder::bframes::av1_support(
+                context.device_properties().vendor_id,
                 &av1_caps,
                 caps.max_active_reference_pictures,
             ),

@@ -46,8 +46,22 @@ pub struct GopPosition {
     /// How deep in a B-frame pyramid the frame is: 0 for IDR and P-frames, 1
     /// for the B-frames of a flat group and for the middle B-frame of a
     /// pyramid, and one more for each split below that.
-    #[allow(dead_code)]
     pub pyramid_level: u8,
+}
+
+/// The held references that are of no more use once a frame of
+/// `new_level` is encoded, as indices into `levels`, the pyramid levels of
+/// the held references.
+///
+/// A B-frame that is a reference is used only by the frames between the two
+/// references it was predicted from. In encode order those all come before
+/// the next frame of its own level or of a level above it. So a reference
+/// frame replaces every B-frame reference of its level and of the levels
+/// below it, and the references the frame itself needs all stay.
+pub fn obsolete_b_references(levels: &[u8], new_level: u8) -> Vec<usize> {
+    (0..levels.len())
+        .filter(|&i| levels[i] > 0 && levels[i] >= new_level)
+        .collect()
 }
 
 /// A B-frame of a group, in encode order: its index in the group's display
@@ -192,6 +206,17 @@ impl<T> GopPlanner<T> {
     pub fn abandon(&mut self) -> Vec<T> {
         self.force_idr = true;
         self.waiting.drain(..).map(|(frame, _)| frame).collect()
+    }
+
+    /// How many B-frames are held as references at once at most: one for
+    /// each pyramid level that has references. 0 for flat groups.
+    pub fn b_reference_count(&self) -> usize {
+        b_frame_order(self.b_frames as usize, self.references)
+            .into_iter()
+            .filter(|&(_, is_reference, _)| is_reference)
+            .map(|(_, _, level)| level as usize)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The largest number of frames that are encoded before a frame and
@@ -345,6 +370,66 @@ mod tests {
                 (7, 3)
             ]
         );
+    }
+
+    #[test]
+    fn b_reference_count_is_the_depth_of_the_references() {
+        let count = |b_frames, references| {
+            GopPlanner::<u32>::new(0, b_frames, references).b_reference_count()
+        };
+        for b_frames in 0..=7 {
+            assert_eq!(count(b_frames, BFrameReferences::Flat), 0);
+        }
+        let pyramid: Vec<usize> = (0..=7)
+            .map(|b_frames| count(b_frames, BFrameReferences::Pyramid))
+            .collect();
+        assert_eq!(pyramid, [0, 0, 0, 1, 1, 1, 2, 2]);
+    }
+
+    /// Encode a long stream, dropping references by `obsolete_b_references`
+    /// and by a sliding window of two P-frames: every B-frame must still
+    /// find the nearest reference frame on each side, and the B-frame
+    /// references held never exceed `b_reference_count`.
+    #[test]
+    fn obsolete_references_are_never_needed() {
+        for b_frames in 0..=7 {
+            let mut gop = GopPlanner::new(0, b_frames, BFrameReferences::Pyramid);
+            let limit = gop.b_reference_count();
+            let mut out = Vec::new();
+            for frame in 0..60u32 {
+                out.extend(gop.push(frame));
+            }
+            // (display number, level) of the held references.
+            let mut held: Vec<(u32, u8)> = Vec::new();
+            // Every frame encoded so far that is a reference.
+            let mut all: Vec<u32> = Vec::new();
+            for (frame, position) in out {
+                if position.is_reference {
+                    let levels: Vec<u8> = held.iter().map(|h| h.1).collect();
+                    for index in obsolete_b_references(&levels, position.pyramid_level)
+                        .into_iter()
+                        .rev()
+                    {
+                        held.remove(index);
+                    }
+                }
+                if position.frame_type == GopFrameType::B {
+                    let before = all.iter().filter(|&&r| r < frame).max().unwrap();
+                    let after = all.iter().filter(|&&r| r > frame).min().unwrap();
+                    assert!(held.iter().any(|h| h.0 == *before), "b={b_frames} {frame}");
+                    assert!(held.iter().any(|h| h.0 == *after), "b={b_frames} {frame}");
+                }
+                if position.is_reference {
+                    held.push((frame, position.pyramid_level));
+                    all.push(frame);
+                    while held.iter().filter(|h| h.1 == 0).count() > 2 {
+                        let oldest = held.iter().position(|h| h.1 == 0).unwrap();
+                        held.remove(oldest);
+                    }
+                    assert!(held.iter().filter(|h| h.1 > 0).count() <= limit);
+                }
+            }
+        }
     }
 
     #[test]

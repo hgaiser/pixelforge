@@ -69,6 +69,7 @@ impl H265 {
             allow_layered_dpb: true,
             rgb_caps,
             b_frame_support: crate::encoder::bframes::h265_support(
+                context.device_properties().vendor_id,
                 &h265_caps,
                 caps.max_active_reference_pictures,
             ),

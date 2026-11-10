@@ -18,6 +18,7 @@ mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
+use crate::encoder::gop::obsolete_b_references;
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use references::{FrameReferences, bidirectional_references, show_existing_frame};
@@ -35,6 +36,8 @@ pub(crate) struct ReferenceInfo {
     pub frame_type: u32,
     /// Display order (`pts`) of this reference, for reference frame invalidation.
     pub display_order: u64,
+    /// 0 for a key frame or P-frame, and the pyramid level of a B-frame.
+    pub level: u8,
 }
 
 /// AV1-specific encoder state (multi-reference prediction).
@@ -160,6 +163,17 @@ impl VideoCodec for Av1 {
         if is_key {
             self.frame_num = 0;
             self.references.clear();
+        } else if plan.is_reference() {
+            // A reference frame makes the B-frame references of its level
+            // and below of no more use, and their frame buffers free. They
+            // were hidden frames, and all of them were shown by now.
+            let levels: Vec<u8> = self.references.iter().map(|r| r.level).collect();
+            for index in obsolete_b_references(&levels, plan.pyramid_level())
+                .into_iter()
+                .rev()
+            {
+                self.references.remove(index);
+            }
         }
 
         // A hidden frame goes into the temporal unit of the next frame that
@@ -202,6 +216,7 @@ impl VideoCodec for Av1 {
             dpb_slot: common.current_dpb_slot,
             order_hint: order_hint(plan),
             display_order: plan.display_order,
+            level: plan.pyramid_level(),
             frame_type: if is_key {
                 ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
             } else {
@@ -214,9 +229,13 @@ impl VideoCodec for Av1 {
         }
         self.references.insert(0, ref_info);
         // Keep a sliding window of the most recent references for prediction and
-        // loss recovery.
-        while self.references.len() > self.reference_window.max(1) as usize {
-            self.references.pop();
+        // loss recovery. It counts the P-frames: the B-frame references on
+        // top of it go when a later reference frame replaces them.
+        while self.references.iter().filter(|r| r.level == 0).count()
+            > self.reference_window.max(1) as usize
+        {
+            let oldest = self.references.iter().rposition(|r| r.level == 0);
+            self.references.remove(oldest.expect("counted above"));
         }
 
         // Cycle to the next available DPB slot.
@@ -287,6 +306,7 @@ mod tests {
             order_hint: 42,
             frame_type: 0,
             display_order: 0,
+            level: 0,
         };
         assert_eq!(ref_info.dpb_slot, 2);
         assert_eq!(ref_info.order_hint, 42);
@@ -314,6 +334,7 @@ mod tests {
                 order_hint: i as u32,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             };
             references.insert(0, ref_info);
             while references.len() > max_refs {
@@ -336,6 +357,7 @@ mod tests {
                     order_hint: i as u32,
                     frame_type: 0,
                     display_order: 0,
+                    level: 0,
                 },
             );
         }
@@ -349,6 +371,7 @@ mod tests {
                 order_hint: 0,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         assert_eq!(references.len(), 1);
@@ -381,6 +404,7 @@ mod tests {
                 order_hint: 0,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -396,6 +420,7 @@ mod tests {
                 order_hint: 1,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -411,6 +436,7 @@ mod tests {
                 order_hint: 2,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -429,6 +455,7 @@ mod tests {
                 order_hint: 3,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -461,6 +488,7 @@ mod tests {
                 order_hint: 0,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -476,6 +504,7 @@ mod tests {
                 order_hint: 1,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {
@@ -493,6 +522,7 @@ mod tests {
                 order_hint: 2,
                 frame_type: 0,
                 display_order: 0,
+                level: 0,
             },
         );
         while references.len() > max_refs {

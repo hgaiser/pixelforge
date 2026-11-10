@@ -366,7 +366,8 @@ impl H265 {
         let codec_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .min_qp(min_qp)
             .max_qp(max_qp);
-        let codec_rate_control = rate_control_info(&common.config);
+        let codec_rate_control =
+            rate_control_info(&common.config, common.gop.b_reference_count() > 0);
 
         let encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
@@ -435,7 +436,10 @@ impl H265 {
 }
 
 /// The GOP the rate control is told to expect.
-fn rate_control_info(config: &EncodeConfig) -> vk::VideoEncodeH265RateControlInfoKHR<'static> {
+fn rate_control_info(
+    config: &EncodeConfig,
+    pyramid: bool,
+) -> vk::VideoEncodeH265RateControlInfoKHR<'static> {
     let info = vk::VideoEncodeH265RateControlInfoKHR::default()
         .gop_frame_count(config.gop_size)
         .idr_period(config.gop_size);
@@ -453,6 +457,10 @@ fn rate_control_info(config: &EncodeConfig) -> vk::VideoEncodeH265RateControlInf
         .consecutive_b_frame_count(config.b_frames.min(gop_frame_count - 1))
         .flags(
             vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP
-                | vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+                | if pyramid {
+                    vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+                } else {
+                    vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+                },
         )
 }

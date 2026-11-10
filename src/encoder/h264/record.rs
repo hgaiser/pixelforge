@@ -1,7 +1,7 @@
 //! H.264 per-frame encode recording: builds the StdVideo* graph for one frame
 //! and submits it. This is the part that genuinely differs from the other codecs.
 
-use super::lists::b_frame_lists;
+use super::lists::{b_frame_lists, p_frame_list_modifications};
 use super::{H264, ReferenceInfo};
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
@@ -43,7 +43,7 @@ impl H264 {
         // surviving reference. Only valid on a non-IDR reference picture (an IDR
         // resets the DPB on its own). Kept alive for the whole `record` call so
         // the pointer handed to the encoder stays valid.
-        let ref_pic_marking_ops: Vec<ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry> =
+        let mut ref_pic_marking_ops: Vec<ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry> =
             if !is_idr && is_reference && !self.pending_unmark_frame_nums.is_empty() {
                 self.pending_unmark_frame_nums
                     .iter()
@@ -170,12 +170,59 @@ impl H264 {
             *entry = reference.dpb_slot;
         }
 
+        // A P-frame that makes B-frame references obsolete still has them at
+        // the start of the list a decoder builds for it, because the marking
+        // only takes effect after the frame. So it names its references.
+        let mut list0_modifications: Vec<ash::vk::native::StdVideoEncodeH264RefListModEntry> =
+            if !is_idr && !is_b && common.config.b_frames > 0 && use_adaptive_marking {
+                let frame_nums: Vec<u32> = list0.iter().map(|r| r.frame_num).collect();
+                p_frame_list_modifications(frame_num, &frame_nums, 256)
+                    .into_iter()
+                    .map(|op| ash::vk::native::StdVideoEncodeH264RefListModEntry {
+                        modification_of_pic_nums_idc: if op.add {
+                            ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_ADD
+                        } else {
+                            ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_SUBTRACT
+                        },
+                        abs_diff_pic_num_minus1: op.abs_diff_pic_num_minus1,
+                        long_term_pic_num: 0,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // The NVIDIA driver (615.78.08) writes the operations it is given
+        // and nothing more, so the operation that ends the list is one of
+        // them.
+        if !list0_modifications.is_empty() {
+            list0_modifications.push(ash::vk::native::StdVideoEncodeH264RefListModEntry {
+                modification_of_pic_nums_idc:
+                    ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END,
+                abs_diff_pic_num_minus1: 0,
+                long_term_pic_num: 0,
+            });
+        }
+        // The same driver ends the marking operations by itself only in a
+        // P-slice with no list operations. In a B-slice, or with list
+        // operations, the operation that ends them has to be given.
+        if use_adaptive_marking && (is_b || !list0_modifications.is_empty()) {
+            ref_pic_marking_ops.push(ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry {
+                memory_management_control_operation:
+                    ash::vk::native::StdVideoH264MemMgmtControlOp_STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_END,
+                difference_of_pic_nums_minus1: 0,
+                long_term_pic_num: 0,
+                long_term_frame_idx: 0,
+                max_long_term_frame_idx_plus1: 0,
+            });
+        }
+
         let ref_lists_info_flags = ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags::new_bitfield_1(
-                0, // ref_pic_list_modification_flag_l0
-                0, // ref_pic_list_modification_flag_l1
-                0, // reserved
+                !list0_modifications.is_empty() as u32, // ref_pic_list_modification_flag_l0
+                0,                                      // ref_pic_list_modification_flag_l1
+                0,                                      // reserved
             ),
         };
 
@@ -185,11 +232,15 @@ impl H264 {
             num_ref_idx_l1_active_minus1: list1.len().saturating_sub(1) as u8,
             RefPicList0: ref_list0,
             RefPicList1: ref_list1,
-            refList0ModOpCount: 0,
+            refList0ModOpCount: list0_modifications.len() as u8,
             refList1ModOpCount: 0,
             refPicMarkingOpCount: ref_pic_marking_ops.len() as u8,
             reserved1: [0; 7],
-            pRefList0ModOperations: std::ptr::null(),
+            pRefList0ModOperations: if list0_modifications.is_empty() {
+                std::ptr::null()
+            } else {
+                list0_modifications.as_ptr()
+            },
             pRefList1ModOperations: std::ptr::null(),
             pRefPicMarkingOperations: if ref_pic_marking_ops.is_empty() {
                 std::ptr::null()
@@ -445,7 +496,11 @@ impl H264 {
             .consecutive_b_frame_count(config.b_frames.min(gop_frame_count - 1))
             .flags(
                 vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP
-                    | vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+                    | if common.gop.b_reference_count() > 0 {
+                        vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+                    } else {
+                        vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+                    },
             )
     }
 }

@@ -27,8 +27,8 @@ use common::{Readback, decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
-    BFrameSupport, BitDepth, ChromaFormat, Codec, EncodeConfig, Encoder, FrameType, RateControl,
-    VideoContextBuilder, YuvLayout, YuvUploader,
+    BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, Codec, EncodeConfig, Encoder,
+    FrameType, RateControl, VideoContextBuilder, YuvLayout, YuvUploader,
 };
 use pixelforge::{Frame, MAX_B_FRAMES};
 
@@ -39,19 +39,19 @@ const GOP: u32 = 30;
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::H264, "h264", 0).map(|_| ())
+    roundtrip(Codec::H264, "h264", 0, BFrameReferences::Flat).map(|_| ())
 }
 
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_h265() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::H265, "h265", 0).map(|_| ())
+    roundtrip(Codec::H265, "h265", 0, BFrameReferences::Flat).map(|_| ())
 }
 
 #[test]
 #[ignore = "requires a Vulkan Video device and ffmpeg"]
 fn roundtrip_av1() -> Result<(), Box<dyn std::error::Error>> {
-    roundtrip(Codec::AV1, "obu", 0).map(|_| ())
+    roundtrip(Codec::AV1, "obu", 0, BFrameReferences::Flat).map(|_| ())
 }
 
 #[test]
@@ -83,14 +83,28 @@ fn roundtrip_b_frames(codec: Codec, extension: &str) -> Result<(), Box<dyn std::
         eprintln!("{codec:?}: no B-frames on this device, nothing to check");
         return Ok(());
     }
-    let baseline = roundtrip(codec, extension, 0)?;
+    let baseline = roundtrip(codec, extension, 0, BFrameReferences::Flat)?;
     // 30 frames: none of these counts divides the 29 after the IDR, so the
-    // last group is a short one, closed by the flush.
-    for b_frames in [1, 2, 3, MAX_B_FRAMES] {
-        let psnr = roundtrip(codec, extension, b_frames)?;
+    // last group is a short one, closed by the flush. A pyramid starts at
+    // 3 B-frames, has a second level of references at 6, and at 7 a B-frame
+    // replaces another as a reference.
+    let mut cases = vec![
+        (1, BFrameReferences::Flat),
+        (2, BFrameReferences::Flat),
+        (3, BFrameReferences::Flat),
+        (MAX_B_FRAMES, BFrameReferences::Flat),
+    ];
+    if support == BFrameSupport::Pyramid {
+        cases.extend([3, 4, 6, MAX_B_FRAMES].map(|b| (b, BFrameReferences::Pyramid)));
+    } else {
+        eprintln!("{codec:?}: no B-frame pyramid on this device");
+    }
+    for (b_frames, references) in cases {
+        let psnr = roundtrip(codec, extension, b_frames, references)?;
         assert!(
             psnr > baseline - 0.5,
-            "{b_frames} B-frames: luma PSNR {psnr:.2} dB, {baseline:.2} dB without"
+            "{b_frames} B-frames ({references:?}): luma PSNR {psnr:.2} dB, \
+             {baseline:.2} dB without"
         );
     }
     Ok(())
@@ -132,13 +146,14 @@ fn roundtrip(
     codec: Codec,
     extension: &str,
     b_frames: u32,
+    references: BFrameReferences,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     common::init_logging();
 
     let input_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv420p.yuv");
     common::ensure_test_data(WIDTH, HEIGHT, "yuv420p", &input_path)?;
 
-    let dir = common::scratch_dir(&format!("roundtrip-{extension}-b{b_frames}"));
+    let dir = common::scratch_dir(&format!("roundtrip-{extension}-b{b_frames}-{references:?}"));
     let bitstream_path = dir.join(format!("out.{extension}"));
 
     let context = VideoContextBuilder::new()
@@ -158,7 +173,8 @@ fn roundtrip(
         .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
         .with_gop_size(GOP)
-        .with_b_frames(b_frames);
+        .with_b_frames(b_frames)
+        .with_b_frame_references(references);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
     let mut input_image = YuvUploader::for_encoder(&encoder)?;
