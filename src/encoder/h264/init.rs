@@ -76,6 +76,8 @@ impl H264 {
         })?;
         let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
+        let b_l0_reference_count = (init.session_active_references.saturating_sub(1))
+            .min(h264_caps.max_b_picture_l0_reference_count);
         let common = init.common;
 
         let codec = H264 {
@@ -84,6 +86,7 @@ impl H264 {
             l0_references: Vec::new(),
             reference_window,
             active_reference_count,
+            b_l0_reference_count,
             pending_unmark_frame_nums: Vec::new(),
             profile_idc,
             preferred_entropy_cabac,

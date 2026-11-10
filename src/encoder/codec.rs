@@ -496,6 +496,9 @@ impl FramePlan {
     pub fn is_reference(&self) -> bool {
         self.gop.is_reference
     }
+    pub fn is_b(&self) -> bool {
+        self.gop.frame_type == GopFrameType::B
+    }
     pub fn is_first_frame(&self) -> bool {
         self.encode_index == 0
     }
@@ -934,6 +937,10 @@ pub(crate) struct CommonInit {
     pub reference_window: u32,
     /// How many of the newest of those one frame predicts from.
     pub active_reference_count: u32,
+    /// How many references one frame may use at most, which is what the
+    /// session was made with. More than `active_reference_count` only with
+    /// B-frames, which use a reference on each side.
+    pub session_active_references: u32,
 }
 
 /// The device-capability fields the generic init needs, resolved once by the
@@ -1132,7 +1139,17 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         .max_reference_window
         .min(max_dpb_slots_supported - 1)
         .min(MAX_DPB_SLOTS - 1);
-    let reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
+    let mut reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
+    // A B-frame predicts from a reference on each side, so both have to stay.
+    if config.b_frames > 0 && reference_window < 2 {
+        if window_limit < 2 {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "B-frames need a reference window of 2, and the device allows {window_limit}"
+            )));
+        }
+        tracing::info!("B-frames: reference window raised from {reference_window} to 2");
+        reference_window = 2;
+    }
     let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
         .min(req.max_frame_references);
@@ -1147,8 +1164,15 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     if max_active_reference_pictures < 1 && max_active_supported >= 1 {
         max_active_reference_pictures = 1;
     }
-    // B-frames are not yet supported, so a reconstructed-frame slot plus the
-    // window is enough.
+    // A B-frame uses a reference on each side, whatever a P-frame uses. The
+    // B-frame support check has made sure that the device allows two.
+    let session_active_references = if config.b_frames > 0 {
+        max_active_reference_pictures.max(2)
+    } else {
+        max_active_reference_pictures
+    };
+    // The window plus a slot for the reconstructed frame. A B-frame that is
+    // not a reference takes that slot too and leaves it free again.
     let dpb_slot_count = reference_window + 1;
     tracing::debug!(
         "Reference window {reference_window}, {max_active_reference_pictures} used per frame \
@@ -1175,7 +1199,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         })
         .reference_picture_format(reference_picture_format)
         .max_dpb_slots(dpb_slot_count as u32)
-        .max_active_reference_pictures(max_active_reference_pictures as u32)
+        .max_active_reference_pictures(session_active_references as u32)
         .std_header_version(&std_header_version);
     if rgb_session.is_some() {
         session_create_info = session_create_info.push(&mut rgb_session_info);
@@ -1281,5 +1305,6 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         common,
         reference_window: reference_window as u32,
         active_reference_count: max_active_reference_pictures as u32,
+        session_active_references: session_active_references as u32,
     })
 }

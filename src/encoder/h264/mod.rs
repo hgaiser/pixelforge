@@ -6,6 +6,7 @@
 //! (`record`), and the SPS/PPS generation (`session_params`).
 
 mod init;
+mod lists;
 mod record;
 mod session_params;
 
@@ -40,6 +41,9 @@ pub(crate) struct H264 {
     reference_window: u32,
     /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
+    /// How many references shown before it a B-frame predicts from. It
+    /// predicts from one shown after it.
+    b_l0_reference_count: u32,
     /// `frame_num`s of references dropped by reference frame invalidation that
     /// still need to be marked unused-for-reference (via MMCO) in the next
     /// P-frame's slice header, so the decoder's DPB matches the encoder's.

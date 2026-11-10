@@ -5,13 +5,14 @@
 //! `output.h264`, `output.h265` or `output.av1` depending on the codec.
 //!
 //! Usage:
-//!   cargo run --example encode -- [h264|h265|av1]
+//!   cargo run --example encode -- [h264|h265|av1] [--b-frames N] [--pyramid]
 //!
-//! The codec defaults to `h264`.
+//! The codec defaults to `h264`. `--b-frames N` puts N B-frames between two
+//! reference frames, and `--pyramid` makes the middle ones references.
 
 use pixelforge::{
-    ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder, YuvLayout,
-    YuvUploader,
+    BFrameReferences, ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl,
+    VideoContextBuilder, YuvLayout, YuvUploader,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,9 +36,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pick the codec. H.265 asks for an explicit format; the others take the
     // default, which is also YUV420.
-    let codec_arg = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "h264".to_string());
+    let mut codec_arg = "h264".to_string();
+    let mut b_frames = 0u32;
+    let mut b_frame_references = BFrameReferences::Flat;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--b-frames" => {
+                b_frames = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or("--b-frames takes a number")?;
+            }
+            "--pyramid" => b_frame_references = BFrameReferences::Pyramid,
+            _ => codec_arg = arg,
+        }
+    }
     let (codec, config, output_name) = match codec_arg.as_str() {
         "h264" => (
             Codec::H264,
@@ -94,11 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config
         .with_rate_control(RateControl::Cqp { qp: 26 })
         .with_frame_rate(30, 1)
-        .with_gop_size(30);
+        .with_gop_size(30)
+        .with_b_frames(b_frames)
+        .with_b_frame_references(b_frame_references);
 
     println!(
-        "Config: {:?}, GOP={}\n",
-        config.rate_control, config.gop_size
+        "Config: {:?}, GOP={}, B-frames={}\n",
+        config.rate_control, config.gop_size, config.b_frames
     );
 
     let mut encoder = Encoder::new(context, config)?;
@@ -134,9 +150,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upload YUV420 data to the input image.
         input_image.upload(YuvLayout::I420, frame)?;
 
-        // Submit the frame (async) and keep the pipeline at most ~2 deep.
+        // Submit the frame (async) and keep the pipeline at most ~2 deep. A
+        // B-frame waits for the reference frame after it, so its packet does
+        // not come before `b_frames` more frames are submitted.
         pending.push_back(encoder.submit(Frame::image(input_image.source()))?);
-        while pending.len() > 2 {
+        while pending.len() > 2 + b_frames as usize {
             let packet = pollster::block_on(pending.pop_front().unwrap())?;
             write_packet(packet, &mut total_bytes)?;
         }
