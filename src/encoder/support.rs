@@ -1,5 +1,6 @@
 //! Device support queries for encode formats.
 
+use super::bframes::{BFrameSupport, av1_support, h264_support, h265_support};
 use super::codec::query_video_capabilities;
 use super::profile::{av1_profile, h264_profile_idc, h265_profile_idc};
 use super::rgb::rgb_conversion_profile;
@@ -35,7 +36,7 @@ impl VideoContext {
         if !self.supports_encode(codec) {
             return false;
         }
-        let result = self.query_encode_profile(codec, chroma_format, bit_depth, None, |_| ());
+        let result = self.query_encode_profile(codec, chroma_format, bit_depth, None, |_, _| ());
         report(
             &format!("{codec:?} encode {chroma_format:?} {bit_depth:?}"),
             result,
@@ -43,9 +44,36 @@ impl VideoContext {
         .is_some()
     }
 
+    /// Check what the device can do with B-frames for `codec` in the given
+    /// chroma format and bit depth: what an [`Encoder`](crate::Encoder) with
+    /// [`EncodeConfig::with_b_frames`](crate::EncodeConfig::with_b_frames)
+    /// accepts. [`BFrameSupport::None`] also where the device cannot encode
+    /// the profile at all, and where the encoder has no B-frames for the
+    /// codec yet.
+    pub fn supports_b_frames(
+        &self,
+        codec: Codec,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+    ) -> BFrameSupport {
+        if !self.supports_encode(codec) {
+            return BFrameSupport::None;
+        }
+        let result =
+            self.query_encode_profile(codec, chroma_format, bit_depth, None, |_, support| support);
+        report(
+            &format!("{codec:?} B-frames {chroma_format:?} {bit_depth:?}"),
+            result,
+        )
+        .unwrap_or(BFrameSupport::None)
+    }
+
     /// Build the profile an encoder would request for `codec`, `chroma_format`
     /// and `bit_depth`, ask the driver for its capabilities, and on success
     /// hand the profile to `then` for any further query about it.
+    ///
+    /// `then` also gets what the encoder can do with B-frames for the
+    /// profile, by the rules the encoder itself checks.
     ///
     /// With `rgb_caps`, the profile is the RGB input one an encoder built with
     /// [`Conversion::Encoder`](crate::Conversion::Encoder)
@@ -60,7 +88,7 @@ impl VideoContext {
         chroma_format: ChromaFormat,
         bit_depth: BitDepth,
         mut rgb_caps: Option<&mut vk::VideoEncodeRgbConversionCapabilitiesVALVE<'static>>,
-        then: impl FnOnce(&vk::VideoProfileInfoKHR<'_>) -> R,
+        then: impl FnOnce(&vk::VideoProfileInfoKHR<'_>, BFrameSupport) -> R,
     ) -> Result<R, ProfileQueryError> {
         let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = chroma_format.into();
         let component_bit_depth: vk::VideoComponentBitDepthFlagsKHR = bit_depth.into();
@@ -75,7 +103,7 @@ impl VideoContext {
         // Each arm keeps its profile and capability structs alive across the
         // calls that use them.
         macro_rules! query {
-            ($operation:expr, $profile:expr, $codec_caps:expr) => {{
+            ($operation:expr, $profile:expr, $codec_caps:expr, $b_frames:expr) => {{
                 let mut profile = $profile;
                 let mut profile_info = base.video_codec_operation($operation).push(&mut profile);
                 if rgb_caps.is_some() {
@@ -89,7 +117,11 @@ impl VideoContext {
                     caps = caps.push(rgb_caps);
                 }
                 match query_video_capabilities(self, &profile_info, &mut caps) {
-                    vk::Result::SUCCESS => Ok(then(&profile_info)),
+                    vk::Result::SUCCESS => {
+                        let max_active = caps.max_active_reference_pictures;
+                        let support = $b_frames(&codec_caps, max_active);
+                        Ok(then(&profile_info, support))
+                    }
                     err => Err(ProfileQueryError::Query(err)),
                 }
             }};
@@ -100,7 +132,8 @@ impl VideoContext {
                 vk::VideoCodecOperationFlagsKHR::ENCODE_H264,
                 vk::VideoEncodeH264ProfileInfoKHR::default()
                     .std_profile_idc(h264_profile_idc(chroma_format)),
-                vk::VideoEncodeH264CapabilitiesKHR::default()
+                vk::VideoEncodeH264CapabilitiesKHR::default(),
+                h264_support
             ),
             Codec::H265 => {
                 let profile_idc = h265_profile_idc(chroma_format, bit_depth)
@@ -108,13 +141,15 @@ impl VideoContext {
                 query!(
                     vk::VideoCodecOperationFlagsKHR::ENCODE_H265,
                     vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc),
-                    vk::VideoEncodeH265CapabilitiesKHR::default()
+                    vk::VideoEncodeH265CapabilitiesKHR::default(),
+                    h265_support
                 )
             }
             Codec::AV1 => query!(
                 vk::VideoCodecOperationFlagsKHR::ENCODE_AV1,
                 vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(av1_profile(chroma_format)),
-                vk::VideoEncodeAV1CapabilitiesKHR::default()
+                vk::VideoEncodeAV1CapabilitiesKHR::default(),
+                av1_support
             ),
         }
     }

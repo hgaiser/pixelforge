@@ -6,6 +6,7 @@
 
 mod api;
 pub(crate) mod av1;
+mod bframes;
 pub(crate) mod codec;
 #[cfg(feature = "dmabuf")]
 pub mod external;
@@ -419,6 +420,12 @@ pub struct EncodeConfig {
     /// as the device allows, which can be fewer. The device's DPB size can
     /// also lower it.
     pub max_reference_frames: u32,
+    /// How many B-frames go between two reference frames; see
+    /// [`Self::with_b_frames`].
+    pub b_frames: u32,
+    /// Whether B-frames are references; see
+    /// [`Self::with_b_frame_references`].
+    pub b_frame_references: BFrameReferences,
     /// VBV/HRD virtual buffer size in milliseconds, for
     /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much the encoder can deviate from the target bitrate
@@ -467,6 +474,8 @@ impl EncodeConfig {
             },
             gop_size: DEFAULT_GOP_SIZE,
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            b_frames: 0,
+            b_frame_references: BFrameReferences::Flat,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color: StreamColor::default(),
@@ -533,6 +542,32 @@ impl EncodeConfig {
         self
     }
 
+    /// Encode `count` B-frames between two reference frames, at most
+    /// [`MAX_B_FRAMES`]. 0, the default, encodes none and adds no latency.
+    ///
+    /// A B-frame predicts from a frame shown after it, so it is encoded only
+    /// once that frame was submitted. That adds `count` frames of latency,
+    /// and it changes what [`Encoder::submit`] gives back: the future of the
+    /// k-th submit resolves with the k-th packet of the stream, in decode
+    /// order, which is the packet of another frame. So a future may resolve
+    /// only after later submits, and `block_on(encoder.submit(frame)?)`
+    /// never returns. Keep the futures in a queue, and call
+    /// [`Encoder::flush`] at the end of the stream before draining it.
+    ///
+    /// [`Encoder::new`] returns an error if the device cannot encode
+    /// B-frames for the profile; see
+    /// [`VideoContext::supports_b_frames`](crate::VideoContext::supports_b_frames).
+    pub fn with_b_frames(mut self, count: u32) -> Self {
+        self.b_frames = count;
+        self
+    }
+
+    /// Choose whether B-frames are references, see [`BFrameReferences`].
+    pub fn with_b_frame_references(mut self, references: BFrameReferences) -> Self {
+        self.b_frame_references = references;
+        self
+    }
+
     /// Set the VBV/HRD virtual buffer size in milliseconds.
     /// Smaller values produce more uniform frame sizes at the cost of
     /// quality variation during scene changes.
@@ -593,6 +628,7 @@ impl EncodeConfig {
 }
 
 pub use api::Encoder;
+pub use bframes::{BFrameReferences, BFrameSupport, MAX_B_FRAMES};
 pub use frame::{Frame, InputSlot};
 pub use pipeline::EncodeFuture;
 pub use source::{Conversion, ConversionPreference, RgbSource, Source};

@@ -507,9 +507,11 @@ impl EncodePipeline {
         }
     }
 
-    /// Drop the newest future's sender: its frame was not accepted.
-    pub(crate) fn drop_newest_future(&mut self) {
-        self.senders.pop_back();
+    /// Drop the senders of every future no packet was assigned to yet, so
+    /// those futures resolve with an error: an encode failed, and the frames
+    /// after it will not be encoded.
+    pub(crate) fn drop_waiting_futures(&mut self) {
+        self.senders.clear();
     }
 
     /// Wait until every in-flight submission has been read back. Used before

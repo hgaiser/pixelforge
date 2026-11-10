@@ -399,9 +399,9 @@ pub use decoder::{
 #[cfg(feature = "dmabuf")]
 pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, DmaBufPlane};
 pub use encoder::{
-    BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions, EncodeConfig, EncodeContentHint,
-    EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode, Frame, FrameRate,
-    FrameType, RateControl,
+    BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions,
+    EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder,
+    EncoderTuningMode, Frame, FrameRate, FrameType, MAX_B_FRAMES, RateControl,
 };
 pub use encoder::{
     Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,

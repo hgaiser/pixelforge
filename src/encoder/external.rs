@@ -362,7 +362,7 @@ impl Encoder {
             Source::Rgb(rgb) => Some(rgb.format.vk_format()),
             Source::Yuv => None,
         };
-        Ok(match self.conversion() {
+        let plan = match self.conversion() {
             Conversion::None => {
                 if config.chroma_format == ChromaFormat::Yuv422 {
                     return Err(PixelForgeError::InvalidInput(
@@ -385,6 +385,21 @@ impl Encoder {
                 zero_copy: Access::Sample,
                 fallback: None,
             },
+        };
+        // A B-frame is encoded only once the frame after its group arrives.
+        // Read directly, it would keep the producer's buffer that long, and a
+        // compositor has few of them. Copied, the buffer is free at once.
+        Ok(match plan {
+            InputPlan {
+                zero_copy: Access::Encode,
+                vk_format,
+                ..
+            } if config.b_frames > 0 => InputPlan {
+                vk_format,
+                zero_copy: Access::Copy,
+                fallback: None,
+            },
+            plan => plan,
         })
     }
 

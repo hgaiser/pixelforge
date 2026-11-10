@@ -69,6 +69,10 @@ impl H264 {
             bitstream_buffer_size,
             allow_layered_dpb: true,
             rgb_caps,
+            b_frame_support: crate::encoder::bframes::h264_support(
+                &h264_caps,
+                caps.max_active_reference_pictures,
+            ),
         })?;
         let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;

@@ -24,6 +24,7 @@ pub(crate) trait EncoderApi: Send {
     fn common(&self) -> &EncoderCommon;
     fn input_image(&self) -> vk::Image;
     fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
+    fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
@@ -39,6 +40,9 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
     }
     fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
         CodecEncoder::encode_frame(self, input, sync)
+    }
+    fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
+        CodecEncoder::encode_frame_now(self, input, sync)
     }
     fn flush(&mut self) -> Result<()> {
         CodecEncoder::flush(self)
@@ -93,6 +97,7 @@ impl Encoder {
     /// [`EncodeConfig::conversion`] asks for one that cannot.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
         config.rate_control.check(config.codec)?;
+        super::bframes::check_config(&config)?;
         let plan = plan(&context, &config)?;
         if let Some(format) = plan.rgb_input {
             super::rgb::check_rgb_input(&context, &config, format)?;
@@ -352,7 +357,10 @@ impl Encoder {
         } else {
             FrameInput::InPlace
         };
-        let mut future = self.inner.encode_frame(input, FrameSync::default())?;
+        // Encoded now, with the frames that wait before it: no frame arrives
+        // after it to end their group, and its source may be another slot's
+        // image.
+        let mut future = self.inner.encode_frame_now(input, FrameSync::default())?;
         future.pts_offset = self.pts_offset;
         if other_slot {
             // The next frame may be written into that slot's image.
