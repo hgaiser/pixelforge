@@ -1,11 +1,12 @@
 //! H.265 per-frame encode recording: builds the StdVideo* graph for one frame
 //! and submits it.
 
-use super::H265;
+use super::{H265, ReferenceInfo};
 
+use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
-use crate::error::Result;
+use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -14,6 +15,7 @@ impl H265 {
     pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
+        let is_b = plan.is_b();
         let pic_order_cnt = plan.pic_order_cnt();
 
         let slot = common.pipeline.current();
@@ -28,7 +30,14 @@ impl H265 {
         }
         // Only the references this frame predicts from go to the encode. The
         // rest of the window stays in its DPB slots, untouched.
-        let used_references = self.used_references();
+        let (before, after) = self.references_around(pic_order_cnt);
+        let (used_before, used_after) = self.used_counts(plan, before.len(), after.len())?;
+        let used_references: Vec<ReferenceInfo> = before[..used_before]
+            .iter()
+            .chain(&after[..used_after])
+            .copied()
+            .collect();
+        let used_references = used_references.as_slice();
         let ref_dpb_slots: Vec<u8> = used_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
@@ -45,11 +54,15 @@ impl H265 {
 
         let slice_type = if is_idr {
             ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
+        } else if is_b {
+            ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_B
         } else {
             ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
         };
         let picture_type = if is_idr {
             ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else if is_b {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
         } else {
             ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
         };
@@ -90,37 +103,32 @@ impl H265 {
             pWeightTable: std::ptr::null(),
         };
 
-        // Short-term reference picture set: negative (past) refs for P, plus a
-        // positive (future) ref for B.
+        // Short-term reference picture set: every held reference, shown
+        // before the frame (negative) or after it (positive), nearest first.
+        // A reference left out is one the decoder drops, so all of them stay
+        // in the set, but only the nearest are used by this picture.
         let mut delta_poc_s0_minus1 = [0u16; 16];
-        let mut num_negative_pics: u8 = 0;
+        let mut delta_poc_s1_minus1 = [0u16; 16];
         let mut used_by_curr_pic_s0_flag: u16 = 0;
-
-        if !is_idr && !self.l0_references.is_empty() {
-            // max_poc = 2^(log2_max_pic_order_cnt_lsb_minus4 + 4) * 2 = 512.
-            let max_poc = 1i32 << 9;
-            let mut prev_delta_poc = 0;
-            for (i, ref_info) in self.l0_references.iter().enumerate() {
-                if i >= 15 {
-                    break;
-                }
-                let mut delta_poc = ref_info.poc - pic_order_cnt;
-                if delta_poc > max_poc / 2 {
-                    delta_poc -= max_poc;
-                } else if delta_poc < -max_poc / 2 {
-                    delta_poc += max_poc;
-                }
-                let diff = prev_delta_poc - delta_poc;
-                delta_poc_s0_minus1[num_negative_pics as usize] = (diff - 1).max(0) as u16;
-                prev_delta_poc = delta_poc;
-                // Every held reference stays in the set, so the decoder keeps
-                // it too, but only the newest are used by this picture.
-                if i < used_references.len() {
-                    used_by_curr_pic_s0_flag |= 1 << num_negative_pics;
-                }
-                num_negative_pics += 1;
+        let mut used_by_curr_pic_s1_flag: u16 = 0;
+        let mut previous = pic_order_cnt;
+        for (i, reference) in before.iter().enumerate() {
+            delta_poc_s0_minus1[i] = (previous - reference.poc - 1).max(0) as u16;
+            previous = reference.poc;
+            if i < used_before {
+                used_by_curr_pic_s0_flag |= 1 << i;
             }
         }
+        let mut previous = pic_order_cnt;
+        for (i, reference) in after.iter().enumerate() {
+            delta_poc_s1_minus1[i] = (reference.poc - previous - 1).max(0) as u16;
+            previous = reference.poc;
+            if i < used_after {
+                used_by_curr_pic_s1_flag |= 1 << i;
+            }
+        }
+        let num_negative_pics = before.len() as u8;
+        let num_positive_pics = after.len() as u8;
 
         let frame_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
             flags: ash::vk::native::StdVideoH265ShortTermRefPicSetFlags {
@@ -135,14 +143,14 @@ impl H265 {
             abs_delta_rps_minus1: 0,
             used_by_curr_pic_flag: 0,
             used_by_curr_pic_s0_flag,
-            used_by_curr_pic_s1_flag: 0,
+            used_by_curr_pic_s1_flag,
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,
             num_negative_pics,
-            num_positive_pics: 0,
+            num_positive_pics,
             delta_poc_s0_minus1,
-            delta_poc_s1_minus1: [0; 16],
+            delta_poc_s1_minus1,
         };
 
         let empty_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
@@ -168,6 +176,9 @@ impl H265 {
             delta_poc_s1_minus1: [0; 16],
         };
 
+        // With B-frames a decoder still holds pictures to show when an IDR
+        // comes, and this flag would make it drop them.
+        let no_output_of_prior_pics = (is_idr && common.config.b_frames == 0) as u32;
         let picture_info_flags = ash::vk::native::StdVideoEncodeH265PictureInfoFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH265PictureInfoFlags::new_bitfield_1(
@@ -177,7 +188,7 @@ impl H265 {
                 0,                                // discardable_flag
                 0,                                // cross_layer_bla_flag
                 1,                                // pic_output_flag
-                if is_idr { 1 } else { 0 },       // no_output_of_prior_pics_flag
+                no_output_of_prior_pics,          // no_output_of_prior_pics_flag
                 0,                                // short_term_ref_pic_set_sps_flag
                 0,                                // slice_temporal_mvp_enabled_flag
                 0,                                // reserved
@@ -185,20 +196,16 @@ impl H265 {
         };
 
         const NO_REFERENCE_PICTURE: u8 = 0xFF;
+        // The lists a decoder builds by default: list 0 is the references
+        // used from before the frame, list 1 those from after it.
         let mut ref_list0: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
-        let ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
-
-        let num_ref_l0 = if !is_idr && !self.l0_references.is_empty() {
-            let count = used_references.len();
-            for (i, ref_info) in used_references.iter().enumerate() {
-                if i < 15 {
-                    ref_list0[i] = ref_info.dpb_slot;
-                }
-            }
-            count.min(15)
-        } else {
-            0
-        };
+        let mut ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
+        for (entry, reference) in ref_list0.iter_mut().zip(&before[..used_before]) {
+            *entry = reference.dpb_slot;
+        }
+        for (entry, reference) in ref_list1.iter_mut().zip(&after[..used_after]) {
+            *entry = reference.dpb_slot;
+        }
 
         let ref_lists_info = ash::vk::native::StdVideoEncodeH265ReferenceListsInfo {
             flags: ash::vk::native::StdVideoEncodeH265ReferenceListsInfoFlags {
@@ -208,12 +215,8 @@ impl H265 {
                         0, 0, 0,
                     ),
             },
-            num_ref_idx_l0_active_minus1: if num_ref_l0 > 0 {
-                (num_ref_l0 - 1) as u8
-            } else {
-                0
-            },
-            num_ref_idx_l1_active_minus1: 0,
+            num_ref_idx_l0_active_minus1: used_before.saturating_sub(1) as u8,
+            num_ref_idx_l1_active_minus1: used_after.saturating_sub(1) as u8,
             RefPicList0: ref_list0,
             RefPicList1: ref_list1,
             list_entry_l0: [0; 15],
@@ -228,7 +231,7 @@ impl H265 {
             PicOrderCntVal: pic_order_cnt,
             TemporalId: 0,
             reserved1: [0; 7],
-            pRefLists: if !is_idr && !self.l0_references.is_empty() {
+            pRefLists: if !used_references.is_empty() {
                 &ref_lists_info
             } else {
                 std::ptr::null()
@@ -307,7 +310,7 @@ impl H265 {
         let mut reference_slots_for_begin = Vec::with_capacity(17);
         reference_slots_for_begin.push(setup_slot_for_begin);
 
-        let has_l0_ref = !is_idr && !self.l0_references.is_empty();
+        let has_l0_ref = !used_references.is_empty();
 
         if has_l0_ref {
             for ref_info in used_references {
@@ -363,9 +366,7 @@ impl H265 {
         let codec_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .min_qp(min_qp)
             .max_qp(max_qp);
-        let codec_rate_control = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .gop_frame_count(common.config.gop_size)
-            .idr_period(common.config.gop_size);
+        let codec_rate_control = rate_control_info(&common.config);
 
         let encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
@@ -397,4 +398,61 @@ impl H265 {
             post_encode_barrier: true,
         })
     }
+
+    /// The held references shown before the picture with POC `current`, and
+    /// those shown after it, each nearest first. None for an IDR, which has
+    /// emptied the list.
+    fn references_around(&self, current: i32) -> (Vec<ReferenceInfo>, Vec<ReferenceInfo>) {
+        // A reference picture set holds 16 pictures at most.
+        let held = &self.l0_references[..self.l0_references.len().min(15)];
+        let mut before: Vec<ReferenceInfo> =
+            held.iter().filter(|r| r.poc < current).copied().collect();
+        let mut after: Vec<ReferenceInfo> =
+            held.iter().filter(|r| r.poc > current).copied().collect();
+        before.sort_by_key(|r| std::cmp::Reverse(r.poc));
+        after.sort_by_key(|r| r.poc);
+        (before, after)
+    }
+
+    /// How many of the `before` references shown before it and of the
+    /// `after` shown after it this frame predicts from.
+    fn used_counts(&self, plan: &FramePlan, before: usize, after: usize) -> Result<(usize, usize)> {
+        if plan.is_idr() {
+            return Ok((0, 0));
+        }
+        if !plan.is_b() {
+            return Ok((before.min(self.active_reference_count as usize), 0));
+        }
+        if before == 0 || after == 0 {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "H.265 B-frame with POC {} has {before} references before it and {after} \
+                 after it",
+                plan.pic_order_cnt()
+            )));
+        }
+        Ok((before.min(self.b_l0_reference_count as usize), 1))
+    }
+}
+
+/// The GOP the rate control is told to expect.
+fn rate_control_info(config: &EncodeConfig) -> vk::VideoEncodeH265RateControlInfoKHR<'static> {
+    let info = vk::VideoEncodeH265RateControlInfoKHR::default()
+        .gop_frame_count(config.gop_size)
+        .idr_period(config.gop_size);
+    if config.b_frames == 0 {
+        return info;
+    }
+    // The count of B-frames has to be below the GOP length, so a GOP with no
+    // end is given the longest length there is.
+    let gop_frame_count = if config.gop_size == 0 {
+        u32::MAX
+    } else {
+        config.gop_size
+    };
+    info.gop_frame_count(gop_frame_count)
+        .consecutive_b_frame_count(config.b_frames.min(gop_frame_count - 1))
+        .flags(
+            vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP
+                | vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+        )
 }

@@ -75,6 +75,8 @@ impl H265 {
         })?;
         let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
+        let b_l0_reference_count = (init.session_active_references.saturating_sub(1))
+            .min(h265_caps.max_b_picture_l0_reference_count);
         let common = init.common;
 
         let codec = H265 {
@@ -82,6 +84,7 @@ impl H265 {
             l0_references: Vec::new(),
             reference_window,
             active_reference_count,
+            b_l0_reference_count,
             profile_idc,
         };
 

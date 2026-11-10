@@ -52,7 +52,7 @@ impl H265 {
         let dec_pic_buf_mgr = ash::vk::native::StdVideoH265DecPicBufMgr {
             max_latency_increase_plus1: [0; 7],
             max_dec_pic_buffering_minus1: [(common.dpb_slot_count - 1) as u8, 0, 0, 0, 0, 0, 0],
-            max_num_reorder_pics: [0; 7],
+            max_num_reorder_pics: [common.gop.reorder_delay() as u8, 0, 0, 0, 0, 0, 0],
         };
 
         let short_term_ref_pic_set = ash::vk::native::StdVideoH265ShortTermRefPicSet {

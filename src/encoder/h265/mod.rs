@@ -37,18 +37,10 @@ pub(crate) struct H265 {
     reference_window: u32,
     /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
+    /// How many references shown before it a B-frame predicts from. It
+    /// predicts from one shown after it.
+    b_l0_reference_count: u32,
     profile_idc: u32,
-}
-
-impl H265 {
-    /// The references this frame predicts from: the newest held ones.
-    fn used_references(&self) -> &[ReferenceInfo] {
-        let n = self
-            .l0_references
-            .len()
-            .min(self.active_reference_count as usize);
-        &self.l0_references[..n]
-    }
 }
 
 impl VideoCodec for H265 {

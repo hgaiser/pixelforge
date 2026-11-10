@@ -60,6 +60,12 @@ fn roundtrip_h264_b_frames() -> Result<(), Box<dyn std::error::Error>> {
     roundtrip_b_frames(Codec::H264, "h264")
 }
 
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_h265_b_frames() -> Result<(), Box<dyn std::error::Error>> {
+    roundtrip_b_frames(Codec::H265, "h265")
+}
+
 /// Round trips with B-frames, against the one without. Nothing to do on a
 /// device that encodes none.
 fn roundtrip_b_frames(codec: Codec, extension: &str) -> Result<(), Box<dyn std::error::Error>> {
