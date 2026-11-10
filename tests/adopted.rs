@@ -19,8 +19,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat,
-    RgbSource, Source, SourceImage, TimelinePoint,
+    BFrameSupport, BitDepth, ChromaFormat, ColorSpec, ConversionPreference, EncodeConfig, Encoder,
+    Frame, Handoff, RateControl, RgbFormat, RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -246,13 +246,22 @@ enum Wait {
 /// Encode `ENCODE_FRAMES` RGB frames as H.264 on `context`, the way a capture
 /// pipeline would: the encoder converts each one with the colour converter's
 /// shader, straight into its input image.
-fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+///
+/// With `b_frames`, some frames are encoded later than they are submitted,
+/// in an order of their own: the submissions and their waits have to hold
+/// for that too.
+fn encode_all(
+    context: &VideoContext,
+    wait: Wait,
+    b_frames: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let device = context.device();
     let mut encoder = Encoder::new(
         context.clone(),
         EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT)
             .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
+            .with_b_frames(b_frames)
             .with_source(Source::Rgb(RgbSource::new(
                 RgbFormat::BGRA,
                 ColorSpec::Srgb,
@@ -314,6 +323,8 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
         sources.push(source);
         pending.push(future);
     }
+    // The last B-frames wait for a reference frame that does not come.
+    encoder.flush()?;
     let mut stream = Vec::new();
     for future in pending {
         stream.extend_from_slice(&pollster::block_on(future)?.data);
@@ -323,6 +334,16 @@ fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std
     drop(images);
     unsafe { device.destroy_semaphore(rendered, None) };
     Ok(stream)
+}
+
+/// The B-frame counts to encode with: none, and two where the device can.
+fn b_frame_counts(context: &VideoContext) -> Vec<u32> {
+    let support = context.supports_b_frames(Codec::H264, ChromaFormat::Yuv420, BitDepth::Eight);
+    if support == BFrameSupport::None {
+        vec![0]
+    } else {
+        vec![0, 2]
+    }
 }
 
 /// Luma PSNR between two NV12 frames of the encode size.
@@ -350,7 +371,12 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .require_encode(Codec::H264)
         .require_decode(Codec::H264)
         .build()?;
-    let expected = encode_all(&own, Wait::Cpu)?;
+    // Without B-frames, and with them where the device has them.
+    let b_frame_counts = b_frame_counts(&own);
+    let mut expected = Vec::new();
+    for &b_frames in &b_frame_counts {
+        expected.push(encode_all(&own, Wait::Cpu, b_frames)?);
+    }
 
     let (entry, instance) = instance_1_1()?;
     let builder = VideoContextBuilder::new().require_encode(Codec::H264);
@@ -371,7 +397,10 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
             app.physical_device,
             app.device.clone(),
         )?;
-    let actual = encode_all(&context, Wait::Gpu)?;
+    let mut actual = Vec::new();
+    for &b_frames in &b_frame_counts {
+        actual.push(encode_all(&context, Wait::Gpu, b_frames)?);
+    }
     drop(context);
 
     // Both streams decoded by the same decoder, so any difference is the
@@ -380,25 +409,28 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     // below the floor here. The floor is not equality because not every
     // encoder is reproducible: RADV gives bit-identical streams, while ANV has
     // been seen as low as 47 dB between two runs of the same synchronous path.
-    let expected_frames = decode_all(&own, &expected)?;
-    let actual_frames = decode_all(&own, &actual)?;
-    assert_eq!(actual_frames.len(), ENCODE_FRAMES as usize, "frame count");
-    assert_eq!(expected_frames.len(), actual_frames.len(), "frame count");
-    let psnrs: Vec<f64> = actual_frames
-        .iter()
-        .zip(&expected_frames)
-        .map(|(a, e)| luma_psnr(a, e))
-        .collect();
-    println!(
-        "adopted vs own encode, luma PSNR per frame: {:?}; streams bit-identical: {}",
-        psnrs,
-        actual == expected
-    );
-    for (i, psnr) in psnrs.iter().enumerate() {
-        assert!(
-            *psnr >= 40.0,
-            "frame {i}: {psnr:.2} dB against the own-context encode"
+    for ((expected, actual), b_frames) in expected.iter().zip(&actual).zip(&b_frame_counts) {
+        let expected_frames = decode_all(&own, expected)?;
+        let actual_frames = decode_all(&own, actual)?;
+        assert_eq!(actual_frames.len(), ENCODE_FRAMES as usize, "frame count");
+        assert_eq!(expected_frames.len(), actual_frames.len(), "frame count");
+        let psnrs: Vec<f64> = actual_frames
+            .iter()
+            .zip(&expected_frames)
+            .map(|(a, e)| luma_psnr(a, e))
+            .collect();
+        println!(
+            "adopted vs own encode, {b_frames} B-frames, luma PSNR per frame: {:?}; streams \
+             bit-identical: {}",
+            psnrs,
+            actual == expected
         );
+        for (i, psnr) in psnrs.iter().enumerate() {
+            assert!(
+                *psnr >= 40.0,
+                "{b_frames} B-frames, frame {i}: {psnr:.2} dB against the own-context encode"
+            );
+        }
     }
     Ok(())
 }
@@ -448,7 +480,8 @@ fn encode_and_decode_on_one_adopted_device() -> Result<(), Box<dyn std::error::E
         app.physical_device,
         app.device.clone(),
     )?;
-    let stream = encode_all(&context, Wait::Gpu)?;
+    let b_frames = *b_frame_counts(&own).last().expect("never empty");
+    let stream = encode_all(&context, Wait::Gpu, b_frames)?;
     let actual = decode_all(&context, &stream)?;
     drop(context);
 

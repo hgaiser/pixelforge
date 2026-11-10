@@ -206,6 +206,19 @@ impl Encoder {
             FrameSource::External(external) => external.fills_input_image(),
             _ => true,
         };
+        // The release of a frame written in place is its encode, which with
+        // B-frames may come in a later call, after the sync_file for it had
+        // to be handed out.
+        #[cfg(feature = "dmabuf")]
+        if frame.signal_sync_file
+            && matches!(frame.source, FrameSource::Input(_))
+            && self.config().b_frames > 0
+        {
+            return Err(PixelForgeError::InvalidInput(
+                "with B-frames, a frame written into an input slot has no release sync_file"
+                    .to_string(),
+            ));
+        }
         let frame_slot = self.inner.common().pipeline.next_index();
 
         #[cfg_attr(not(feature = "dmabuf"), allow(unused_mut))]

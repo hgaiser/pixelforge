@@ -11,6 +11,9 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+/// What a constant QP is raised by for a B-frame that is not a reference.
+const B_FRAME_QP_OFFSET: u32 = 2;
+
 impl H265 {
     pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
@@ -248,7 +251,7 @@ impl H265 {
             short_term_ref_pic_set_idx: 0,
         };
 
-        let rc = RateControlPlan::new(&common.config, 26);
+        let rc = RateControlPlan::for_frame(&common.config, 26, plan, B_FRAME_QP_OFFSET, 51);
         let constant_qp = if rc.is_disabled() { rc.qp as i32 } else { 0 };
         let nalu_slice_entries = [vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
             .constant_qp(constant_qp)

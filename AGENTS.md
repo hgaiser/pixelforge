@@ -181,6 +181,62 @@ PIXELFORGE_MAX_ACTIVE_REFERENCES=1 cargo test --test rfi -- --ignored --nocaptur
 `RUST_LOG=pixelforge::encoder::codec=debug` reports the negotiated window and
 per-frame count, on the `Reference window` line.
 
+B-frames (`EncodeConfig::with_b_frames`, `tests/b_frames.rs`, the `_b_frames`
+tests in `tests/roundtrip.rs`) are encoded later than they are submitted. The
+planner (`src/encoder/gop.rs`) is pure code and has the unit tests for the
+order. What needs a device is the stream each codec writes, and the checks are
+ffmpeg's (dav1d's for AV1): decode with `-err_detect explode`, compare with
+pixelforge's decoder byte for byte, and compare the frame types `ffprobe`
+sees. Run the encode example with them when touching reference lists:
+
+```bash
+cargo run --example encode -- h264 --b-frames 7 --pyramid \
+    && ffmpeg -hide_banner -loglevel error -err_detect explode -i output.h264 -f null -
+```
+
+A wrong reference list does not always make ffmpeg report an error. It can
+decode cleanly to the wrong pictures, so also check the PSNR against the source
+with the command above: a B-frame that predicts from another picture than the
+encoder used drops it by 5 dB or more on those frames. To see what a driver
+wrote into a slice header, use
+`ffmpeg -i output.h264 -c copy -bsf:v trace_headers -f null -`.
+
+AV1 has no B-frame type. The reference frame after a group is encoded first as
+a hidden frame, whose bytes go in front of the next packet, and a
+`show_existing_frame` header made on the CPU shows it later
+(`src/encoder/av1/references.rs`). So AV1 packets are in display order, and
+`ffprobe` reports no B-frames for them.
+
+What the drivers do with B-frames, as far as it was checked:
+
+- NVIDIA (615.78.08) reports pyramid support for H.264 and AV1, and flat only
+  for H.265. So the H.265 pyramid does not run in the tests on that driver. It
+  did decode correctly there once with the capability check forced off.
+- An H.264 pyramid needs `ref_pic_list_modification` on the P-frame after it,
+  and drivers differ in how they write the operations they are given. NVIDIA
+  writes exactly the entries it gets: the end operation has to be one of them,
+  for the list operations, and then for the marking operations too. It ends
+  the marking operations by itself only in a P-slice with no list operations.
+  This is checked on NVIDIA only, so `implemented` in `src/encoder/bframes.rs`
+  offers the H.264 pyramid on that vendor only. Before offering it on another
+  driver, check the slice headers there with `trace_headers`.
+- NVIDIA's H.264 B-frames use forward prediction only (no skip, no direct, no
+  list 1), so they cost more bits than P-frames. ffmpeg's `h264_vulkan` with
+  `-bf 2` gives the same on that GPU, so it is the driver's and not
+  pixelforge's. H.265 and AV1 B-frames save bits there.
+- RADV and ANV were not available when B-frames were written. Nothing about
+  B-frames is checked on them.
+
+`scripts/compare_b0.sh` builds v0.11.0 in a worktree and compares its output
+with the working tree's for each codec, with CQP and CBR. Without B-frames the
+streams must be the same, except `h265-*-gop0`: there v0.11.0 gave the driver
+a picture order count that wrapped at 512, and the count no longer wraps. Run
+it after a change to the encode flow.
+
+A test binary that builds many contexts must call `common::init_logging()`
+first, also for another reason than logging: the NVIDIA driver can be loaded
+only about 26 times in one process, and that call keeps it loaded.
+
 Tests run one at a time (`RUST_TEST_THREADS=1` in `.cargo/config.toml`): the
 NVIDIA driver can deadlock when one thread destroys a device while another
 creates objects on a different one.

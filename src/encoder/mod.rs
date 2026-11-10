@@ -554,6 +554,12 @@ impl EncodeConfig {
     /// never returns. Keep the futures in a queue, and call
     /// [`Encoder::flush`] at the end of the stream before draining it.
     ///
+    /// Three more things change. [`Encoder::invalidate_reference_frames`]
+    /// makes the next frame an IDR. A DMA-BUF is copied at submit and not
+    /// read directly. And a frame written into an
+    /// [`InputSlot`] cannot ask for a release sync_file,
+    /// because the encode that reads it may come later than the call.
+    ///
     /// [`Encoder::new`] returns an error if the device cannot encode
     /// B-frames for the profile; see
     /// [`VideoContext::supports_b_frames`](crate::VideoContext::supports_b_frames).
@@ -655,9 +661,13 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
-    /// Presentation timestamp.
+    /// Presentation timestamp: the number of the frame in the order it was
+    /// submitted.
     pub pts: u64,
-    /// Decode timestamp.
+    /// Decode timestamp. Equal to `pts` without B-frames, and for AV1,
+    /// whose packets are in display order. With B-frames in H.264 and H.265
+    /// it counts the packets, and starts below zero so that it is never
+    /// after `pts`.
     pub dts: i64,
     /// Stats about the packet.
     pub stats: EncodedPacketStats,

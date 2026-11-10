@@ -11,6 +11,10 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+/// What a constant quantizer index is raised by for a B-frame that is not a
+/// reference. About the step that 2 is for an H.264 QP.
+const B_FRAME_Q_INDEX_OFFSET: u32 = 8;
+
 impl Av1 {
     pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_key_frame = plan.is_idr();
@@ -36,7 +40,7 @@ impl Av1 {
             current_dpb_slot
         );
 
-        let rc = RateControlPlan::new(&common.config, 128);
+        let rc = RateControlPlan::for_frame(&common.config, 128, plan, B_FRAME_Q_INDEX_OFFSET, 255);
         let qp = rc.qp;
 
         unsafe {

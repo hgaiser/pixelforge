@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add B-frame encoding for H.264, H.265 and AV1: `EncodeConfig::with_b_frames`, at most `MAX_B_FRAMES`.
+- Add B-frame pyramids: `EncodeConfig::with_b_frame_references` and `BFrameReferences`.
+- Add `VideoContext::supports_b_frames` and `BFrameSupport`.
+- Add `--b-frames` and `--pyramid` to the `encode` example.
+
+### Changed
+
+- **Breaking:** `EncodedPacket::dts` is an `i64`. With B-frames it starts below zero.
+- **Breaking:** A future from `Encoder::submit` resolves with the next packet in decode order. With B-frames that is not the packet of the submitted frame.
+- With B-frames, `Encoder::invalidate_reference_frames` makes the next frame an IDR.
+- With B-frames, a DMA-BUF input is always copied.
+- H.265 streams with more than 256 frames between two IDR frames differ from 0.11.0: the encoder now gets the picture order count without a wrap.
+
+### Fixed
+
+- Fix the H.264 decoder's reorder depth for streams without a VUI.
+
 ## [0.11.0] - 06-11-2026
 
 ### Added

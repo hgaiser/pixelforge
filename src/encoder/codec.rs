@@ -614,6 +614,30 @@ impl RateControlPlan {
         }
     }
 
+    /// The decision for the frame `plan`. With a constant quantizer, a
+    /// B-frame gets a coarser one: no frame, or fewer frames, predict from
+    /// it, so its bits buy less. `b_offset` is what is added for a B-frame
+    /// that is not a reference, and half of it for one that is; `max` is
+    /// the largest quantizer the codec has.
+    pub fn for_frame(
+        config: &EncodeConfig,
+        controller_default_qp: u32,
+        plan: &FramePlan,
+        b_offset: u32,
+        max: u32,
+    ) -> Self {
+        let mut rc = Self::new(config, controller_default_qp);
+        if rc.is_disabled() && plan.is_b() {
+            let offset = if plan.is_reference() {
+                b_offset / 2
+            } else {
+                b_offset
+            };
+            rc.qp = (rc.qp + offset).min(max);
+        }
+        rc
+    }
+
     pub fn is_disabled(&self) -> bool {
         self.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
     }

@@ -11,6 +11,9 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+/// What a constant QP is raised by for a B-frame that is not a reference.
+const B_FRAME_QP_OFFSET: u32 = 2;
+
 impl H264 {
     pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
@@ -35,7 +38,7 @@ impl H264 {
             common.current_dpb_slot
         );
 
-        let rc = RateControlPlan::new(&common.config, 26);
+        let rc = RateControlPlan::for_frame(&common.config, 26, plan, B_FRAME_QP_OFFSET, 51);
 
         // Reference frame invalidation: emit MMCO "unmark short-term" operations
         // for references dropped since the last frame, so the decoder evicts the
@@ -127,9 +130,10 @@ impl H264 {
             ),
         };
 
-        let slice_qp_delta = match common.config.rate_control {
-            crate::encoder::RateControl::Cqp { qp } => (qp as i32 - 26) as i8,
-            _ => 0,
+        let slice_qp_delta = if rc.is_disabled() {
+            (rc.qp as i32 - 26) as i8
+        } else {
+            0
         };
 
         let slice_header = ash::vk::native::StdVideoEncodeH264SliceHeader {

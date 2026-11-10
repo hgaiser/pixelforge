@@ -18,13 +18,13 @@
 //! - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 //! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 //! - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
+//! - **B-frames**: for all three codecs, flat or as a pyramid, where the
+//!   device can encode them. Off by default, since they add latency.
 //! - **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 //! - **Utility helpers**: [`YuvUploader`] for easy YUV data upload to GPU.
 //! - **Optional DMA-BUF input**: import a producer's buffers, or allocate buffers
 //!   for it, read with no copy where the driver allows, with sync_file fences
 //!   (Linux only).
-//!
-//! > **Note**: B-frame encoding is not yet implemented, so there is no option for it.
 //!
 //! # Supported Codecs
 //!
@@ -262,6 +262,63 @@
 //!   CPU, waits for that itself.
 //! - a `DmaBufImage`, a DMA-BUF (see below).
 //!
+//! ## B-frames
+//!
+//! [`EncodeConfig::with_b_frames`] puts B-frames between two reference
+//! frames. A B-frame predicts from the frame shown before it and from the one
+//! shown after it, which costs fewer bits, and it costs latency: the encoder
+//! has to wait for the later frame. [`VideoContext::supports_b_frames`] says
+//! what the device can do for a codec, and [`Encoder::new`] returns an error
+//! for more than that.
+//!
+//! ```no_run
+//! # use std::collections::VecDeque;
+//! # use pixelforge::{Encoder, Frame, SourceImage};
+//! # fn encode(encoder: &mut Encoder, frames: &[SourceImage]) -> Result<(), Box<dyn std::error::Error>> {
+//! let b_frames = encoder.config().b_frames as usize;
+//! let mut pending = VecDeque::new();
+//! for frame in frames {
+//!     pending.push_back(encoder.submit(Frame::image(frame))?);
+//!     // A B-frame is encoded once the frame after its group is submitted,
+//!     // so the oldest future is only sure to resolve this many submits
+//!     // later. Waiting for it sooner never returns.
+//!     while pending.len() > b_frames + 1 {
+//!         let packet = pollster::block_on(pending.pop_front().unwrap())?;
+//!         // Write `packet.data`. The packets come in decode order.
+//!     }
+//! }
+//! // Encode the frames that still wait, then take the rest.
+//! encoder.flush()?;
+//! for future in pending {
+//!     let packet = pollster::block_on(future)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! What changes with B-frames:
+//!
+//! - The future of the k-th submitted frame resolves with the k-th packet of
+//!   the stream, in decode order. That is the packet of another frame, and
+//!   [`EncodedPacket::pts`] says which.
+//! - For H.264 and H.265, [`EncodedPacket::dts`] counts in decode order and
+//!   starts below zero, so it is never after `pts`. An AV1 stream has no
+//!   reordering of its own: its packets are in display order, with
+//!   `dts == pts`, and the frame encoded ahead travels hidden in an earlier
+//!   packet.
+//! - [`Encoder::request_idr`], [`Encoder::flush`], [`Encoder::repeat`] and
+//!   [`Encoder::reconfigure`] encode the frames that wait at once, as a
+//!   shorter group.
+//! - [`Encoder::invalidate_reference_frames`] makes the next frame an IDR.
+//! - A DMA-BUF is copied when it is submitted and never read directly, so
+//!   the producer gets its buffer back at once.
+//! - With a constant QP, a B-frame gets a slightly higher QP than the
+//!   other frames.
+//!
+//! How much B-frames save depends on the driver. On NVIDIA (615.78.08) they
+//! save bits with H.265 and AV1. With H.264 that driver predicts a B-frame
+//! from one direction only, and the stream gets larger than without them.
+//!
 //! ## Encoding on your own device
 //!
 //! An application that already renders with Vulkan can give pixelforge its own
@@ -359,8 +416,8 @@
 //!
 //! # TODO's
 //!
-//! 1. [] H.265 and AV1 decoding.
-//! 1. [] B-frames support (encode).
+//! 1. [] Recovery from lost frames without an IDR when B-frames are in use.
+//! 1. [] Open GOPs.
 //!
 //! # Contributing
 //!
