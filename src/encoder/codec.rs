@@ -31,7 +31,8 @@ use crate::encoder::resources::{
 };
 use crate::encoder::rgb::RgbConversionCaps;
 use crate::encoder::{
-    BFrameSupport, ColorDescription, EncodeConfig, FrameType, RateControl, StreamColor,
+    BFrameSupport, ColorDescription, EncodeConfig, EncodedPacket, EncodedPacketStats, FrameType,
+    RateControl, StreamColor,
 };
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
@@ -106,6 +107,9 @@ pub(crate) struct EncoderCommon {
     /// The point the last encode submission signals. `None` until the frame
     /// being encoded was submitted.
     pub encode_point: Option<TimelinePoint>,
+    /// The frames that were encoded and are not shown yet, see
+    /// [`VideoCodec::HIDDEN_FRAMES`].
+    pub hidden_frames: Vec<HiddenFrame>,
     /// The session's video profile, for images made after creation.
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub profile: EncodeProfile,
@@ -476,6 +480,16 @@ pub(crate) struct QueuedFrame {
     pub display_order: u64,
 }
 
+/// A frame that was encoded before frames shown earlier, in a codec that
+/// hides such a frame until its turn (see [`VideoCodec::HIDDEN_FRAMES`]).
+pub(crate) struct HiddenFrame {
+    pub display_order: u64,
+    /// The packet that shows the frame.
+    pub show_packet: Vec<u8>,
+    /// When the frame was submitted, for the packet's latency.
+    pub submitted: std::time::Instant,
+}
+
 /// Everything a single frame needs to know about its schedule, so the codec
 /// hooks all see a consistent view.
 pub(crate) struct FramePlan {
@@ -487,6 +501,9 @@ pub(crate) struct FramePlan {
     /// How far decode order runs ahead of display order, which the DTS is
     /// shifted back by so it is never after the PTS.
     pub reorder_delay: u32,
+    /// Whether the frame is encoded now and shown later, by a packet of its
+    /// own. Only with [`VideoCodec::HIDDEN_FRAMES`].
+    pub hidden: bool,
 }
 
 impl FramePlan {
@@ -602,6 +619,21 @@ impl RateControlPlan {
 /// parameter caches). The generic driver calls these hooks in order around each
 /// frame; everything else (slot rotation, upload, readback, teardown) is shared.
 pub(crate) trait VideoCodec: Sized + Send {
+    /// Whether the codec has no reordering of its own, and hides a frame
+    /// that is encoded before frames shown earlier (AV1).
+    ///
+    /// Such a frame has no packet: its bitstream goes in front of the next
+    /// packet. When its turn to be shown comes, a packet from
+    /// [`Self::show_packet`] shows it. So the packets are in display order,
+    /// and their decode timestamps are their presentation timestamps.
+    const HIDDEN_FRAMES: bool = false;
+
+    /// The packet that shows the hidden frame `plan`, which was just encoded
+    /// into `dpb_slot`. Only called with [`Self::HIDDEN_FRAMES`].
+    fn show_packet(&self, _plan: &FramePlan, _dpb_slot: u8) -> Vec<u8> {
+        Vec::new()
+    }
+
     /// Per-frame prologue: codec IDR/key-frame resets and header retrieval.
     /// Runs before recording; returns the packet's frame type and header.
     fn begin_picture(
@@ -737,20 +769,32 @@ impl<C: VideoCodec> CodecEncoder<C> {
         ready: Vec<(QueuedFrame, GopPosition)>,
     ) -> Result<Vec<(u64, TimelinePoint)>> {
         let reorder_delay = self.common.gop.reorder_delay();
+        // A frame is hidden if a frame after it in this order is shown
+        // before it. A group is always handed over whole, so the frames
+        // after it are all here.
+        let display_orders: Vec<u64> = ready.iter().map(|(q, _)| q.display_order).collect();
         let mut encoded = Vec::with_capacity(ready.len());
-        let mut ready = ready.into_iter();
-        while let Some((queued, gop)) = ready.next() {
+        let mut ready = ready.into_iter().enumerate();
+        while let Some((index, (queued, gop))) = ready.next() {
             let plan = FramePlan {
                 gop,
                 display_order: queued.display_order,
                 encode_index: self.common.encode_frame_num,
                 reorder_delay,
+                hidden: C::HIDDEN_FRAMES
+                    && display_orders[index + 1..]
+                        .iter()
+                        .any(|&later| later < queued.display_order),
             };
             let slot = queued.frame.slot;
-            match self.encode_planned(queued.frame, &plan) {
+            let result = self
+                .encode_planned(queued.frame, &plan)
+                .and_then(|point| self.show_hidden_frames(&plan).map(|()| point));
+            match result {
                 Ok(point) => encoded.push((plan.display_order, point)),
                 Err(e) => {
-                    let left = ready.map(|(queued, _)| queued);
+                    self.common.hidden_frames.clear();
+                    let left = ready.map(|(_, (queued, _))| queued);
                     let waiting = self.common.gop.abandon();
                     self.common.pipeline.release(slot);
                     for queued in left.chain(waiting) {
@@ -770,24 +814,74 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.encode_ready(ready).map(|_| ())
     }
 
+    /// After the shown frame `plan`, show the hidden frames whose turn it
+    /// is: those that come next in display order. Each gets a packet made
+    /// here, with no encode.
+    fn show_hidden_frames(&mut self, plan: &FramePlan) -> Result<()> {
+        if plan.hidden {
+            return Ok(());
+        }
+        let mut next = plan.display_order + 1;
+        while let Some(index) = self
+            .common
+            .hidden_frames
+            .iter()
+            .position(|hidden| hidden.display_order == next)
+        {
+            let hidden = self.common.hidden_frames.swap_remove(index);
+            let latency = hidden.submitted.elapsed().as_nanos() as u64;
+            self.common.pipeline.submit_synthetic(EncodedPacket {
+                data: hidden.show_packet,
+                frame_type: FrameType::P,
+                pts: hidden.display_order,
+                dts: hidden.display_order as i64,
+                stats: EncodedPacketStats {
+                    gpu_time_ns: None,
+                    frame_latency_ns: latency,
+                    wall_latency_ns: 0,
+                },
+            })?;
+            next += 1;
+        }
+        Ok(())
+    }
+
     /// Encode `frame` now, as `plan` says. Returns the point its encode
     /// submission signals. An error means that nothing was submitted.
     fn encode_planned(&mut self, frame: HeldFrame, plan: &FramePlan) -> Result<TimelinePoint> {
         let submitted = frame.submitted;
-        self.common.begin_encode(frame, Delivery::Packet);
+        let delivery = if plan.hidden {
+            Delivery::Carry
+        } else {
+            Delivery::Packet
+        };
+        self.common.begin_encode(frame, delivery);
 
         let setup = self.codec.begin_picture(&mut self.common, plan)?;
         self.common.set_pending_metadata(SlotPacketMetadata {
             frame_type: plan.frame_type(),
             pts: plan.display_order,
-            dts: plan.dts(),
+            // With hidden frames the packets are in display order.
+            dts: if C::HIDDEN_FRAMES {
+                plan.display_order as i64
+            } else {
+                plan.dts()
+            },
             header: setup.header,
             timestamps: [0; 2],
             now: submitted,
         });
 
+        let dpb_slot = self.common.current_dpb_slot;
         self.codec.record_picture(&mut self.common, plan)?;
         self.common.encode_frame_num += 1;
+        if plan.hidden {
+            self.common.hidden_frames.push(HiddenFrame {
+                display_order: plan.display_order,
+                show_packet: self.codec.show_packet(plan, dpb_slot),
+                submitted,
+            });
+        }
         self.codec.end_picture(&mut self.common, plan);
         Ok(self
             .common
@@ -1297,6 +1391,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         source: SourceBinding::default(),
         delivery: Delivery::Packet,
         encode_point: None,
+        hidden_frames: Vec::new(),
         profile: req.profile,
         rgb_input: req.rgb_input,
     };

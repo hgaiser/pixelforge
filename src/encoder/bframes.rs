@@ -76,8 +76,7 @@ pub(crate) fn check_support(config: &EncodeConfig, support: BFrameSupport) -> Re
 /// device can.
 fn implemented(codec: Codec) -> BFrameSupport {
     match codec {
-        Codec::H264 | Codec::H265 => BFrameSupport::Flat,
-        Codec::AV1 => BFrameSupport::None,
+        Codec::H264 | Codec::H265 | Codec::AV1 => BFrameSupport::Flat,
     }
 }
 

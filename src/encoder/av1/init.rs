@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::vulkan::VideoContext;
 use ash::vk;
 use ash::vk::TaggedStructure;
-use tracing::info;
+use tracing::{debug, info};
 
 impl Av1 {
     /// Create a new AV1 encoder.
@@ -75,16 +75,36 @@ impl Av1 {
         })?;
         let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
+        // The past references of a frame that predicts from both directions:
+        // what the device allows for the names before `BWDREF`, less the one
+        // future reference.
+        let bidirectional_past_count = av1_caps
+            .max_bidirectional_compound_group1_reference_count
+            .min(
+                av1_caps
+                    .max_bidirectional_compound_reference_count
+                    .saturating_sub(1),
+            )
+            .min(init.session_active_references.saturating_sub(1));
+        debug!(
+            "AV1 bidirectional prediction: {} references ({} past names, {} future names), \
+             name mask {:#09b}",
+            av1_caps.max_bidirectional_compound_reference_count,
+            av1_caps.max_bidirectional_compound_group1_reference_count,
+            av1_caps.max_bidirectional_compound_group2_reference_count,
+            av1_caps.bidirectional_compound_reference_name_mask
+        );
         let common = init.common;
 
         let codec = Av1 {
             frame_num: 0,
-            order_hint: 0,
             header_data: None,
             references: Vec::new(),
             reference_window,
             active_reference_count,
             single_reference_name_mask: av1_caps.single_reference_name_mask,
+            bidirectional_reference_name_mask: av1_caps.bidirectional_compound_reference_name_mask,
+            bidirectional_past_count,
         };
 
         let mut encoder = CodecEncoder { common, codec };

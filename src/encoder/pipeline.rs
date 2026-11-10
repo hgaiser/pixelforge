@@ -169,7 +169,6 @@ pub(crate) enum Delivery {
     Packet,
     /// In front of the next packet, in the same temporal unit: an AV1 frame
     /// that is not shown. It resolves no future.
-    #[allow(dead_code)]
     Carry,
 }
 
@@ -640,7 +639,6 @@ impl EncodePipeline {
 
     /// Resolve the oldest waiting future with a packet made on the CPU, after
     /// every packet submitted before it.
-    #[allow(dead_code)]
     pub(crate) fn submit_synthetic(&mut self, packet: EncodedPacket) -> Result<()> {
         let result_tx = self.senders.pop_front().ok_or_else(|| {
             PixelForgeError::InvalidInput(

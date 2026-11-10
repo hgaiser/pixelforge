@@ -13,12 +13,14 @@
 
 mod init;
 mod record;
+mod references;
 mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::error::Result;
+use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use references::{FrameReferences, bidirectional_references, show_existing_frame};
 
 /// Minimum bitstream buffer size.
 const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -38,7 +40,6 @@ pub(crate) struct ReferenceInfo {
 /// AV1-specific encoder state (multi-reference prediction).
 pub(crate) struct Av1 {
     frame_num: u32,
-    order_hint: u32,
     /// Cached sequence-header OBU (invalidated when session params change).
     header_data: Option<Vec<u8>>,
     /// References held in the DPB, most-recent first. Each frame predicts
@@ -52,6 +53,17 @@ pub(crate) struct Av1 {
     /// The reference names single-reference prediction may use (bit 0 is
     /// LAST), from `VkVideoEncodeAV1CapabilitiesKHR`.
     single_reference_name_mask: u32,
+    /// The reference names prediction from both directions may use.
+    bidirectional_reference_name_mask: u32,
+    /// How many references shown before it a frame that predicts from both
+    /// directions uses. It uses one shown after it.
+    bidirectional_past_count: u32,
+}
+
+/// The order hint of a frame: its place in display order since the key
+/// frame, in the 8 bits the sequence header gives it.
+fn order_hint(plan: &FramePlan) -> u32 {
+    (plan.pic_order_cnt() / 2) as u32 & 0xFF
 }
 
 impl Av1 {
@@ -76,9 +88,69 @@ impl Av1 {
         }
         names
     }
+
+    /// The references `plan` predicts from, under their names, and the
+    /// distinct ones among them. None for a key frame.
+    ///
+    /// A frame that predicts from one direction uses the newest references.
+    /// A B-frame uses the nearest ones shown before it and the nearest one
+    /// shown after it.
+    fn frame_references(&self, plan: &FramePlan) -> Result<(FrameReferences, Vec<ReferenceInfo>)> {
+        if plan.is_idr() || self.references.is_empty() {
+            let none = FrameReferences {
+                names: [-1; 7],
+                fill: [0; 2],
+            };
+            return Ok((none, Vec::new()));
+        }
+        if !plan.is_b() {
+            let newest = self.references[0].dpb_slot as i8;
+            let references = FrameReferences {
+                names: self.reference_names(),
+                fill: [newest; 2],
+            };
+            return Ok((references, self.used_references().to_vec()));
+        }
+
+        let shown = plan.display_order;
+        let mut past: Vec<ReferenceInfo> = self.references.to_vec();
+        past.retain(|r| r.display_order < shown);
+        past.sort_by_key(|r| std::cmp::Reverse(r.display_order));
+        let mut future: Vec<ReferenceInfo> = self.references.to_vec();
+        future.retain(|r| r.display_order > shown);
+        future.sort_by_key(|r| r.display_order);
+        let slots = |list: &[ReferenceInfo]| list.iter().map(|r| r.dpb_slot).collect::<Vec<u8>>();
+        let references = bidirectional_references(
+            &slots(&past),
+            &slots(&future),
+            self.bidirectional_reference_name_mask,
+            self.bidirectional_past_count as usize,
+        )
+        .ok_or_else(|| {
+            PixelForgeError::InvalidInput(format!(
+                "AV1 B-frame {shown} has {} references before it and {} after it",
+                past.len(),
+                future.len()
+            ))
+        })?;
+        let used = self
+            .references
+            .iter()
+            .filter(|r| references.names.contains(&i32::from(r.dpb_slot)))
+            .copied()
+            .collect();
+        Ok((references, used))
+    }
 }
 
 impl VideoCodec for Av1 {
+    const HIDDEN_FRAMES: bool = true;
+
+    fn show_packet(&self, _plan: &FramePlan, dpb_slot: u8) -> Vec<u8> {
+        // A reference's frame buffer in the stream is its DPB slot.
+        show_existing_frame(dpb_slot)
+    }
+
     fn begin_picture(
         &mut self,
         common: &mut EncoderCommon,
@@ -87,8 +159,13 @@ impl VideoCodec for Av1 {
         let is_key = plan.is_idr();
         if is_key {
             self.frame_num = 0;
-            self.order_hint = 0;
             self.references.clear();
+        }
+
+        // A hidden frame goes into the temporal unit of the next frame that
+        // is shown, after that frame's delimiter.
+        if plan.hidden {
+            return Ok(PictureSetup { header: None });
         }
 
         // Every temporal unit starts with a Temporal Delimiter OBU; key frames
@@ -114,14 +191,16 @@ impl VideoCodec for Av1 {
 
     fn end_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) {
         let is_key = plan.is_idr();
-        // Order hint used while recording this frame (pre-increment).
-        let encoded_order_hint = self.order_hint;
         self.frame_num += 1;
-        self.order_hint = (self.order_hint + 1) & 0xFF;
+        // A frame that is not a reference is in no frame buffer, and its DPB
+        // slot is free for the next frame.
+        if !plan.is_reference() {
+            return;
+        }
 
         let ref_info = ReferenceInfo {
             dpb_slot: common.current_dpb_slot,
-            order_hint: encoded_order_hint,
+            order_hint: order_hint(plan),
             display_order: plan.display_order,
             frame_type: if is_key {
                 ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
