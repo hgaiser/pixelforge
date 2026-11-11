@@ -11,7 +11,13 @@ cargo test -- --ignored        # device + ffmpeg tests, ignored by default
 cargo bench --bench encode
 cargo run --example encode -- h264
 cargo run --example decode -- input.264 output.yuv
+cargo run -p pixelforge-tools --bin encode -- h264 --b-frames 3
+cargo run -p pixelforge-tools --bin decode -- input.264 output.yuv
 ```
+
+The examples (`examples/`) are for users: short, one use each. The tools
+(`tools/`, a workspace crate that is not published) are for checking the
+library, with every option that takes. The commands below use the tools.
 
 Decoding on Intel Arc under Mesa needs the video queues enabled explicitly:
 `ANV_DEBUG=video-decode,video-encode`.
@@ -31,7 +37,7 @@ Do not edit `README.md` directly; update the doc comments in `src/lib.rs` instea
 To verify the quality of the encoded videos, run:
 
 ```bash
-cargo run --example encode -- h265 \
+cargo run -p pixelforge-tools --bin encode -- h265 \
     && rm -f decoded.yuv \
     && ffmpeg -hide_banner -loglevel error -y -i output.h265 -pix_fmt yuv420p -f rawvideo decoded.yuv \
     && ffmpeg -hide_banner -loglevel info -s 320x240 -pix_fmt yuv420p -f rawvideo -i testdata/test_frames.yuv -s 320x240 -pix_fmt yuv420p -f rawvideo -i decoded.yuv -lavfi psnr -f null -
@@ -41,18 +47,18 @@ To verify decoding, decode a stream and compare against ffmpeg's software
 decoder, which should be byte-identical:
 
 ```bash
-cargo run --example decode -- tests/data/bframes.264 out.yuv \
+cargo run -p pixelforge-tools --bin decode -- tests/data/bframes.264 out.yuv \
     && ffmpeg -hide_banner -loglevel error -y -i tests/data/bframes.264 -pix_fmt nv12 ref.yuv \
     && cmp ref.yuv out.yuv && echo "decode matches ffmpeg"
 ```
 
-The `decode` example picks the codec from the extension (`.264`, `.265`,
+The `decode` tool picks the codec from the extension (`.264`, `.265`,
 `.obu`, `.ivf`). For AV1 the reference is dav1d, and `-noautoscale` keeps a
 stream that changes size from being scaled to its first size (it applies to
 any codec; H.264 and H.265 streams in `tests/data` do not change size):
 
 ```bash
-cargo run --example decode -- tests/data/av1/aom_altref.obu out.yuv \
+cargo run -p pixelforge-tools --bin decode -- tests/data/av1/aom_altref.obu out.yuv \
     && ffmpeg -hide_banner -loglevel error -y -c:v libdav1d -i tests/data/av1/aom_altref.obu \
         -noautoscale -pix_fmt nv12 ref.yuv \
     && cmp ref.yuv out.yuv && echo "decode matches dav1d"
@@ -60,8 +66,9 @@ cargo run --example decode -- tests/data/av1/aom_altref.obu out.yuv \
 
 `tests/decode_streams.rs` does this for every fixture in `tests/data` (use
 `p010le` for the 10-bit ones), and `tests/roundtrip.rs` for each codec's own
-encoder output. A run with `PIXELFORGE_NO_UNIFIED_LAYOUTS=1` set takes the
-copying path below.
+encoder output. Those tests take whichever path the device has; the
+`PIXELFORGE_NO_UNIFIED_LAYOUTS` switch below is read by the `decode` tool
+only.
 
 On NVIDIA (615.78.08) the AV1 decoder does not copy the `StdVideoAV1SequenceHeader`
 handed to `vkCreateVideoSessionParametersKHR`: it reads it again at every
@@ -76,7 +83,7 @@ with no copy. Where it does not, they are copied into private images. Force the
 copying path to exercise it on hardware that would otherwise never take it:
 
 ```bash
-PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run --example decode -- \
+PIXELFORGE_NO_UNIFIED_LAYOUTS=1 cargo run -p pixelforge-tools --bin decode -- \
     tests/data/bframes.264 out.yuv && cmp ref.yuv out.yuv
 ```
 
@@ -96,27 +103,25 @@ Do not judge that one by PSNR. The hardware sampler and ffmpeg reconstruct
 subsampled chroma differently, so they agree almost everywhere and disagree
 hard on pixels sitting on a colour edge; on the synthetic test patterns that
 drags PSNR to ~26 dB while the images are indistinguishable. Compare the share
-of pixels that agree instead. For `bframes.264` that has been 87.9% within 2
-and 33.2% exact on every device tested so far, and it is deterministic enough
-to treat a change in it as a regression.
+of pixels that agree instead (all three channels). For `bframes.264` that has
+been 87.9% within 2 on every device tested so far, and it is deterministic
+enough to treat a change in it as a regression.
 
-`sample_planes` is the other half of that story, and the tighter test. It reads
-the same frames through per-plane views, with no ycbcr conversion and no sampler
-at all, and writes the samples straight through, so its output is plain NV12 and
-can be compared exactly:
+`tests/sample_planes.rs` is the other half of that story, and the tighter
+check. It reads the same frames through per-plane views, with no ycbcr
+conversion and no sampler at all, and compares the samples byte for byte with
+`YuvDownloader`'s copy of each frame, on both decode paths:
 
 ```bash
-cargo run --example sample_planes -- tests/data/bframes.264 out.yuv \
-    && cmp ref.yuv out.yuv && echo "plane views match the decoder"
+cargo test --test sample_planes -- --ignored --nocapture
 ```
 
-Where that example is worth extra attention: on a device *without*
-`VK_KHR_unified_image_layouts`, its frames are pool copies, which carry no video
-usage, so a mistake in how a plane view is created passes silently. The same
-mistake is an immediate validation error on a device that has the extension,
-because there the frame really is the decoder's DPB image. So if a device
-supporting it is available, run this example there before trusting a green run
-elsewhere. `RUST_LOG=debug` reports which case applies, as `pinnable=`.
+On a device *without* `VK_KHR_unified_image_layouts`, its frames are pool
+copies, which carry no video usage, so a mistake in how a plane view is created
+passes silently. The same mistake is an immediate validation error on a device
+that has the extension, because there the frame really is the decoder's DPB
+image. So if a device supporting it is available, run it there under
+validation before trusting a green run elsewhere.
 
 Nothing in `tests/data` changes resolution mid-stream, and that path has its
 own hazards, so build one and check it:
@@ -125,11 +130,11 @@ own hazards, so build one and check it:
 ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 a.264
 ffmpeg -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 -c:v libx264 -bf 2 -f h264 b.264
 cat a.264 b.264 > switch.264
-cargo run --example decode -- switch.264 out.yuv
+cargo run -p pixelforge-tools --bin decode -- switch.264 out.yuv
 ```
 
 Sixty frames, thirty at each size, and one `generation N -> N+1` line at the
-changeover. Run `sample_frame` and `sample_planes` over it too: a consumer's own
+changeover. Run `sample_frame` over it too: a consumer's own
 images are sized from a frame, so a resolution change is where they have to be
 rebuilt, and getting that wrong is silent rather than loud. Build the reference per segment, since ffmpeg rescales a
 resolution-changing stream to its first size and a whole-stream reference will
@@ -194,10 +199,10 @@ planner (`src/encoder/gop.rs`) is pure code and has the unit tests for the
 order. What needs a device is the stream each codec writes, and the checks are
 ffmpeg's (dav1d's for AV1): decode with `-err_detect explode`, compare with
 pixelforge's decoder byte for byte, and compare the frame types `ffprobe`
-sees. Run the encode example with them when touching reference lists:
+sees. Run the encode tool with them when touching reference lists:
 
 ```bash
-cargo run --example encode -- h264 --b-frames 7 --pyramid \
+cargo run -p pixelforge-tools --bin encode -- h264 --b-frames 7 --pyramid \
     && ffmpeg -hide_banner -loglevel error -err_detect explode -i output.h264 -f null -
 ```
 
@@ -291,7 +296,9 @@ view by image handle, and only RADV without validation showed it.
 
 ## Project Structure
 - `src/` - Library source code
-- `examples/` - Usage examples for encoding and decoding
+- `examples/` - Short usage examples, one use each
+- `tools/` - Command-line tools to check the library (workspace crate, not
+  published)
 - `tests/` - Integration tests; the device + ffmpeg checks are `#[ignore]`d and
   run with `cargo test -- --ignored`
 - `benches/` - The encode timing/throughput benchmark (`cargo bench`)

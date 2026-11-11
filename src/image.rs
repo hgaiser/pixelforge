@@ -1,4 +1,7 @@
-//! Image utilities for creating and uploading video frames.
+//! Image utilities for moving video frames between the CPU and the GPU.
+//!
+//! [`YuvDownloader`] does the reverse of [`YuvUploader`]: it copies decoded
+//! frames back to the CPU.
 //!
 //! This module provides [`YuvUploader`], a helper for uploading YUV data from the CPU
 //! to the GPU. The image it creates is a transfer-only staging image (not a Vulkan Video
@@ -9,6 +12,7 @@
 //! encoder's [`InputSlot`] (from
 //! [`Encoder::input_slot`](crate::encoder::Encoder::input_slot)).
 
+use crate::decoder::DecodedFrame;
 use crate::encoder::{BitDepth, ChromaFormat, Encoder, Handoff, InputSlot, Source, SourceImage};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -669,6 +673,332 @@ impl Drop for YuvUploader {
             device.free_memory(self.staging_memory, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// A decoded frame's samples in CPU memory, from [`YuvDownloader::download`].
+///
+/// Two planes, cropped to the visible size, with no padding between rows:
+/// writing [`y`](Self::y) and then [`uv`](Self::uv) gives the frame as NV12
+/// (P010 for 10 bits, each sample a little-endian 16-bit word with the value
+/// in its high 10 bits).
+#[derive(Debug, Clone)]
+pub struct DownloadedFrame {
+    /// The luma plane: `height` rows of `width` samples.
+    pub y: Vec<u8>,
+    /// The chroma plane: Cb and Cr samples interleaved, at the chroma
+    /// format's resolution. For 4:2:0, `ceil(height / 2)` rows of
+    /// `ceil(width / 2)` pairs.
+    pub uv: Vec<u8>,
+    /// The visible width in pixels.
+    pub width: u32,
+    /// The visible height in pixels.
+    pub height: u32,
+    /// The chroma format of the samples.
+    pub chroma_format: ChromaFormat,
+    /// The bit depth of the samples.
+    pub bit_depth: BitDepth,
+}
+
+/// Copies decoded frames from the GPU into CPU memory.
+///
+/// For when the samples are needed on the CPU: to write them to a file, to
+/// compare them in a test, or to process them in software. Not for showing a
+/// frame: a renderer samples [`DecodedFrame::image`] where it is, and a copy
+/// to the CPU only adds latency and bandwidth.
+///
+/// Each [`download`](Self::download) submits a copy on the transfer queue and
+/// waits for it. The decoder submits to the same queue when it copies
+/// pictures out, so call it from the thread that drives the decoder.
+pub struct YuvDownloader {
+    context: VideoContext,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// Staging buffer, its memory and its size, made larger when a frame
+    /// needs more.
+    staging: Option<(vk::Buffer, vk::DeviceMemory, usize)>,
+}
+
+impl YuvDownloader {
+    /// A downloader for frames decoded on `context`.
+    pub fn new(context: &VideoContext) -> Result<Self> {
+        let device = context.device();
+        let command_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(context.transfer_queue_family())
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(PixelForgeError::vk("vkCreateCommandPool"))?;
+        let command_buffer = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(PixelForgeError::vk("vkAllocateCommandBuffers"))?[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(PixelForgeError::vk("vkCreateFence"))?;
+        Ok(Self {
+            context: context.clone(),
+            command_pool,
+            command_buffer,
+            fence,
+            staging: None,
+        })
+    }
+
+    /// Copy `frame` into CPU memory, and return its visible region.
+    pub fn download(&mut self, frame: &DecodedFrame) -> Result<DownloadedFrame> {
+        let bytes = match frame.bit_depth {
+            BitDepth::Eight => 1usize,
+            BitDepth::Ten => 2,
+        };
+        // How many luma samples one chroma sample covers, across and down.
+        let (sub_x, sub_y) = match frame.chroma_format {
+            ChromaFormat::Yuv420 => (2, 2),
+            ChromaFormat::Yuv422 => (2, 1),
+            ChromaFormat::Yuv444 => (1, 1),
+        };
+        // The whole coded image, so each plane is one contiguous copy.
+        let (coded_width, coded_height) = (frame.coded_width, frame.coded_height);
+        let (chroma_width, chroma_height) = (coded_width / sub_x, coded_height / sub_y);
+        let y_stride = coded_width as usize * bytes;
+        let y_size = y_stride * coded_height as usize;
+        let uv_stride = chroma_width as usize * 2 * bytes;
+        let uv_size = uv_stride * chroma_height as usize;
+        let (buffer, memory) = self.staging(y_size + uv_size)?;
+
+        let plane = |aspect, offset: usize, width, height| {
+            vk::BufferImageCopy::default()
+                .buffer_offset(offset as u64)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    base_array_layer: frame.array_layer,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+        };
+        let regions = [
+            plane(vk::ImageAspectFlags::PLANE_0, 0, coded_width, coded_height),
+            plane(
+                vk::ImageAspectFlags::PLANE_1,
+                y_size,
+                chroma_width,
+                chroma_height,
+            ),
+        ];
+
+        // GENERAL, where the decoder hands over its own image, is a valid
+        // source for a copy. Any other layout is an image of this frame's
+        // own, so moving it and back is safe.
+        let transition = frame.layout != vk::ImageLayout::GENERAL;
+        let barrier = |from, to, src_access, dst_access| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(to)
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(frame.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: frame.array_layer,
+                    layer_count: 1,
+                })
+        };
+        let copy_layout = if transition {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        } else {
+            frame.layout
+        };
+
+        let device = self.context.device();
+        let command_buffer = self.command_buffer;
+        unsafe {
+            device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
+            device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
+            if transition {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        frame.layout,
+                        copy_layout,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_READ,
+                    )],
+                );
+            }
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                frame.image,
+                copy_layout,
+                buffer,
+                &regions,
+            );
+            if transition {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        copy_layout,
+                        frame.layout,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::empty(),
+                    )],
+                );
+            }
+            device
+                .end_command_buffer(command_buffer)
+                .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
+            let submit =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+            device
+                .queue_submit(self.context.transfer_queue(), &[submit], self.fence)
+                .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
+            device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(PixelForgeError::vk("vkWaitForFences"))?;
+            device
+                .reset_fences(&[self.fence])
+                .map_err(PixelForgeError::vk("vkResetFences"))?;
+        }
+
+        // Crop to the visible region: the image has the coded size, padded
+        // up to the codec's block size. An odd size rounds the chroma up.
+        let visible_y = frame.width as usize * bytes;
+        let visible_uv = frame.width.div_ceil(sub_x) as usize * 2 * bytes;
+        let uv_rows = frame.height.div_ceil(sub_y) as usize;
+        let mut y = Vec::with_capacity(visible_y * frame.height as usize);
+        let mut uv = Vec::with_capacity(visible_uv * uv_rows);
+        unsafe {
+            // The whole allocation: a smaller range has to respect
+            // `nonCoherentAtomSize`.
+            let data = device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(PixelForgeError::vk("vkMapMemory"))? as *const u8;
+            for row in 0..frame.height as usize {
+                y.extend_from_slice(std::slice::from_raw_parts(
+                    data.add(row * y_stride),
+                    visible_y,
+                ));
+            }
+            for row in 0..uv_rows {
+                uv.extend_from_slice(std::slice::from_raw_parts(
+                    data.add(y_size + row * uv_stride),
+                    visible_uv,
+                ));
+            }
+            device.unmap_memory(memory);
+        }
+        Ok(DownloadedFrame {
+            y,
+            uv,
+            width: frame.width,
+            height: frame.height,
+            chroma_format: frame.chroma_format,
+            bit_depth: frame.bit_depth,
+        })
+    }
+
+    /// The staging buffer, with room for `size` bytes.
+    fn staging(&mut self, size: usize) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+        if let Some((buffer, memory, capacity)) = self.staging
+            && capacity >= size
+        {
+            return Ok((buffer, memory));
+        }
+        let device = self.context.device();
+        unsafe {
+            // Each download waits for its copy, so the old buffer is free.
+            if let Some((buffer, memory, _)) = self.staging.take() {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            let buffer = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
+            let requirements = device.get_buffer_memory_requirements(buffer);
+            let Some(memory_type) = self.context.find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ) else {
+                device.destroy_buffer(buffer, None);
+                return Err(PixelForgeError::NoSuitableDevice(
+                    "no host-visible memory to download frames into".to_string(),
+                ));
+            };
+            let memory = match device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            ) {
+                Ok(memory) => memory,
+                Err(e) => {
+                    device.destroy_buffer(buffer, None);
+                    return Err(PixelForgeError::vulkan("vkAllocateMemory", e));
+                }
+            };
+            if let Err(e) = device.bind_buffer_memory(buffer, memory, 0) {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+                return Err(PixelForgeError::vulkan("vkBindBufferMemory", e));
+            }
+            self.staging = Some((buffer, memory, requirements.size as usize));
+            Ok((buffer, memory))
+        }
+    }
+}
+
+impl Drop for YuvDownloader {
+    fn drop(&mut self) {
+        let device = self.context.device();
+        unsafe {
+            // Each download waits for its copy, so nothing is in flight.
+            if let Some((buffer, memory, _)) = self.staging.take() {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            device.destroy_fence(self.fence, None);
+            device.destroy_command_pool(self.command_pool, None);
         }
     }
 }

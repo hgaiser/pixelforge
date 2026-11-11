@@ -9,6 +9,9 @@ keywords = ["vulkan", "video", "encoding", "decoding", "h264"]
 categories = ["multimedia::video", "graphics"]
 readme = "README.md"
 
+[workspace]
+members = [".", "tools"]
+
 [features]
 default = []
 dmabuf = []

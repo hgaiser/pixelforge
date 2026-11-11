@@ -16,7 +16,7 @@ use std::path::Path;
 
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
 use pixelforge::{Codec, VideoContextBuilder};
@@ -51,7 +51,7 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
         .require_decode(codec)
         .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
         .build()?;
-    let mut readback = Some(Readback::new(&context)?);
+    let mut readback = Some(pixelforge::YuvDownloader::new(&context)?);
     let mut output = Some(File::create(&output_path)?);
     let mut decoder = Decoder::new(context, DecodeConfig::new(codec).with_byte_stream())?;
     let stream = std::fs::read(&input)?;

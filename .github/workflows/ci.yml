@@ -24,7 +24,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build python3
 
       - name: Run cargo check
-        run: cargo check --all-targets --all-features
+        run: cargo check --workspace --all-targets --all-features
 
   test:
     name: Test Suite
@@ -59,7 +59,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build python3
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: Rustfmt

@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `VideoContext::supports_b_frames` and `BFrameSupport`.
 - Add `--b-frames` and `--pyramid` to the `encode` example.
 - Add `EncodeConfig::with_quality_level` and `VideoContext::encode_quality_levels`. The default stays 0, the fastest level. `Encoder::new` returns an error for a level the device does not have.
-- Add `--quality-level` to the `encode` example.
+- Add `YuvDownloader` and `DownloadedFrame`, to copy decoded frames to CPU memory: the reverse of `YuvUploader`.
+- Add the `encode_gpu` example: encode RGB frames that the application draws into its own Vulkan image.
+- Add the `tools` workspace crate (not published), with `encode` and `decode` tools that have the options for checking the library.
 
 ### Changed
+
+- The examples are short and show one use each. `encode` and `decode` lost their testing options (now in the tools), `query_capabilities` uses pixelforge's own queries, and `sample_planes` is now a test (`tests/sample_planes.rs`) that compares plane views with `YuvDownloader` on both decode paths.
 
 - **Breaking:** `EncodedPacket::dts` is an `i64`. With B-frames it starts below zero.
 - **Breaking:** A future from `Encoder::submit` resolves with the next packet in decode order. With B-frames that is not the packet of the submitted frame.

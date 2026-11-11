@@ -128,14 +128,14 @@ fn repeat_encodes_the_last_frame_again() -> Result<(), Box<dyn std::error::Error
     }
     assert_eq!(keys, [true, false, false, true, true]);
 
-    let mut readback = common::Readback::new(&context)?;
+    let mut readback = pixelforge::YuvDownloader::new(&context)?;
     let mut decoder = pixelforge::Decoder::new(
         context.clone(),
         pixelforge::DecodeConfig::new(pixelforge::Codec::H264).with_byte_stream(),
     )?;
     let mut means = Vec::new();
     common::decode_stream(&mut decoder, &stream, |frame| {
-        let y = readback.read(&frame)?.y;
+        let y = readback.download(&frame)?.y;
         means.push(y.iter().map(|&v| f64::from(v)).sum::<f64>() / y.len() as f64);
         Ok(())
     })?;

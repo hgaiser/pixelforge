@@ -27,7 +27,8 @@ H.265 and AV1, for both encode and decode.
 - **B-frames**: for all three codecs, flat or as a pyramid, where the
   device can encode them. Off by default, since they add latency.
 - **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
-- **Utility helpers**: [`YuvUploader`] for easy YUV data upload to GPU.
+- **Utility helpers**: [`YuvUploader`] to upload YUV frames to the GPU,
+  and [`YuvDownloader`] to copy decoded frames back to the CPU.
 - **Optional DMA-BUF input**: import a producer's buffers, or allocate buffers
   for it, read with no copy where the driver allows, with sync_file fences
   (Linux only).
@@ -181,8 +182,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 A live frame reserves a DPB slot, so
 [`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
 bounds how many can be outstanding before the decoder starts copying
-pictures out instead of handing over its own. Reading a frame back to the
-CPU is the consumer's job; `examples/common` shows one way.
+pictures out instead of handing over its own. To get a frame's samples on
+the CPU (for a file, a test or software processing), copy it with
+[`YuvDownloader`].
 
 ### RGB input
 
@@ -374,27 +376,27 @@ cargo bench --bench encode
 
 ## Examples
 
-Run the examples with:
-
 ```
-# Query codec capabilities
+# What this device can encode and decode
 cargo run --example query_capabilities
 
-# Decode H.264 to raw YUV
-cargo run --example decode -- input.264 output.yuv
-
-# Encode, choosing the codec (h264, h265 or av1)
+# Encode frames from CPU memory (h264, h265 or av1)
 cargo run --example encode -- h265
 
-# Sample decoded frames through a ycbcr conversion (RGBA output)
-cargo run --example sample_frame -- input.264 out.rgba
+# Encode frames that the application draws on the GPU
+cargo run --example encode_gpu -- h265
 
-# Sample decoded frames through per-plane views (NV12 output)
-cargo run --example sample_planes -- input.264 out.yuv
+# Decode a stream to a raw YUV file
+cargo run --example decode -- input.264 output.yuv
+
+# Decode and sample the frames in a shader, with no copy (RGBA output)
+cargo run --example sample_frame -- input.264 out.rgba
 ```
 
-Correctness checks that need a video device and ffmpeg are integration
-tests, ignored by default:
+The `tools` crate in the repository has command-line tools to check the
+library, with more options: `cargo run -p pixelforge-tools --bin encode`
+and `--bin decode`. Correctness checks that need a video device are
+integration tests, ignored by default:
 
 ```
 cargo test -- --ignored

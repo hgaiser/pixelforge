@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{decode_stream, write_nv12};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::{
@@ -263,7 +263,7 @@ fn roundtrip(
     // drains whatever the reorder buffer still holds at end of stream.
     let yuv_path = dir.join("out.yuv");
     let mut out = Some(File::create(&yuv_path)?);
-    let mut readback = Some(Readback::new(&context)?);
+    let mut readback = Some(pixelforge::YuvDownloader::new(&context)?);
     let mut decoder = Decoder::new(context, DecodeConfig::new(codec).with_byte_stream())?;
     let mut decoded_count = 0usize;
 

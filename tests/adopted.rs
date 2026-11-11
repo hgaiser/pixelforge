@@ -12,8 +12,8 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 #[allow(dead_code)]
 mod common;
+use common::decode_stream;
 use common::source::create_src_image;
-use common::{Readback, decode_stream};
 
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
@@ -143,14 +143,14 @@ fn decode_all(
     context: &VideoContext,
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut readback = Readback::new(context)?;
+    let mut readback = pixelforge::YuvDownloader::new(context)?;
     let mut decoder = Decoder::new(
         context.clone(),
         DecodeConfig::new(Codec::H264).with_byte_stream(),
     )?;
     let mut frames = Vec::new();
     decode_stream(&mut decoder, stream, |frame| {
-        let data = readback.read(&frame)?;
+        let data = readback.download(&frame)?;
         frames.push([data.y, data.uv].concat());
         Ok(())
     })?;

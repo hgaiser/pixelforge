@@ -20,6 +20,8 @@ version a Vulkan 1.1 device must accept: pixelforge also runs on a device the
 caller created, which can be 1.1. The `.spv` files are included in source via
 `include_bytes!`, so rerun this after editing a `.comp` and commit the result.
 
-The examples carry one more, outside the library: `examples/shader/sample_frame.comp`
-reads a decoded frame through a sampler-YCbCr conversion and writes RGBA, which
-is what `examples/sample_frame.rs` uses to show the zero-copy render path.
+Two more are outside the library. `examples/shader/sample_frame.comp` reads a
+decoded frame through a sampler-YCbCr conversion and writes RGBA, which is what
+`examples/sample_frame.rs` uses to show the zero-copy render path.
+`tests/shader/sample_planes.comp` reads it through per-plane views, for
+`tests/sample_planes.rs`.
