@@ -1,3 +1,5 @@
+![pixelforge](assets/banner-readme.png)
+
 # {{crate}}
 
 [![CI](https://github.com/hgaiser/pixelforge/workflows/CI/badge.svg)](https://github.com/hgaiser/pixelforge/actions)
