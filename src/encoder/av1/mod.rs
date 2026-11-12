@@ -56,6 +56,21 @@ pub(crate) struct Av1 {
     /// How many references shown before it a frame that predicts from both
     /// directions uses. It uses one shown after it.
     bidirectional_past_count: u32,
+    /// The frame size the device codes: the display size aligned up to
+    /// `codedPictureAlignment`. The sequence header must allow it.
+    coded_size: vk::Extent2D,
+}
+
+/// The frame size a device that codes pictures at `alignment` gives a frame
+/// of `width` x `height`. The Vulkan spec lets the implementation enlarge the
+/// coded frame to its alignment; the render size still crops to the display
+/// size. An alignment of zero is treated as the AV1 minimum of 8.
+fn coded_size(width: u32, height: u32, alignment: vk::Extent2D) -> vk::Extent2D {
+    let align = |value: u32, unit: u32| value.div_ceil(unit.max(1)) * unit.max(1);
+    vk::Extent2D {
+        width: align(width, alignment.width.max(8)),
+        height: align(height, alignment.height.max(8)),
+    }
 }
 
 /// The order hint of the frame with POC `poc`: its place in display order
@@ -241,6 +256,19 @@ mod tests {
     #[test]
     fn test_superblock_size() {
         assert_eq!(SUPERBLOCK_SIZE, 64);
+    }
+
+    #[test]
+    fn the_coded_size_follows_the_alignment() {
+        let extent = |width, height| vk::Extent2D { width, height };
+        let size = |w, h, a| {
+            let s = coded_size(w, h, a);
+            (s.width, s.height)
+        };
+        assert_eq!(size(320, 240, extent(8, 8)), (320, 240));
+        assert_eq!(size(320, 240, extent(64, 64)), (320, 256));
+        assert_eq!(size(1920, 1080, extent(16, 16)), (1920, 1088));
+        assert_eq!(size(1920, 1080, extent(0, 0)), (1920, 1080));
     }
 
     #[test]

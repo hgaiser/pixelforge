@@ -156,18 +156,29 @@ fn roundtrip_b_frames(codec: Codec, extension: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// The luma PSNR of `decoded` (NV12) against `source` (I420), in dB.
-fn luma_psnr(source: &[u8], decoded: &[u8]) -> f64 {
-    let luma = (WIDTH * HEIGHT) as usize;
-    let frame = luma * 3 / 2;
+/// The luma PSNR of `decoded` (NV12, frames of `decoded_size`) against
+/// `source` (I420, `WIDTH` x `HEIGHT`), in dB. A decoded frame larger than
+/// the source is compared in its top-left `WIDTH` x `HEIGHT`.
+fn luma_psnr(source: &[u8], decoded: &[u8], decoded_size: (u32, u32)) -> f64 {
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let decoded_width = decoded_size.0 as usize;
+    let source_frame = width * height * 3 / 2;
+    let decoded_frame = decoded_width * decoded_size.1 as usize * 3 / 2;
     let mut error = 0u64;
     let mut count = 0u64;
-    for (a, b) in source.chunks_exact(frame).zip(decoded.chunks_exact(frame)) {
-        for (x, y) in a[..luma].iter().zip(&b[..luma]) {
-            let d = i64::from(*x) - i64::from(*y);
-            error += (d * d) as u64;
+    for (a, b) in source
+        .chunks_exact(source_frame)
+        .zip(decoded.chunks_exact(decoded_frame))
+    {
+        for row in 0..height {
+            let a = &a[row * width..][..width];
+            let b = &b[row * decoded_width..][..width];
+            for (x, y) in a.iter().zip(b) {
+                let d = i64::from(*x) - i64::from(*y);
+                error += (d * d) as u64;
+            }
         }
-        count += luma as u64;
+        count += (width * height) as u64;
     }
     10.0 * (255.0f64 * 255.0 * count as f64 / error.max(1) as f64).log10()
 }
@@ -266,8 +277,12 @@ fn roundtrip(
     let mut readback = Some(pixelforge::YuvDownloader::new(&context)?);
     let mut decoder = Decoder::new(context, DecodeConfig::new(codec).with_byte_stream())?;
     let mut decoded_count = 0usize;
+    // The device may code a frame larger than the display size (AV1's
+    // `codedPictureAlignment`), and the decoders then give the whole frame.
+    let mut decoded_size = (WIDTH, HEIGHT);
 
     decode_stream(&mut decoder, &bitstream, |frame| {
+        decoded_size = (frame.width, frame.height);
         write_nv12(&frame, &mut readback, &mut out)?;
         decoded_count += 1;
         Ok(())
@@ -315,10 +330,19 @@ fn roundtrip(
                 _ => 'I',
             })
             .collect();
-        assert_eq!(ffprobe_frame_types(&bitstream_path)?, expected);
+        // A driver may code a P-frame with B slices that predict from the
+        // past only (low-delay B, which ANV does for H.265). ffprobe reports
+        // those as B, and the stream is no less correct.
+        let seen = ffprobe_frame_types(&bitstream_path)?;
+        let agrees = seen.len() == expected.len()
+            && seen
+                .chars()
+                .zip(expected.chars())
+                .all(|(seen, expected)| seen == expected || (expected == 'P' && seen == 'B'));
+        assert!(agrees, "frame types: ffprobe {seen}, encoder {expected}");
     }
 
-    Ok(luma_psnr(&yuv, &std::fs::read(&yuv_path)?))
+    Ok(luma_psnr(&yuv, &std::fs::read(&yuv_path)?, decoded_size))
 }
 
 /// Every frame has one packet, the packets come in decode order, and no

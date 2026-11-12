@@ -397,10 +397,34 @@ impl PlaneReader {
                 1,
             );
 
-            let after = [
+            let mut after = vec![
                 storage_to_copy(self.out[0].image),
                 storage_to_copy(self.out[1].image),
             ];
+            // Give the frame back in the layout it reports: the decoder, and
+            // anyone else reading the frame, go by `frame.layout`.
+            if frame.layout != vk::ImageLayout::GENERAL {
+                after.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .dst_access_mask(vk::AccessFlags2::NONE)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(frame.layout)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(frame.image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_0
+                                | vk::ImageAspectFlags::PLANE_1,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: frame.array_layer,
+                            layer_count: 1,
+                        }),
+                );
+            }
             device.cmd_pipeline_barrier2(
                 self.command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&after),

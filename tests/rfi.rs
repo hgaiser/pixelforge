@@ -247,6 +247,9 @@ fn decode_and_psnr(
     decoded: &str,
     source: &str,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    // The device may code a frame larger than the display size (AV1's
+    // `codedPictureAlignment`); compare only the display size.
+    let crop = format!("crop={WIDTH}:{HEIGHT}:0:0");
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -255,6 +258,8 @@ fn decode_and_psnr(
             "-y",
             "-i",
             bitstream,
+            "-vf",
+            &crop,
             "-pix_fmt",
             "yuv420p",
             "-f",

@@ -18,8 +18,10 @@ impl Av1 {
         desc: &ColorDescription,
     ) -> Result<vk::VideoSessionParametersKHR> {
         let config = &common.config;
-        let width = config.dimensions.width;
-        let height = config.dimensions.height;
+        // The device may code a frame larger than the display size (see
+        // `coded_size`), so the sequence header allows that size.
+        let width = self.coded_size.width;
+        let height = self.coded_size.height;
 
         let frame_width_bits = 32 - (width - 1).leading_zeros();
         let frame_height_bits = 32 - (height - 1).leading_zeros();

@@ -107,7 +107,19 @@ impl Av1 {
             single_reference_name_mask: av1_caps.single_reference_name_mask,
             bidirectional_reference_name_mask: av1_caps.bidirectional_compound_reference_name_mask,
             bidirectional_past_count,
+            coded_size: super::coded_size(
+                config.dimensions.width,
+                config.dimensions.height,
+                av1_caps.coded_picture_alignment,
+            ),
         };
+        debug!(
+            "AV1 coded picture alignment {}x{}: frames are coded at {}x{}",
+            av1_caps.coded_picture_alignment.width,
+            av1_caps.coded_picture_alignment.height,
+            codec.coded_size.width,
+            codec.coded_size.height
+        );
 
         let mut encoder = CodecEncoder { common, codec };
         let color_desc = config.color.description();

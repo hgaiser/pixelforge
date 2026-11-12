@@ -55,9 +55,23 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
     let mut output = Some(File::create(&output_path)?);
     let mut decoder = Decoder::new(context, DecodeConfig::new(codec).with_byte_stream())?;
     let stream = std::fs::read(&input)?;
-    decode_stream(&mut decoder, &stream, |frame| {
+    let decoded = decode_stream(&mut decoder, &stream, |frame| {
         write_nv12(&frame, &mut readback, &mut output)
-    })?;
+    });
+    // Film grain is an optional part of the AV1 decode profile. A device
+    // without it reports the profile as not supported when the stream asks
+    // for it, which is correct, so there is nothing to compare.
+    if FILM_GRAIN.contains(&name)
+        && let Err(e) = &decoded
+        && matches!(
+            e.downcast_ref::<pixelforge::PixelForgeError>(),
+            Some(pixelforge::PixelForgeError::NoSuitableDevice(_))
+        )
+    {
+        eprintln!("skipping {name}: {e}");
+        return Ok(());
+    }
+    decoded?;
     drop(output);
 
     assert!(
@@ -67,6 +81,9 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
     );
     Ok(())
 }
+
+/// The streams that use film grain, which a device need not support.
+const FILM_GRAIN: &[&str] = &["av1/aom_grain.obu", "av1/svt_grain.obu"];
 
 macro_rules! stream_tests {
     ($($test:ident: $codec:expr, $name:literal, $pix_fmt:literal;)*) => {

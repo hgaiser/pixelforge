@@ -82,7 +82,8 @@ impl Av1 {
         }
 
         // Without MOTION_VECTOR_SCALING all picture resource codedExtents must
-        // match and equal the sequence header's max_frame dimensions.
+        // match. The device may code the frame larger, to its
+        // `codedPictureAlignment`; the sequence header allows that size.
         let frame_extent = vk::Extent2D {
             width: common.config.dimensions.width,
             height: common.config.dimensions.height,

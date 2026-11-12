@@ -33,6 +33,11 @@ impl DecoderCommon {
     /// what the frame reports as its layout, so a consumer knows to transition
     /// it before reading.
     pub fn record_picture_copy(&self, frame: &DecodedPicture, dst_image: vk::Image) -> Result<()> {
+        // A picture that decoded something has waited for its slot already
+        // (`begin_decode_commands`). One that decoded nothing, such as an AV1
+        // `show_existing_frame`, has not, and the slot's previous copy may
+        // still be running.
+        self.pipeline.wait_current_free();
         let command_buffer = self.pipeline.current().transfer_command_buffer;
         let base_layer = frame.array_layer;
         let device = self.context.device().clone();

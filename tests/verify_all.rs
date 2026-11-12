@@ -225,6 +225,9 @@ fn run_test(
         _ => return Err("Unsupported format".into()),
     };
 
+    // The device may code a frame larger than the display size (AV1's
+    // `codedPictureAlignment`); compare only the display size.
+    let crop = format!("crop={WIDTH}:{HEIGHT}:0:0");
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -233,6 +236,8 @@ fn run_test(
             "-y",
             "-i",
             &output_filename,
+            "-vf",
+            &crop,
             "-pix_fmt",
             input_pix_fmt,
             "-f",
