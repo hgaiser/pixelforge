@@ -14,6 +14,7 @@ with ffmpeg n9.0, libaom and SVT-AV1 4.2:
     aom_10bit:      ffmpeg -c:v libaom-av1 -cpu-used 8 -pix_fmt yuv420p10le -f obu
     aom_grain:      ffmpeg -c:v libaom-av1 -cpu-used 8 -denoise-noise-level 10 -f obu
     svt_grain:      ffmpeg -c:v libsvtav1 -preset 10 -svtav1-params film-grain=8 -f obu
+    svt_hier:       ffmpeg -c:v libsvtav1 -preset 10 -crf 50 -svtav1-params hierarchical-levels=3:pred-struct=2 -f obu
     aom_errres:     aomenc --cpu-used=8 --limit=15 --obu --error-resilient=1 --sframe-dist=5 --sframe-mode=1
     aom_superres:   aomenc --cpu-used=8 --limit=15 --obu --superres-mode=1 --superres-denominator=12 --superres-kf-denominator=10
     aom_resize:     aomenc --cpu-used=8 --limit=15 --obu --resize-mode=1 --resize-denominator=12 --resize-kf-denominator=16

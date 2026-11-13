@@ -24,6 +24,7 @@ pub(crate) trait EncoderApi: Send {
     fn common(&self) -> &EncoderCommon;
     fn input_image(&self) -> vk::Image;
     fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
+    fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
@@ -39,6 +40,9 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
     }
     fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
         CodecEncoder::encode_frame(self, input, sync)
+    }
+    fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
+        CodecEncoder::encode_frame_now(self, input, sync)
     }
     fn flush(&mut self) -> Result<()> {
         CodecEncoder::flush(self)
@@ -93,6 +97,7 @@ impl Encoder {
     /// [`EncodeConfig::conversion`] asks for one that cannot.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
         config.rate_control.check(config.codec)?;
+        super::bframes::check_config(&config)?;
         let plan = plan(&context, &config)?;
         if let Some(format) = plan.rgb_input {
             super::rgb::check_rgb_input(&context, &config, format)?;
@@ -201,7 +206,20 @@ impl Encoder {
             FrameSource::External(external) => external.fills_input_image(),
             _ => true,
         };
-        let frame_slot = self.inner.common().pipeline.current_index();
+        // The release of a frame written in place is its encode, which with
+        // B-frames may come in a later call, after the sync_file for it had
+        // to be handed out.
+        #[cfg(feature = "dmabuf")]
+        if frame.signal_sync_file
+            && matches!(frame.source, FrameSource::Input(_))
+            && self.config().b_frames > 0
+        {
+            return Err(PixelForgeError::InvalidInput(
+                "with B-frames, a frame written into an input slot has no release sync_file"
+                    .to_string(),
+            ));
+        }
+        let frame_slot = self.inner.common().pipeline.next_index();
 
         #[cfg_attr(not(feature = "dmabuf"), allow(unused_mut))]
         let mut sync = FrameSync {
@@ -212,12 +230,14 @@ impl Encoder {
         #[cfg(feature = "dmabuf")]
         let slot = {
             // The slot's semaphores are free once the slot is.
-            let _ = self.inner.input_image();
-            let slot = self.inner.common().pipeline.current_index();
+            let slot = frame_slot;
             if frame.wait_sync_file.is_some() || frame.signal_sync_file {
                 let files = match &mut self.sync_files {
                     Some(files) => files,
-                    files @ None => files.insert(super::external::SyncFiles::new(&self.context)?),
+                    files @ None => files.insert(super::external::SyncFiles::new(
+                        &self.context,
+                        self.inner.common().pipeline.slot_count(),
+                    )?),
                 };
                 if let Some(fence) = frame.wait_sync_file {
                     sync.waits.push(files.import_wait(slot, fence)?);
@@ -330,7 +350,7 @@ impl Encoder {
         let common = self.inner.common();
         // The encode writes nothing into its own slot's image, so the frame
         // stays where it is for the next repeat.
-        let other_slot = last != common.pipeline.current_index();
+        let other_slot = last != common.pipeline.next_index();
         let input = if other_slot {
             let slot = common.pipeline.slot(last);
             FrameInput::Direct {
@@ -350,7 +370,10 @@ impl Encoder {
         } else {
             FrameInput::InPlace
         };
-        let mut future = self.inner.encode_frame(input, FrameSync::default())?;
+        // Encoded now, with the frames that wait before it: no frame arrives
+        // after it to end their group, and its source may be another slot's
+        // image.
+        let mut future = self.inner.encode_frame_now(input, FrameSync::default())?;
         future.pts_offset = self.pts_offset;
         if other_slot {
             // The next frame may be written into that slot's image.
@@ -426,6 +449,14 @@ impl Encoder {
     /// The window does not depend on how many references the device can
     /// predict from per frame. A device that predicts from one or two still
     /// keeps the whole window, and recovers from the older frames in it.
+    ///
+    /// With B-frames, packets come in decode order, so the client lost every
+    /// frame encoded after the lost one, also B-frames shown before it. The
+    /// encoder drops every reference from the first frame it encoded that is
+    /// shown at or after `first_lost_display_order`. The frames that wait for
+    /// their group are encoded later from the references that survive. If
+    /// none survives, the oldest frame that waits is encoded at once as the
+    /// IDR.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
         let local = first_lost_display_order.saturating_sub(self.pts_offset);
         self.inner.invalidate_reference_frames(local)

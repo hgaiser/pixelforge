@@ -16,9 +16,9 @@ use std::path::Path;
 
 #[allow(dead_code)]
 mod common;
-use common::{Readback, decode_stream, write_nv12};
+use common::{decode_stream, write_nv12};
 
-use pixelforge::decoder::{DecodeConfig, Decoder};
+use pixelforge::decoder::{DecodeConfig, Decoder, FramePoll};
 use pixelforge::{Codec, VideoContextBuilder};
 
 /// Decode `name` from `tests/data` and compare it against ffmpeg.
@@ -51,13 +51,27 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
         .require_decode(codec)
         .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
         .build()?;
-    let mut readback = Some(Readback::new(&context)?);
+    let mut readback = Some(pixelforge::YuvDownloader::new(&context)?);
     let mut output = Some(File::create(&output_path)?);
     let mut decoder = Decoder::new(context, DecodeConfig::new(codec).with_byte_stream())?;
     let stream = std::fs::read(&input)?;
-    decode_stream(&mut decoder, &stream, |frame| {
+    let decoded = decode_stream(&mut decoder, &stream, |frame| {
         write_nv12(&frame, &mut readback, &mut output)
-    })?;
+    });
+    // Film grain is an optional part of the AV1 decode profile. A device
+    // without it reports the profile as not supported when the stream asks
+    // for it, which is correct, so there is nothing to compare.
+    if FILM_GRAIN.contains(&name)
+        && let Err(e) = &decoded
+        && matches!(
+            e.downcast_ref::<pixelforge::PixelForgeError>(),
+            Some(pixelforge::PixelForgeError::NoSuitableDevice(_))
+        )
+    {
+        eprintln!("skipping {name}: {e}");
+        return Ok(());
+    }
+    decoded?;
     drop(output);
 
     assert!(
@@ -67,6 +81,9 @@ fn check(codec: Codec, name: &str, pix_fmt: &str) -> Result<(), Box<dyn std::err
     );
     Ok(())
 }
+
+/// The streams that use film grain, which a device need not support.
+const FILM_GRAIN: &[&str] = &["av1/aom_grain.obu", "av1/svt_grain.obu"];
 
 macro_rules! stream_tests {
     ($($test:ident: $codec:expr, $name:literal, $pix_fmt:literal;)*) => {
@@ -82,9 +99,14 @@ macro_rules! stream_tests {
 
 stream_tests! {
     h264_bframes: Codec::H264, "bframes.264", "nv12";
+    h264_bpyramid: Codec::H264, "bpyramid.264", "nv12";
+    h264_bstrict: Codec::H264, "bstrict.264", "nv12";
+    h264_novui: Codec::H264, "novui.264", "nv12";
+    h264_novui_poc2: Codec::H264, "novui_poc2.264", "nv12";
     h264_multislice: Codec::H264, "multislice.264", "nv12";
     h264_zerolatency: Codec::H264, "zerolatency.264", "nv12";
     h265_closedgop: Codec::H265, "closedgop.265", "nv12";
+    h265_bpyramid: Codec::H265, "bpyramid.265", "nv12";
     h265_cra_start: Codec::H265, "cra_start.265", "nv12";
     h265_main10: Codec::H265, "main10.265", "p010le";
     h265_nvenc: Codec::H265, "nvenc.265", "nv12";
@@ -101,4 +123,87 @@ stream_tests! {
     av1_10bit: Codec::AV1, "av1/aom_10bit.obu", "p010le";
     av1_grain: Codec::AV1, "av1/aom_grain.obu", "nv12";
     av1_svt_grain: Codec::AV1, "av1/svt_grain.obu", "nv12";
+    av1_svt_hier: Codec::AV1, "av1/svt_hier.obu", "nv12";
+}
+
+/// Split an H.264 byte stream with one slice per picture into access units.
+fn h264_access_units(stream: &[u8]) -> Vec<&[u8]> {
+    // Offsets of every start code, counting a leading zero byte as part of it.
+    let mut nals = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if stream[i..i + 3] == [0, 0, 1] {
+            let start = if i > 0 && stream[i - 1] == 0 {
+                i - 1
+            } else {
+                i
+            };
+            nals.push((start, stream[i + 3] & 0x1f));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut starts = Vec::new();
+    let mut seen_slice = true;
+    for (offset, nal_type) in nals {
+        let is_slice = matches!(nal_type, 1 | 5);
+        // The first unit after a slice opens the next access unit.
+        if seen_slice {
+            starts.push(offset);
+        }
+        seen_slice = is_slice;
+    }
+    let ends = starts.iter().skip(1).copied().chain([stream.len()]);
+    starts
+        .iter()
+        .copied()
+        .zip(ends)
+        .map(|(start, end)| &stream[start..end])
+        .collect()
+}
+
+/// A stream that cannot reorder must give each frame back before the next one
+/// is fed: the reorder buffer may add no latency to it.
+fn check_no_latency(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    let context = VideoContextBuilder::new()
+        .app_name("pixelforge-decode-latency")
+        .require_decode(Codec::H264)
+        .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+        .build()?;
+    let mut decoder = Decoder::new(context, DecodeConfig::new(Codec::H264))?;
+    let stream = std::fs::read(Path::new("tests/data").join(name))?;
+    let units = h264_access_units(&stream);
+    assert_eq!(units.len(), 30, "{name}: access units");
+
+    for (i, unit) in units.iter().enumerate() {
+        decoder.decode(unit, i as u64)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            match decoder.try_next_frame()? {
+                FramePoll::Frame(frame) => break frame,
+                FramePoll::Pending if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => panic!("{name}: no frame after access unit {i} ({other:?})"),
+            }
+        };
+        assert_eq!(frame.pts, i as u64, "{name}: frame order");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn h264_zerolatency_has_no_delay() -> Result<(), Box<dyn std::error::Error>> {
+    check_no_latency("zerolatency.264")
+}
+
+/// The same stream without a VUI: POC type 2 tells the decoder that nothing
+/// is reordered, where the level alone would allow a delay of several frames.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn h264_novui_poc2_has_no_delay() -> Result<(), Box<dyn std::error::Error>> {
+    check_no_latency("novui_poc2.264")
 }

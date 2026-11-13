@@ -6,6 +6,7 @@
 
 mod api;
 pub(crate) mod av1;
+mod bframes;
 pub(crate) mod codec;
 #[cfg(feature = "dmabuf")]
 pub mod external;
@@ -16,6 +17,7 @@ pub(crate) mod h265;
 pub(crate) mod input;
 pub(crate) mod pipeline;
 pub(crate) mod profile;
+pub(crate) mod references;
 pub(crate) mod resources;
 pub(crate) mod rgb;
 mod source;
@@ -419,6 +421,12 @@ pub struct EncodeConfig {
     /// as the device allows, which can be fewer. The device's DPB size can
     /// also lower it.
     pub max_reference_frames: u32,
+    /// How many B-frames go between two reference frames; see
+    /// [`Self::with_b_frames`].
+    pub b_frames: u32,
+    /// Whether B-frames are references; see
+    /// [`Self::with_b_frame_references`].
+    pub b_frame_references: BFrameReferences,
     /// VBV/HRD virtual buffer size in milliseconds, for
     /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much the encoder can deviate from the target bitrate
@@ -447,6 +455,8 @@ pub struct EncodeConfig {
     pub encode_content_hint: EncodeContentHint,
     /// Encoder tuning mode.
     pub encoder_tuning_mode: EncoderTuningMode,
+    /// The driver's quality level; see [`Self::with_quality_level`].
+    pub quality_level: u32,
 }
 
 impl EncodeConfig {
@@ -467,6 +477,8 @@ impl EncodeConfig {
             },
             gop_size: DEFAULT_GOP_SIZE,
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            b_frames: 0,
+            b_frame_references: BFrameReferences::Flat,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
             color: StreamColor::default(),
@@ -475,6 +487,7 @@ impl EncodeConfig {
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
+            quality_level: 0,
         }
     }
 
@@ -530,6 +543,38 @@ impl EncodeConfig {
     /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
+        self
+    }
+
+    /// Encode `count` B-frames between two reference frames, at most
+    /// [`MAX_B_FRAMES`]. 0, the default, encodes none and adds no latency.
+    ///
+    /// A B-frame predicts from a frame shown after it, so it is encoded only
+    /// once that frame was submitted. That adds `count` frames of latency,
+    /// and it changes what [`Encoder::submit`] gives back: the future of the
+    /// k-th submit resolves with the k-th packet of the stream, in decode
+    /// order, which is the packet of another frame. So a future may resolve
+    /// only after later submits, and `block_on(encoder.submit(frame)?)`
+    /// never returns. Keep the futures in a queue, and call
+    /// [`Encoder::flush`] at the end of the stream before draining it.
+    ///
+    /// Three more things change. [`Encoder::invalidate_reference_frames`]
+    /// makes the next frame an IDR. A DMA-BUF is copied at submit and not
+    /// read directly. And a frame written into an
+    /// [`InputSlot`] cannot ask for a release sync_file,
+    /// because the encode that reads it may come later than the call.
+    ///
+    /// [`Encoder::new`] returns an error if the device cannot encode
+    /// B-frames for the profile; see
+    /// [`VideoContext::supports_b_frames`](crate::VideoContext::supports_b_frames).
+    pub fn with_b_frames(mut self, count: u32) -> Self {
+        self.b_frames = count;
+        self
+    }
+
+    /// Choose whether B-frames are references, see [`BFrameReferences`].
+    pub fn with_b_frame_references(mut self, references: BFrameReferences) -> Self {
+        self.b_frame_references = references;
         self
     }
 
@@ -590,9 +635,27 @@ impl EncodeConfig {
         self.encoder_tuning_mode = mode;
         self
     }
+
+    /// Set the driver's quality level. 0 (the default) is the fastest. A
+    /// higher level searches more: the stream is smaller at the same quality,
+    /// and each frame takes longer to encode. No level adds frames of delay.
+    ///
+    /// The highest level is one less than what
+    /// [`VideoContext::encode_quality_levels`](crate::VideoContext::encode_quality_levels)
+    /// returns, and it differs between devices and codecs. [`Encoder::new`]
+    /// returns an error for a level the device does not have.
+    ///
+    /// On an NVIDIA RTX 5080 (driver 615.78.08) at 1080p, AV1 at level 6
+    /// needs about 5% fewer bits than at level 0, and each frame takes about
+    /// 1.9 ms more.
+    pub fn with_quality_level(mut self, level: u32) -> Self {
+        self.quality_level = level;
+        self
+    }
 }
 
 pub use api::Encoder;
+pub use bframes::{BFrameReferences, BFrameSupport, MAX_B_FRAMES};
 pub use frame::{Frame, InputSlot};
 pub use pipeline::EncodeFuture;
 pub use source::{Conversion, ConversionPreference, RgbSource, Source};
@@ -619,10 +682,14 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
-    /// Presentation timestamp.
+    /// Presentation timestamp: the number of the frame in the order it was
+    /// submitted.
     pub pts: u64,
-    /// Decode timestamp.
-    pub dts: u64,
+    /// Decode timestamp. Equal to `pts` without B-frames, and for AV1,
+    /// whose packets are in display order. With B-frames in H.264 and H.265
+    /// it counts the packets, and starts below zero so that it is never
+    /// after `pts`.
+    pub dts: i64,
     /// Stats about the packet.
     pub stats: EncodedPacketStats,
 }
@@ -777,6 +844,14 @@ mod tests {
             assert_eq!(config.gop_size, 30);
             assert_eq!(config.frame_rate.numerator, 30);
             assert_eq!(config.frame_rate.denominator, 1);
+            // The fastest level, for the lowest latency.
+            assert_eq!(config.quality_level, 0);
+        }
+
+        #[test]
+        fn test_with_quality_level() {
+            let config = EncodeConfig::av1(1920, 1080).with_quality_level(6);
+            assert_eq!(config.quality_level, 6);
         }
 
         #[test]

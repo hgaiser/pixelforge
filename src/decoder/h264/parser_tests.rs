@@ -4,16 +4,29 @@
 //! x264. Between them they cover the Baseline and High profiles, POC types 0
 //! and 2, and streams with and without B-frames.
 //!
+//! `bpyramid` (`bframes=3:b-pyramid=normal:weightb=1:direct=temporal`) and
+//! `bstrict` (`bframes=3:b-pyramid=strict`) come from
+//! `ffmpeg -c:v libx264 -crf 40 -x264-params b-adapt=0:scenecut=0:<params>` on
+//! testsrc2. `novui` and `novui_poc2` are `bframes` and `zerolatency` with the
+//! VUI removed from the SPS by `tests/data/strip_vui.py`, so they carry no
+//! `max_num_reorder_frames`.
+//!
 //! These tests exercise the host-side parsing and DPB bookkeeping only; they
 //! need no GPU and so run everywhere.
 
-use super::parser::{Mmco, NalType, iter_nal_units, parse_pps, parse_slice_header, parse_sps};
+use super::parser::{
+    Mmco, NalType, ReorderSource, iter_nal_units, parse_pps, parse_slice_header, parse_sps,
+};
 
 const BASELINE: &[u8] = include_bytes!("../../../tests/data/base.264");
 const ZEROLATENCY: &[u8] = include_bytes!("../../../tests/data/zerolatency.264");
 const BFRAMES: &[u8] = include_bytes!("../../../tests/data/bframes.264");
 /// 4 slices per picture: distinguishes "split per slice" from "split per picture".
 const MULTISLICE: &[u8] = include_bytes!("../../../tests/data/multislice.264");
+const BPYRAMID: &[u8] = include_bytes!("../../../tests/data/bpyramid.264");
+const BSTRICT: &[u8] = include_bytes!("../../../tests/data/bstrict.264");
+const NOVUI: &[u8] = include_bytes!("../../../tests/data/novui.264");
+const NOVUI_POC2: &[u8] = include_bytes!("../../../tests/data/novui_poc2.264");
 
 /// Every fixture: one SPS, one PPS, 30 slices, first slice is an IDR.
 #[test]
@@ -468,5 +481,89 @@ fn vui_reorder_matches_streams() {
         if let Some(v) = expect {
             assert_eq!(sps.max_num_reorder_frames, Some(v), "{name}: reorder depth");
         }
+    }
+}
+
+/// Without a VUI the reorder depth is inferred: none where the stream cannot
+/// reorder, and the level's DPB size otherwise.
+#[test]
+fn reorder_depth_without_vui() {
+    let sps_of = |data: &[u8]| {
+        let nal = iter_nal_units(data)
+            .find(|n| n.nal_type == NalType::Sps)
+            .unwrap();
+        parse_sps(nal.payload()).unwrap()
+    };
+
+    for (name, data, expect) in [
+        ("bframes", BFRAMES, (2, ReorderSource::Vui)),
+        ("bpyramid", BPYRAMID, (2, ReorderSource::Vui)),
+        ("bstrict", BSTRICT, (2, ReorderSource::Vui)),
+        ("zerolatency", ZEROLATENCY, (0, ReorderSource::Vui)),
+        // Level 1.3 at 320x240: MaxDpbMbs 2376 over 300 macroblocks.
+        ("novui", NOVUI, (7, ReorderSource::Level)),
+        ("novui_poc2", NOVUI_POC2, (0, ReorderSource::PocType)),
+    ] {
+        let sps = sps_of(data);
+        assert_eq!(sps.reorder_depth(), expect, "{name}");
+    }
+
+    // The rest of the SPS is untouched by removing the VUI.
+    let (with, without) = (sps_of(BFRAMES), sps_of(NOVUI));
+    assert_eq!(without.max_num_reorder_frames, None);
+    assert_eq!(
+        super::parser::Sps {
+            max_num_reorder_frames: with.max_num_reorder_frames,
+            ..without
+        },
+        with
+    );
+
+    // A Baseline stream has no B-frames, whatever its POC type and level.
+    let mut baseline = sps_of(BASELINE);
+    baseline.max_num_reorder_frames = None;
+    baseline.pic_order_cnt_type = 0;
+    assert_eq!(baseline.reorder_depth(), (0, ReorderSource::Profile));
+
+    // MaxDpbFrames is capped at 16, and follows the picture size.
+    let mut sps = sps_of(NOVUI);
+    sps.level_idc = 51;
+    assert_eq!(sps.reorder_depth(), (16, ReorderSource::Level));
+    sps.level_idc = 41;
+    sps.pic_width_in_mbs_minus1 = 119;
+    sps.pic_height_in_map_units_minus1 = 67;
+    assert_eq!(sps.reorder_depth(), (4, ReorderSource::Level));
+}
+
+/// The pyramid fixtures use B-frames as references, each with its own way of
+/// retiring them.
+#[test]
+fn pyramid_fixtures_have_reference_b_frames() {
+    for (name, data) in [("bpyramid", BPYRAMID), ("bstrict", BSTRICT)] {
+        let mut sps = None;
+        let mut pps = None;
+        let mut reference_b = 0;
+        let mut plain_b = 0;
+        for nal in iter_nal_units(data) {
+            match nal.nal_type {
+                NalType::Sps => sps = Some(parse_sps(nal.payload()).unwrap()),
+                NalType::Pps => pps = Some(parse_pps(nal.payload(), |_| Some(1)).unwrap()),
+                t if t.is_slice() => {
+                    let header =
+                        parse_slice_header(&nal, sps.as_ref().unwrap(), pps.as_ref().unwrap())
+                            .unwrap();
+                    if header.slice_type == super::parser::SliceType::B {
+                        if nal.ref_idc != 0 {
+                            reference_b += 1;
+                        } else {
+                            plain_b += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(reference_b > 0, "{name}: B-frames used as references");
+        assert!(plain_b > 0, "{name}: non-reference B-frames");
     }
 }

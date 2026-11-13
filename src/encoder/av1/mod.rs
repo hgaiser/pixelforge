@@ -13,13 +13,15 @@
 
 mod init;
 mod record;
+mod references;
 mod session_params;
 
 use crate::encoder::ColorDescription;
 use crate::encoder::codec::{EncoderCommon, FramePlan, PictureSetup, VideoCodec};
-use crate::encoder::pipeline::EncodeFuture;
-use crate::error::Result;
+use crate::encoder::references::{Reference, ReferenceSet};
+use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use references::{FrameReferences, bidirectional_references, show_existing_frame};
 
 /// Minimum bitstream buffer size.
 const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -27,42 +29,60 @@ const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// AV1 superblock size in pixels (64x64, matching use_128x128_superblock=0).
 pub const SUPERBLOCK_SIZE: u32 = 64;
 
+/// What AV1 needs to know about a reference besides what every codec does.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReferenceInfo {
-    pub dpb_slot: u8,
-    pub order_hint: u32,
+pub(crate) struct Av1Reference {
     pub frame_type: u32,
-    /// Display order (`pts`) of this reference, for reference frame invalidation.
-    pub display_order: u64,
 }
+
+pub(crate) type ReferenceInfo = Reference<Av1Reference>;
 
 /// AV1-specific encoder state (multi-reference prediction).
 pub(crate) struct Av1 {
     frame_num: u32,
-    order_hint: u32,
     /// Cached sequence-header OBU (invalidated when session params change).
     header_data: Option<Vec<u8>>,
-    /// References held in the DPB, most-recent first. Each frame predicts
-    /// from the first `active_reference_count`; the rest are kept for
-    /// reference frame invalidation to fall back on.
-    references: Vec<ReferenceInfo>,
-    /// How many references stay in the DPB.
-    reference_window: u32,
+    /// References held in the DPB. Each frame predicts from the newest
+    /// `active_reference_count`; the rest are kept for reference frame
+    /// invalidation to fall back on.
+    references: ReferenceSet<Av1Reference>,
     /// How many of the newest references one frame predicts from.
     active_reference_count: u32,
     /// The reference names single-reference prediction may use (bit 0 is
     /// LAST), from `VkVideoEncodeAV1CapabilitiesKHR`.
     single_reference_name_mask: u32,
+    /// The reference names prediction from both directions may use.
+    bidirectional_reference_name_mask: u32,
+    /// How many references shown before it a frame that predicts from both
+    /// directions uses. It uses one shown after it.
+    bidirectional_past_count: u32,
+    /// The frame size the device codes: the display size aligned up to
+    /// `codedPictureAlignment`. The sequence header must allow it.
+    coded_size: vk::Extent2D,
+}
+
+/// The frame size a device that codes pictures at `alignment` gives a frame
+/// of `width` x `height`. The Vulkan spec lets the implementation enlarge the
+/// coded frame to its alignment; the render size still crops to the display
+/// size. An alignment of zero is treated as the AV1 minimum of 8.
+fn coded_size(width: u32, height: u32, alignment: vk::Extent2D) -> vk::Extent2D {
+    let align = |value: u32, unit: u32| value.div_ceil(unit.max(1)) * unit.max(1);
+    vk::Extent2D {
+        width: align(width, alignment.width.max(8)),
+        height: align(height, alignment.height.max(8)),
+    }
+}
+
+/// The order hint of the frame with POC `poc`: its place in display order
+/// since the key frame, in the 8 bits the sequence header gives it.
+fn order_hint(poc: i32) -> u32 {
+    (poc / 2) as u32 & 0xFF
 }
 
 impl Av1 {
     /// The references this frame predicts from: the newest held ones.
     fn used_references(&self) -> &[ReferenceInfo] {
-        let n = self
-            .references
-            .len()
-            .min(self.active_reference_count as usize);
-        &self.references[..n]
+        self.references.newest(self.active_reference_count as usize)
     }
 
     /// The DPB slot each of the 7 AV1 reference names predicts from, or -1.
@@ -77,9 +97,64 @@ impl Av1 {
         }
         names
     }
+
+    /// The references `plan` predicts from, under their names, and the
+    /// distinct ones among them. None for a key frame.
+    ///
+    /// A frame that predicts from one direction uses the newest references.
+    /// A B-frame uses the nearest ones shown before it and the nearest one
+    /// shown after it.
+    fn frame_references(&self, plan: &FramePlan) -> Result<(FrameReferences, Vec<ReferenceInfo>)> {
+        if plan.is_idr() || self.references.is_empty() {
+            let none = FrameReferences {
+                names: [-1; 7],
+                fill: [0; 2],
+            };
+            return Ok((none, Vec::new()));
+        }
+        if !plan.is_b() {
+            let newest = self.references.as_slice()[0].dpb_slot as i8;
+            let references = FrameReferences {
+                names: self.reference_names(),
+                fill: [newest; 2],
+            };
+            return Ok((references, self.used_references().to_vec()));
+        }
+
+        let (past, future) = self.references.around(plan.pic_order_cnt());
+        let slots = |list: &[ReferenceInfo]| list.iter().map(|r| r.dpb_slot).collect::<Vec<u8>>();
+        let references = bidirectional_references(
+            &slots(&past),
+            &slots(&future),
+            self.bidirectional_reference_name_mask,
+            self.bidirectional_past_count as usize,
+        )
+        .ok_or_else(|| {
+            PixelForgeError::InvalidInput(format!(
+                "AV1 B-frame {} has {} references before it and {} after it",
+                plan.display_order,
+                past.len(),
+                future.len()
+            ))
+        })?;
+        let used = self
+            .references
+            .as_slice()
+            .iter()
+            .filter(|r| references.names.contains(&i32::from(r.dpb_slot)))
+            .copied()
+            .collect();
+        Ok((references, used))
+    }
 }
 
 impl VideoCodec for Av1 {
+    const HIDDEN_FRAMES: bool = true;
+
+    fn show_packet(&self, _plan: &FramePlan, dpb_slot: u8) -> Vec<u8> {
+        show_existing_frame(dpb_slot)
+    }
+
     fn begin_picture(
         &mut self,
         common: &mut EncoderCommon,
@@ -88,12 +163,21 @@ impl VideoCodec for Av1 {
         let is_key = plan.is_idr();
         if is_key {
             self.frame_num = 0;
-            self.order_hint = 0;
             self.references.clear();
+        } else if plan.is_reference() {
+            // A reference frame makes the B-frame references of its level
+            // and below of no more use. They go out of the list, and their
+            // frame buffers are taken by later frames.
+            self.references.drop_obsolete(plan.pyramid_level());
         }
 
-        // Every temporal unit starts with a Temporal Delimiter OBU; key frames
-        // also carry the sequence header (so decoders can initialize).
+        // A hidden frame's bitstream goes in front of the next packet, which
+        // has the temporal delimiter.
+        if plan.hidden {
+            return Ok(PictureSetup { header: None });
+        }
+
+        // Every temporal unit starts with a temporal delimiter OBU.
         let mut header = vec![0x12, 0x00];
         if is_key {
             if self.header_data.is_none() {
@@ -109,54 +193,35 @@ impl VideoCodec for Av1 {
         })
     }
 
-    fn record_picture(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    fn record_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         self.record(common, plan)
     }
 
     fn end_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) {
-        let is_key = plan.is_idr();
-        // Order hint used while recording this frame (pre-increment).
-        let encoded_order_hint = self.order_hint;
         self.frame_num += 1;
-        self.order_hint = (self.order_hint + 1) & 0xFF;
+        // A frame that is not a reference goes into no frame buffer, and the
+        // next frame takes its DPB slot.
+        if !plan.is_reference() {
+            return;
+        }
 
-        let ref_info = ReferenceInfo {
-            dpb_slot: common.current_dpb_slot,
-            order_hint: encoded_order_hint,
-            display_order: plan.display_order,
-            frame_type: if is_key {
-                ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
-            } else {
-                ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
-            },
+        let frame_type = if plan.is_idr() {
+            ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
+        } else {
+            ash::vk::native::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
         };
+        self.references.insert(Reference {
+            dpb_slot: common.current_dpb_slot,
+            poc: plan.pic_order_cnt(),
+            display_order: plan.display_order,
+            encode_index: plan.encode_index,
+            level: plan.pyramid_level(),
+            codec: Av1Reference { frame_type },
+        });
 
-        if is_key {
-            self.references.clear();
-        }
-        self.references.insert(0, ref_info);
-        // Keep a sliding window of the most recent references for prediction and
-        // loss recovery.
-        while self.references.len() > self.reference_window.max(1) as usize {
-            self.references.pop();
-        }
-
-        // Cycle to the next available DPB slot.
-        let used_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
-        let mut next_slot = (common.current_dpb_slot + 1) % common.dpb_slot_count as u8;
-        if used_slots.contains(&next_slot) {
-            for i in 0..common.dpb_slot_count as u8 {
-                if !used_slots.contains(&i) {
-                    next_slot = i;
-                    break;
-                }
-            }
-        }
-        common.current_dpb_slot = next_slot;
+        // Round-robin over the frame buffers, skipping the ones in use.
+        let next = (common.current_dpb_slot + 1) % common.dpb_slot_count as u8;
+        common.current_dpb_slot = self.references.free_slot(common.dpb_slot_count, Some(next));
     }
 
     fn invalidate_references(
@@ -164,13 +229,10 @@ impl VideoCodec for Av1 {
         _common: &mut EncoderCommon,
         first_lost_display_order: u64,
     ) -> bool {
-        // Drop every reference at or after the first lost frame: those are
-        // transitively undecodable on the client. Older survivors are kept, so
-        // the next P-frame re-anchors LAST_FRAME to the most recent of them (see
-        // `calculate_reference_frame_mapping`). Returns false only when no
-        // reference survives, in which case the caller forces a full key frame.
-        self.references
-            .retain(|r| r.display_order < first_lost_display_order);
+        // Every frame buffer is declared explicitly per frame from
+        // `references` (ref_frame_idx + ref_order_hint), so dropping entries
+        // here is enough for the decoder to follow.
+        self.references.invalidate(first_lost_display_order);
         !self.references.is_empty()
     }
 
@@ -197,6 +259,19 @@ mod tests {
     }
 
     #[test]
+    fn the_coded_size_follows_the_alignment() {
+        let extent = |width, height| vk::Extent2D { width, height };
+        let size = |w, h, a| {
+            let s = coded_size(w, h, a);
+            (s.width, s.height)
+        };
+        assert_eq!(size(320, 240, extent(8, 8)), (320, 240));
+        assert_eq!(size(320, 240, extent(64, 64)), (320, 256));
+        assert_eq!(size(1920, 1080, extent(16, 16)), (1920, 1088));
+        assert_eq!(size(1920, 1080, extent(0, 0)), (1920, 1080));
+    }
+
+    #[test]
     fn test_superblock_alignment() {
         let align = |v: u32| (v + SUPERBLOCK_SIZE - 1) & !(SUPERBLOCK_SIZE - 1);
         assert_eq!(align(1920), 1920);
@@ -207,224 +282,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_info() {
-        let ref_info = ReferenceInfo {
-            dpb_slot: 2,
-            order_hint: 42,
-            frame_type: 0,
-            display_order: 0,
-        };
-        assert_eq!(ref_info.dpb_slot, 2);
-        assert_eq!(ref_info.order_hint, 42);
-        let copied = ref_info;
-        assert_eq!(copied.dpb_slot, ref_info.dpb_slot);
-        assert_eq!(copied.order_hint, ref_info.order_hint);
-    }
-
-    #[test]
-    fn test_order_hint_wrapping() {
-        let mut order_hint: u32 = 254;
-        for _ in 0..4 {
-            order_hint = (order_hint + 1) & 0xFF;
-        }
-        assert_eq!(order_hint, 2);
-    }
-
-    #[test]
-    fn test_reference_tracking() {
-        let mut references: Vec<ReferenceInfo> = Vec::new();
-        let max_refs = 4usize;
-        for i in 0..6u8 {
-            let ref_info = ReferenceInfo {
-                dpb_slot: i % max_refs as u8,
-                order_hint: i as u32,
-                frame_type: 0,
-                display_order: 0,
-            };
-            references.insert(0, ref_info);
-            while references.len() > max_refs {
-                references.pop();
-            }
-        }
-        assert_eq!(references.len(), max_refs);
-        assert_eq!(references[0].order_hint, 5);
-        assert_eq!(references[max_refs - 1].order_hint, 2);
-    }
-
-    #[test]
-    fn test_key_frame_clears_references() {
-        let mut references: Vec<ReferenceInfo> = Vec::new();
-        for i in 0..3u8 {
-            references.insert(
-                0,
-                ReferenceInfo {
-                    dpb_slot: i,
-                    order_hint: i as u32,
-                    frame_type: 0,
-                    display_order: 0,
-                },
-            );
-        }
-        assert_eq!(references.len(), 3);
-        references.clear();
-        assert!(references.is_empty());
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 0,
-                order_hint: 0,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        assert_eq!(references.len(), 1);
-        assert_eq!(references[0].dpb_slot, 0);
-        assert_eq!(references[0].order_hint, 0);
-    }
-
-    #[test]
-    fn test_dpb_slot_reuse() {
-        let max_refs = 2usize;
-        let dpb_slot_count = 3u8;
-        let mut references: Vec<ReferenceInfo> = Vec::new();
-        let mut current_dpb_slot: u8 = 0;
-
-        let find_free_slot = |refs: &[ReferenceInfo], slot_count: u8| -> u8 {
-            let used: Vec<u8> = refs.iter().map(|r| r.dpb_slot).collect();
-            for i in 0..slot_count {
-                if !used.contains(&i) {
-                    return i;
-                }
-            }
-            0
-        };
-
-        assert_eq!(current_dpb_slot, 0);
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 0,
-                order_hint: 0,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 1);
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 1,
-                order_hint: 1,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 2);
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 2,
-                order_hint: 2,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        assert_eq!(references.len(), 2);
-        assert_eq!(references[0].dpb_slot, 2);
-        assert_eq!(references[1].dpb_slot, 1);
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 0);
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 0,
-                order_hint: 3,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 1);
-    }
-
-    #[test]
-    fn test_single_reference_slot() {
-        let max_refs = 1usize;
-        let dpb_slot_count = 2u8;
-        let mut references: Vec<ReferenceInfo> = Vec::new();
-
-        let find_free_slot = |refs: &[ReferenceInfo], slot_count: u8| -> u8 {
-            let used: Vec<u8> = refs.iter().map(|r| r.dpb_slot).collect();
-            for i in 0..slot_count {
-                if !used.contains(&i) {
-                    return i;
-                }
-            }
-            0
-        };
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 0,
-                order_hint: 0,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        let mut current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 1);
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 1,
-                order_hint: 1,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        assert_eq!(references.len(), 1);
-        assert_eq!(references[0].dpb_slot, 1);
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 0);
-
-        references.insert(
-            0,
-            ReferenceInfo {
-                dpb_slot: 0,
-                order_hint: 2,
-                frame_type: 0,
-                display_order: 0,
-            },
-        );
-        while references.len() > max_refs {
-            references.pop();
-        }
-        current_dpb_slot = find_free_slot(&references, dpb_slot_count);
-        assert_eq!(current_dpb_slot, 1);
+    fn order_hint_wraps_at_8_bits() {
+        assert_eq!(order_hint(2 * 254), 254);
+        assert_eq!(order_hint(2 * 258), 2);
     }
 }

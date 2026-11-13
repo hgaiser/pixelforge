@@ -188,7 +188,7 @@ impl VideoContext {
             ChromaFormat::Yuv420,
             bit_depth,
             Some(&mut caps),
-            |profile| {
+            |profile, _| {
                 query_supported_video_formats(
                     self,
                     profile,

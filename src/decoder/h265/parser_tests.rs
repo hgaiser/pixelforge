@@ -12,6 +12,7 @@
 //! | `main10`        | `keyint=15:bframes=2`, `-pix_fmt yuv420p10le`, 172x140            |
 //! | `temporal`      | `temporal-layers=3:bframes=3:b-pyramid=1:keyint=20:scaling-list=default` |
 //! | `scaling`       | `scaling-list=<custom HM-format file>:bframes=2`                  |
+//! | `bpyramid`      | `bframes=4:b-pyramid=1:b-adapt=0:scenecut=0:keyint=20:min-keyint=20:open-gop=0` |
 //!
 //! `nvenc` is `hevc_nvenc -bf 3 -b_ref_mode middle -g 10 -rc constqp -qp 45`:
 //! unlike x265 it codes a short-term set in the SPS and has VUI HRD
@@ -43,6 +44,7 @@ const NVENC: &[u8] = include_bytes!("../../../tests/data/nvenc.265");
 const CRA_START: &[u8] = include_bytes!("../../../tests/data/cra_start.265");
 const TEMPORAL: &[u8] = include_bytes!("../../../tests/data/temporal.265");
 const SCALING: &[u8] = include_bytes!("../../../tests/data/scaling.265");
+const BPYRAMID: &[u8] = include_bytes!("../../../tests/data/bpyramid.265");
 
 /// Every fixture, with the number of pictures it holds and the number ffmpeg
 /// outputs.
@@ -55,6 +57,7 @@ const ALL: &[(&str, &[u8], usize, usize)] = &[
     ("cra_start", CRA_START, 8, 6),
     ("temporal", TEMPORAL, 20, 20),
     ("scaling", SCALING, 10, 10),
+    ("bpyramid", BPYRAMID, 30, 30),
 ];
 
 /// One slice segment with the parameter sets in effect for it.

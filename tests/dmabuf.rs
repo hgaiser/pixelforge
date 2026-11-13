@@ -9,17 +9,18 @@
 
 #[allow(dead_code)]
 mod common;
+use common::decode_stream;
 use common::source::{host_buffer, one_shot};
-use common::{Readback, decode_stream};
 
 use ash::vk;
 use ash::vk::TaggedStructure;
 use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::external::drm_format;
 use pixelforge::{
-    Codec, ColorSpec, Conversion, ConversionPreference, DmaBuf, DmaBufImage, DmaBufPlane,
-    EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat, RgbSource, Source, SourceImage,
-    VideoContext, VideoContextBuilder, YuvLayout, YuvUploader,
+    BFrameSupport, BitDepth, ChromaFormat, Codec, ColorSpec, Conversion, ConversionPreference,
+    DmaBuf, DmaBufImage, DmaBufPlane, EncodeConfig, Encoder, Frame, Handoff, RateControl,
+    RgbFormat, RgbSource, Source, SourceImage, VideoContext, VideoContextBuilder, YuvLayout,
+    YuvUploader,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -508,6 +509,87 @@ fn allocated_and_imported_inputs_encode_the_same() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// With B-frames a buffer is never read directly: a B-frame is encoded
+/// later than it is submitted, and a producer has only a few buffers to
+/// write the frames after it into. So each frame is copied when it is
+/// submitted, the buffer is free again at once, and the stream is that of
+/// the same frames from an ordinary image.
+#[test]
+#[ignore = "requires a Vulkan Video device with DMA-BUF support"]
+fn b_frames_copy_the_buffer() -> Result<(), Box<dyn std::error::Error>> {
+    let context = context()?;
+    let (w, h) = (320, 256);
+    let frames: Vec<Vec<u8>> = (0..9).map(|n| nv12_frame(w, h, n)).collect();
+    for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+        if !context.supports_encode(codec)
+            || context.supports_b_frames(codec, ChromaFormat::Yuv420, BitDepth::Eight)
+                == BFrameSupport::None
+        {
+            eprintln!("skipping {codec:?}: no B-frames on this device");
+            continue;
+        }
+        let config = config(codec, w, h).with_b_frames(2);
+
+        let mut encoder = Encoder::new(context.clone(), config.clone())?;
+        let mut input = YuvUploader::for_encoder(&encoder)?;
+        let mut pending = Vec::new();
+        for frame in &frames {
+            input.upload(YuvLayout::Nv12, frame)?;
+            pending.push(encoder.submit(Frame::image(input.source()))?);
+        }
+        encoder.flush()?;
+        let mut reference = Vec::new();
+        for future in pending {
+            reference.extend(pollster::block_on(future)?.data);
+        }
+
+        let mut encoder = Encoder::new(context.clone(), config)?;
+        // The release of a frame written in place would be an encode that
+        // has not been submitted yet.
+        let slot = encoder.input_slot()?;
+        assert!(
+            encoder
+                .submit(Frame::input(slot).signal_sync_file())
+                .is_err(),
+            "{codec:?}: a release sync_file for a frame written in place"
+        );
+        let modifiers = exportable_modifiers(&encoder);
+        if modifiers.is_empty() {
+            eprintln!("skipping {codec:?}: no modifier the encoder can allocate");
+            continue;
+        }
+        let allocated = encoder.allocate_input(&modifiers)?;
+        assert!(
+            !allocated.is_zero_copy(),
+            "{codec:?}: a buffer read directly with B-frames"
+        );
+        let mut producer = Producer::import(&context, &allocated.export()?)?;
+        let mut pending = Vec::new();
+        for frame in &frames {
+            producer.write(frame)?;
+            pending.push(encoder.submit(Frame::external(&allocated))?);
+            // The one buffer is written again for the next frame, while
+            // this one may still wait for its encode. Its copy is all that
+            // has to be done by then.
+            for point in allocated.released() {
+                let semaphores = [point.semaphore];
+                let values = [point.value];
+                let wait = vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values);
+                unsafe { context.device().wait_semaphores(&wait, u64::MAX)? };
+            }
+        }
+        encoder.flush()?;
+        let mut stream = Vec::new();
+        for future in pending {
+            stream.extend(pollster::block_on(future)?.data);
+        }
+        assert!(stream == reference, "{codec:?}: copied input differs");
+    }
+    Ok(())
+}
+
 /// A buffer with a modifier the encode cannot read is copied instead, and
 /// encodes the same.
 #[test]
@@ -605,14 +687,14 @@ fn unaligned_sizes_are_read_at_the_display_size() -> Result<(), Box<dyn std::err
     let mut producer = Producer::import(&context, &allocated.export()?)?;
     let stream = encode_external(&mut encoder, &mut producer, &allocated, &frames)?;
 
-    let mut readback = Readback::new(&context)?;
+    let mut readback = pixelforge::YuvDownloader::new(&context)?;
     let mut decoder = Decoder::new(
         context.clone(),
         DecodeConfig::new(Codec::H264).with_byte_stream(),
     )?;
     let mut decoded = Vec::new();
     decode_stream(&mut decoder, &stream, |frame| {
-        decoded.push(readback.read(&frame)?.y);
+        decoded.push(readback.download(&frame)?.y);
         Ok(())
     })?;
     assert_eq!(decoded.len(), FRAMES as usize);

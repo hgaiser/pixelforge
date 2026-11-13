@@ -20,7 +20,9 @@ impl H265 {
         let config = &common.config;
 
         let ctb_log2_size_y: u8 = 5;
-        let min_cb_log2_size_y: u8 = 4;
+        // 8x8, the smallest coding block. Vulkan has no capability for it, and
+        // a larger minimum stops the encoder from using small blocks.
+        let min_cb_log2_size_y: u8 = 3;
         let log2_min_transform_block_size: u8 = 2;
         let log2_max_transform_block_size: u8 = 5;
 
@@ -52,7 +54,7 @@ impl H265 {
         let dec_pic_buf_mgr = ash::vk::native::StdVideoH265DecPicBufMgr {
             max_latency_increase_plus1: [0; 7],
             max_dec_pic_buffering_minus1: [(common.dpb_slot_count - 1) as u8, 0, 0, 0, 0, 0, 0],
-            max_num_reorder_pics: [0; 7],
+            max_num_reorder_pics: [common.gop.reorder_delay() as u8, 0, 0, 0, 0, 0, 0],
         };
 
         let short_term_ref_pic_set = ash::vk::native::StdVideoH265ShortTermRefPicSet {
@@ -335,7 +337,8 @@ impl H265 {
                 .max_std_pps_count(1)
                 .parameters_add_info(&h265_add_info);
 
-        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(common.config.quality_level);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)

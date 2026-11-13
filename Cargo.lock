@@ -277,6 +277,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixelforge-tools"
+version = "0.0.0"
+dependencies = [
+ "pixelforge",
+ "pollster",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pollster"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

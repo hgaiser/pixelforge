@@ -1,27 +1,31 @@
 //! AV1 per-frame encode recording: builds the StdVideo* graph for one frame and
 //! submits it. AV1 uses single-reference prediction.
 
-use super::Av1;
+use super::references::{FrameReferences, ref_frame_idx};
+use super::{Av1, order_hint};
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
-use crate::encoder::pipeline::EncodeFuture;
+use crate::encoder::gop::ReferencePattern;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+/// What a constant quantizer index is raised by for a B-frame that is not a
+/// reference. About the step that 2 is for an H.264 QP.
+const B_FRAME_Q_INDEX_OFFSET: u32 = 8;
+
 impl Av1 {
-    pub(super) fn record(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_key_frame = plan.is_idr();
+        let is_b = plan.is_b();
         // All frames need a setup reference slot (DPB write) per the Vulkan spec
-        // when maxDpbSlots > 0.
-        let is_reference = true;
+        // when maxDpbSlots > 0, also a frame that no frame predicts from.
+        let has_setup_slot = true;
         let current_dpb_slot = common.current_dpb_slot;
+        let order_hint = order_hint(plan.pic_order_cnt());
+        let (references, used_references) = self.frame_references(plan)?;
 
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
@@ -37,7 +41,7 @@ impl Av1 {
             current_dpb_slot
         );
 
-        let rc = RateControlPlan::new(&common.config, 128);
+        let rc = RateControlPlan::for_frame(&common.config, 128, plan, B_FRAME_Q_INDEX_OFFSET, 255);
         let qp = rc.qp;
 
         unsafe {
@@ -45,7 +49,7 @@ impl Av1 {
         }
         // Only the references this frame predicts from go to the encode. The
         // rest of the window stays in its DPB slots, untouched.
-        let ref_dpb_slots: Vec<u8> = self.used_references().iter().map(|r| r.dpb_slot).collect();
+        let ref_dpb_slots: Vec<u8> = used_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
                 common.context.sync2(),
@@ -70,7 +74,7 @@ impl Av1 {
             _bitfield_align_1: [],
             _bitfield_1: Default::default(),
         };
-        picture_info_flags.set_show_frame(1);
+        picture_info_flags.set_show_frame(!plan.hidden as u32);
         if is_key_frame {
             picture_info_flags.set_error_resilient_mode(1);
         } else {
@@ -78,7 +82,8 @@ impl Av1 {
         }
 
         // Without MOTION_VECTOR_SCALING all picture resource codedExtents must
-        // match and equal the sequence header's max_frame dimensions.
+        // match. The device may code the frame larger, to its
+        // `codedPictureAlignment`; the sequence header allows that size.
         let frame_extent = vk::Extent2D {
             width: common.config.dimensions.width,
             height: common.config.dimensions.height,
@@ -100,7 +105,7 @@ impl Av1 {
             flags: reference_info_flags,
             frame_type,
             RefFrameId: current_dpb_slot as u32,
-            OrderHint: self.order_hint as u8,
+            OrderHint: order_hint as u8,
             reserved1: [0; 3],
             pExtensionHeader: std::ptr::null(),
         };
@@ -121,7 +126,7 @@ impl Av1 {
         // than one AV1 reference name below, but each slot is declared once).
         let mut distinct_refs: Vec<&super::ReferenceInfo> = Vec::new();
         if !is_key_frame {
-            for r in self.used_references() {
+            for r in &used_references {
                 if !distinct_refs.iter().any(|d| d.dpb_slot == r.dpb_slot) {
                     distinct_refs.push(r);
                 }
@@ -132,9 +137,9 @@ impl Av1 {
         for ref_info in &distinct_refs {
             ref_std_infos.push(ash::vk::native::StdVideoEncodeAV1ReferenceInfo {
                 flags: reference_info_flags,
-                frame_type: ref_info.frame_type,
+                frame_type: ref_info.codec.frame_type,
                 RefFrameId: ref_info.dpb_slot as u32,
-                OrderHint: ref_info.order_hint as u8,
+                OrderHint: super::order_hint(ref_info.poc) as u8,
                 reserved1: [0; 3],
                 pExtensionHeader: std::ptr::null(),
             });
@@ -188,14 +193,44 @@ impl Av1 {
             qm_v: 0,
         };
 
-        let cdef = ash::vk::native::StdVideoAV1CDEF {
-            cdef_damping_minus_3: 0,
-            cdef_bits: 0,
-            cdef_y_pri_strength: [0; 8],
-            cdef_y_sec_strength: [0; 8],
-            cdef_uv_pri_strength: [0; 8],
-            cdef_uv_sec_strength: [0; 8],
+        // CDEF and loop restoration. A lossless frame (quantizer index 0)
+        // codes neither. The encoder picks one of four CDEF strengths for each
+        // block; the strengths are those of the Vulkan Video samples. NVIDIA
+        // (615.78.08) ignores the chroma strengths and writes its own.
+        let lossless = rc.is_disabled() && qp == 0;
+        let cdef = if lossless {
+            ash::vk::native::StdVideoAV1CDEF {
+                cdef_damping_minus_3: 0,
+                cdef_bits: 0,
+                cdef_y_pri_strength: [0; 8],
+                cdef_y_sec_strength: [0; 8],
+                cdef_uv_pri_strength: [0; 8],
+                cdef_uv_sec_strength: [0; 8],
+            }
+        } else {
+            ash::vk::native::StdVideoAV1CDEF {
+                cdef_damping_minus_3: 2,
+                cdef_bits: 2,
+                cdef_y_pri_strength: [0, 2, 4, 9, 0, 0, 0, 0],
+                cdef_y_sec_strength: [0; 8],
+                cdef_uv_pri_strength: [0; 8],
+                cdef_uv_sec_strength: [0; 8],
+            }
         };
+        // Loop restoration on luma, with 64x64 restoration units
+        // (`LoopRestorationSize` is the log2 of the size, less 5). NVIDIA
+        // (615.78.08) writes SGRPROJ, whatever type it gets.
+        let loop_restoration = ash::vk::native::StdVideoAV1LoopRestoration {
+            FrameRestorationType: [
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_SGRPROJ,
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
+                ash::vk::native::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
+            ],
+            LoopRestorationSize: [1, 1, 1],
+        };
+        if !lossless {
+            picture_info_flags.set_UsesLr(1);
+        }
 
         let loop_filter = ash::vk::native::StdVideoAV1LoopFilter {
             flags: ash::vk::native::StdVideoAV1LoopFilterFlags {
@@ -211,14 +246,14 @@ impl Av1 {
         };
 
         let (ref_frame_idx, ref_order_hint, primary_ref_frame, refresh_frame_flags) =
-            self.calculate_reference_frame_mapping(is_key_frame, current_dpb_slot);
+            self.calculate_reference_frame_mapping(plan, &references, current_dpb_slot);
 
         let std_picture_info = ash::vk::native::StdVideoEncodeAV1PictureInfo {
             flags: picture_info_flags,
             frame_type,
             frame_presentation_time: self.frame_num,
             current_frame_id: current_dpb_slot as u32,
-            order_hint: self.order_hint as u8,
+            order_hint: order_hint as u8,
             primary_ref_frame,
             refresh_frame_flags,
             coded_denom: 0,
@@ -237,7 +272,11 @@ impl Av1 {
             pSegmentation: std::ptr::null(),
             pLoopFilter: &loop_filter,
             pCDEF: &cdef,
-            pLoopRestoration: std::ptr::null(),
+            pLoopRestoration: if lossless {
+                std::ptr::null()
+            } else {
+                &loop_restoration
+            },
             pGlobalMotion: std::ptr::null(),
             pExtensionHeader: std::ptr::null(),
             pBufferRemovalTimes: std::ptr::null(),
@@ -246,16 +285,17 @@ impl Av1 {
         // Map the AV1 reference names this frame predicts from to DPB slots
         // (see `reference_names`); the others stay -1. The names that are set
         // must mirror `ref_frame_idx` from `calculate_reference_frame_mapping`.
-        let reference_name_slot_indices = if !is_key_frame && !self.references.is_empty() {
-            self.reference_names()
-        } else {
-            [-1i32; 7]
-        };
+        let reference_name_slot_indices = references.names;
 
         let (prediction_mode, rate_control_group) = if is_key_frame {
             (
                 vk::VideoEncodeAV1PredictionModeKHR::INTRA_ONLY,
                 vk::VideoEncodeAV1RateControlGroupKHR::INTRA,
+            )
+        } else if is_b {
+            (
+                vk::VideoEncodeAV1PredictionModeKHR::BIDIRECTIONAL_COMPOUND,
+                vk::VideoEncodeAV1RateControlGroupKHR::BIPREDICTIVE,
             )
         } else {
             (
@@ -293,7 +333,7 @@ impl Av1 {
 
         // Begin coding: setup slot (slot_index -1) plus any active reference slots.
         let mut all_reference_slots = Vec::new();
-        if is_reference {
+        if has_setup_slot {
             let setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
                 .slot_index(-1)
                 .picture_resource(&setup_picture_resource)
@@ -305,11 +345,35 @@ impl Av1 {
         // Clamp GOP values to at least 1; a value of 0 is undefined in
         // Vulkan and causes undefined behavior on some drivers (RADV).
         let gop_frames = common.config.gop_size.max(1);
-        let codec_rate_control = vk::VideoEncodeAV1RateControlInfoKHR::default()
+        let mut codec_rate_control = vk::VideoEncodeAV1RateControlInfoKHR::default()
             .gop_frame_count(gop_frames)
             .key_frame_period(gop_frames)
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
+        let b_frames = common.config.b_frames;
+        if b_frames > 0 {
+            // The count of B-frames has to be below the GOP length, so a GOP
+            // with no end is given the longest length there is.
+            let gop_frames = if common.config.gop_size == 0 {
+                u32::MAX
+            } else {
+                common.config.gop_size
+            };
+            let pattern = match common.gop.reference_pattern() {
+                Some(ReferencePattern::Flat) => {
+                    vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+                }
+                Some(ReferencePattern::Dyadic) => {
+                    vk::VideoEncodeAV1RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+                }
+                None => vk::VideoEncodeAV1RateControlFlagsKHR::empty(),
+            };
+            codec_rate_control = codec_rate_control
+                .gop_frame_count(gop_frames)
+                .key_frame_period(gop_frames)
+                .consecutive_bipredictive_frame_count(b_frames.min(gop_frames - 1))
+                .flags(vk::VideoEncodeAV1RateControlFlagsKHR::REGULAR_GOP | pattern);
+        }
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -322,7 +386,7 @@ impl Av1 {
             .dst_buffer(bitstream_buffer)
             .dst_buffer_offset(0)
             .dst_buffer_range(bitstream_buffer_size as u64);
-        if is_reference {
+        if has_setup_slot {
             encode_info = encode_info.setup_reference_slot(&setup_reference_slot);
         }
         if !reference_slots.is_empty() {
@@ -355,11 +419,12 @@ impl Av1 {
     /// header enables order hints. `STD_VIDEO_AV1_PRIMARY_REF_NONE` is 7.
     fn calculate_reference_frame_mapping(
         &self,
-        is_key_frame: bool,
+        plan: &FramePlan,
+        references: &FrameReferences,
         current_dpb_slot: u8,
     ) -> ([i8; 7], [u8; 8], u8, u8) {
         const PRIMARY_REF_NONE: u8 = 7;
-        if is_key_frame {
+        if plan.is_idr() {
             // Key frame refreshes all 8 reference slots; all names point to slot 0.
             return ([0i8; 7], [0u8; 8], PRIMARY_REF_NONE, 0xFFu8);
         }
@@ -367,19 +432,15 @@ impl Av1 {
             return ([0i8; 7], [0u8; 8], PRIMARY_REF_NONE, 0x00u8);
         }
 
-        let mut ref_frame_idx = [0i8; 7];
         let mut ref_order_hint = [0u8; 8];
         // The names this frame predicts from match `reference_name_slot_indices`.
         // The bitstream needs a slot for every name, so the others point at
-        // the most recent reference, which no block then uses.
-        let names = self.reference_names();
-        let newest = self.references[0].dpb_slot as i8;
-        for (idx, &slot) in ref_frame_idx.iter_mut().zip(&names) {
-            *idx = if slot >= 0 { slot as i8 } else { newest };
-        }
+        // a reference on their side, which no block then uses.
+        let names = references.names;
+        let ref_frame_idx = ref_frame_idx(references);
         // Order hints keyed by DPB slot, for every reference still held.
-        for r in &self.references {
-            ref_order_hint[r.dpb_slot as usize] = r.order_hint as u8;
+        for r in self.references.as_slice() {
+            ref_order_hint[r.dpb_slot as usize] = super::order_hint(r.poc) as u8;
         }
         // Load the frame context from the most recent reference, under the
         // first name it took, and refresh only the current slot so this frame
@@ -388,7 +449,12 @@ impl Av1 {
             .iter()
             .position(|&slot| slot >= 0)
             .map_or(PRIMARY_REF_NONE, |name| name as u8);
-        let refresh_flags = 1u8 << current_dpb_slot;
+        // A frame that no frame predicts from goes into no frame buffer.
+        let refresh_flags = if plan.is_reference() {
+            1u8 << current_dpb_slot
+        } else {
+            0
+        };
         (
             ref_frame_idx,
             ref_order_hint,

@@ -128,9 +128,22 @@ pub struct Sps {
     ///
     /// The number of frames that may precede any frame in decode order yet
     /// follow it in display order — i.e. the reorder buffer depth. `None` when
-    /// the stream does not signal it, in which case the decoder falls back to a
-    /// conservative bound.
+    /// the stream does not signal it, in which case [`Self::reorder_depth`]
+    /// infers it.
     pub max_num_reorder_frames: Option<u32>,
+}
+
+/// Where a stream's reorder depth comes from. See [`Sps::reorder_depth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderSource {
+    /// `max_num_reorder_frames` in the VUI.
+    Vui,
+    /// POC type 2: output order is decode order.
+    PocType,
+    /// A profile without B-frames.
+    Profile,
+    /// `MaxDpbFrames` of the level, which is what the standard infers.
+    Level,
 }
 
 impl Sps {
@@ -169,6 +182,60 @@ impl Sps {
             );
         }
         (width, height)
+    }
+
+    /// How many frames the reorder buffer must hold for this stream, and where
+    /// the number comes from.
+    ///
+    /// The VUI gives it when the stream has a bitstream restriction. Without
+    /// one the standard infers `MaxDpbFrames` (clause E.2.1), except where the
+    /// stream cannot reorder at all: POC type 2 makes output order equal decode
+    /// order, and the Baseline and intra-only profiles have no B-frames.
+    pub fn reorder_depth(&self) -> (usize, ReorderSource) {
+        if let Some(frames) = self.max_num_reorder_frames {
+            return (frames as usize, ReorderSource::Vui);
+        }
+        if self.pic_order_cnt_type == 2 {
+            return (0, ReorderSource::PocType);
+        }
+        // constraint_set3_flag marks the intra-only variants of the High
+        // profiles; 44 is CAVLC 4:4:4 Intra.
+        let constraint_set3 = self.constraint_set_flags & 0x10 != 0;
+        let intra_only = self.profile_idc == 44
+            || (matches!(self.profile_idc, 100 | 110 | 122 | 244) && constraint_set3);
+        if self.profile_idc == 66 || intra_only {
+            return (0, ReorderSource::Profile);
+        }
+        (self.max_dpb_frames(), ReorderSource::Level)
+    }
+
+    /// `MaxDpbFrames` (clause A.3.1): the DPB size the level allows for this
+    /// picture size, at most 16.
+    pub fn max_dpb_frames(&self) -> usize {
+        // MaxDpbMbs from Table A-1. Level 1b is coded as 11 with
+        // constraint_set3_flag (or as 9) and shares level 1's value.
+        let level_1b = self.level_idc == 9
+            || (self.level_idc == 11
+                && self.constraint_set_flags & 0x10 != 0
+                && matches!(self.profile_idc, 66 | 77 | 88));
+        let max_dpb_mbs: u32 = match self.level_idc {
+            _ if level_1b => 396,
+            0..=10 => 396,
+            11 => 900,
+            12 | 13 | 20 => 2376,
+            21 => 4752,
+            22 | 30 => 8100,
+            31 => 18000,
+            32 => 20480,
+            40 | 41 => 32768,
+            42 => 34816,
+            50 => 110_400,
+            51 | 52 => 184_320,
+            // Level 6 and above; an unknown level gets the largest bound.
+            _ => 696_320,
+        };
+        let frame_mbs = (self.coded_width() / 16) * (self.coded_height() / 16);
+        ((max_dpb_mbs / frame_mbs.max(1)) as usize).clamp(1, 16)
     }
 
     pub fn max_frame_num(&self) -> u32 {

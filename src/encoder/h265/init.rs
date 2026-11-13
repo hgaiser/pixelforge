@@ -1,9 +1,10 @@
 use super::{CTB_SIZE, H265};
+use crate::encoder::references::ReferenceSet;
 
 use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
-    CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+    CodecEncoder, CommonInitRequest, build_encoder_common, check_quality_level, query_video_caps,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::profile::h265_profile_idc;
@@ -50,6 +51,7 @@ impl H265 {
             capabilities = capabilities.push(&mut rgb_caps);
         }
         let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
+        check_quality_level(&config, encode_caps.max_quality_levels)?;
         let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
@@ -68,16 +70,23 @@ impl H265 {
             bitstream_buffer_size,
             allow_layered_dpb: true,
             rgb_caps,
+            b_frame_support: crate::encoder::bframes::h265_support(
+                context.device_properties().vendor_id,
+                &h265_caps,
+                caps.max_active_reference_pictures,
+            ),
         })?;
         let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
+        let b_l0_reference_count = (init.session_active_references.saturating_sub(1))
+            .min(h265_caps.max_b_picture_l0_reference_count);
         let common = init.common;
 
         let codec = H265 {
             header_data: None,
-            l0_references: Vec::new(),
-            reference_window,
+            references: ReferenceSet::new(reference_window),
             active_reference_count,
+            b_l0_reference_count,
             profile_idc,
         };
 

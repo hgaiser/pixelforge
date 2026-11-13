@@ -1,111 +1,116 @@
 //! Read decoded frames through per-plane views, with no ycbcr conversion.
 //!
-//! The companion to `sample_frame`, and the reason
-//! [`DecodedFrame::plane_views`] exists. `sample_frame` samples the decoded
-//! picture as one multi-planar image, which needs a `VkSamplerYcbcrConversion`
-//! bound as a combined image sampler with an immutable sampler. Some shader
-//! toolchains cannot express that at all: naga has no combined-image-sampler
-//! type, so wgpu has no ycbcr sampler, and a renderer built on either had no
-//! way to read a decoded frame without copying it first.
+//! [`DecodedFrame::plane_views`] says a decoded picture can be read as two
+//! ordinary single-plane textures, `R8_UNORM` luma and `R8G8_UNORM` chroma,
+//! bound as plain `texture2D` descriptors: no conversion object, no immutable
+//! sampler. That is what a renderer needs whose shader toolchain has no ycbcr
+//! sampler (naga, and so wgpu). It works because pixelforge asks for
+//! `MUTABLE_FORMAT` on picture images wherever the driver allows it.
 //!
-//! This reads the same picture as two ordinary single-plane textures instead,
-//! `R8_UNORM` luma and `R8G8_UNORM` chroma, bound as plain `texture2D`
-//! descriptors. No conversion object, no immutable sampler, no sampler at all.
-//! It works because pixelforge asks for `MUTABLE_FORMAT` on picture images
-//! wherever the driver allows it.
+//! The shader writes the samples straight through, so its output must equal
+//! [`YuvDownloader`]'s copy of the same frame, byte for byte.
 //!
-//! A real renderer would apply the YUV to RGB matrix in the shader. This writes
-//! the samples straight through, which makes the output plain NV12 and lets it
-//! be compared byte-for-byte against the decoder:
+//! On a device without `VK_KHR_unified_image_layouts`, frames are copies with
+//! no video usage, so a mistake in how a plane view is made passes silently.
+//! On a device with it the frame is the decoder's own image, and the same
+//! mistake is a validation error. So run this under validation on such a
+//! device too.
 //!
-//!   cargo run --example sample_planes -- tests/data/bframes.264 out.yuv
-//!   ffmpeg -i tests/data/bframes.264 -pix_fmt nv12 ref.yuv
-//!   cmp ref.yuv out.yuv
-//!
-//! Unlike `sample_frame`, this comparison is exact. There is no filtering, no
-//! chroma reconstruction and no colour matrix in the way.
+//! Ignored by default: requires a Vulkan Video device. Run with
+//! `cargo test --test sample_planes -- --ignored`.
 
 #[allow(dead_code)]
 mod common;
-use common::decode_input;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodedFrame, Decoder};
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder};
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
-use std::fs::File;
-use std::io::Write;
+use pixelforge::{Codec, YuvDownloader};
 
 const SHADER: &[u8] = include_bytes!("shader/sample_planes.spv");
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
-    let mut args = std::env::args().skip(1);
-    let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: sample_planes <input.264|.265|.obu|.ivf> [output.yuv]");
-        std::process::exit(1);
-    });
-    let output_path = args.next();
-    let (codec, input) = common::open_input(&input_path)?;
-
-    let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
-    let context = VideoContextBuilder::new()
-        .app_name("pixelforge-planes")
-        .require_decode(codec)
-        .enable_validation(validation)
-        .build()?;
-    println!(
-        "Device: {}",
-        unsafe { std::ffi::CStr::from_ptr(context.device_properties().device_name.as_ptr()) }
-            .to_string_lossy()
-    );
-
-    let consumer_family = context.compute_queue_family();
-    let config = common::decode_config(codec, &input)
-        .with_output_depth(8)
-        .with_consumer_queue_family(consumer_family);
-
-    let mut output = output_path.as_ref().map(File::create).transpose()?;
-    let mut planes: Option<PlaneReader> = None;
-    let mut decoder = Decoder::new(context.clone(), config)?;
-    let mut count = 0usize;
-    let start = std::time::Instant::now();
-
-    decode_input(&mut decoder, &input, |frame| {
-        if !frame.plane_views {
-            return Err(
-                "this device does not allow per-plane views of decoded pictures; \
-                        use the sample_frame example instead"
-                    .into(),
-            );
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn plane_views_match_the_decoder() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    // Both paths: the decoder's own images where the device has unified
+    // image layouts, and copies of them.
+    for (codec, path, copies) in [false, true].into_iter().flat_map(|copies| {
+        [
+            (Codec::H264, "tests/data/bframes.264", copies),
+            (Codec::H265, "tests/data/bpyramid.265", copies),
+            (Codec::AV1, "tests/data/av1/aom_altref.obu", copies),
+        ]
+    }) {
+        let mut builder = VideoContextBuilder::new()
+            .require_decode(codec)
+            .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok());
+        if copies {
+            builder = builder.without_unified_image_layouts();
         }
-        let reader = match &mut planes {
-            Some(p) => p,
-            none => none.insert(PlaneReader::new(&context, consumer_family, &frame)?),
-        };
-        let (y, uv) = reader.read(&frame)?;
-        if let Some(file) = output.as_mut() {
-            file.write_all(&y)?;
-            file.write_all(&uv)?;
+        let context = builder.build()?;
+        if !context.supports_decode(codec) {
+            eprintln!("{codec:?}: no decode on this device, nothing to check");
+            continue;
         }
-        count += 1;
-        Ok(())
-    })?;
-
-    let elapsed = start.elapsed();
-    println!(
-        "Read {} frames through plane views in {:.1?} ({:.1} fps)",
-        count,
-        elapsed,
-        count as f64 / elapsed.as_secs_f64()
-    );
-    if let Some(path) = output_path {
-        println!("Wrote NV12 frames to {}", path);
+        let consumer_family = context.compute_queue_family();
+        let config = DecodeConfig::new(codec)
+            .with_byte_stream()
+            .with_consumer_queue_family(consumer_family);
+        let mut decoder = Decoder::new(context.clone(), config)?;
+        let mut downloader = YuvDownloader::new(&context)?;
+        let mut planes: Option<PlaneReader> = None;
+        let mut count = 0;
+        common::decode_stream(&mut decoder, &std::fs::read(path)?, |frame| {
+            if !frame.plane_views {
+                return Err(format!("{path}: no per-plane views on this device").into());
+            }
+            let reader = match &mut planes {
+                Some(p) => p,
+                none => none.insert(PlaneReader::new(&context, consumer_family, &frame)?),
+            };
+            let (y, uv) = reader.read(&frame)?;
+            let expected = downloader.download(&frame)?;
+            assert!(y == expected.y, "{path}: frame {count}: luma differs");
+            assert!(uv == expected.uv, "{path}: frame {count}: chroma differs");
+            count += 1;
+            Ok(())
+        })?;
+        assert!(count > 0, "{path}: no frames");
+        eprintln!(
+            "{codec:?} (copies: {copies}): {count} frames read through plane views, all equal"
+        );
+        // Vulkan objects go before the device.
+        drop(planes);
+        drop(decoder);
     }
-
-    drop(planes);
-    drop(decoder);
     Ok(())
+}
+
+/// Find a memory type satisfying `flags` for `reqs`, and allocate from it.
+fn allocate(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    reqs: vk::MemoryRequirements,
+    flags: vk::MemoryPropertyFlags,
+) -> Result<vk::DeviceMemory, Box<dyn std::error::Error>> {
+    let index = (0..props.memory_type_count)
+        .find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(flags)
+        })
+        .ok_or("no suitable memory type")?;
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(index),
+            None,
+        )
+    }?;
+    Ok(memory)
 }
 
 /// Reads a decoded picture's two planes as ordinary textures.
@@ -392,10 +397,34 @@ impl PlaneReader {
                 1,
             );
 
-            let after = [
+            let mut after = vec![
                 storage_to_copy(self.out[0].image),
                 storage_to_copy(self.out[1].image),
             ];
+            // Give the frame back in the layout it reports: the decoder, and
+            // anyone else reading the frame, go by `frame.layout`.
+            if frame.layout != vk::ImageLayout::GENERAL {
+                after.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .dst_access_mask(vk::AccessFlags2::NONE)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(frame.layout)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(frame.image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_0
+                                | vk::ImageAspectFlags::PLANE_1,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: frame.array_layer,
+                            layer_count: 1,
+                        }),
+                );
+            }
             device.cmd_pipeline_barrier2(
                 self.command_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&after),
@@ -657,7 +686,7 @@ fn make_staging(
         )
     }?;
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory = common::allocate(
+    let memory = allocate(
         device,
         props,
         reqs,
@@ -695,7 +724,7 @@ fn make_plane(
         )
     }?;
     let reqs = unsafe { device.get_image_memory_requirements(image) };
-    let memory = common::allocate(device, props, reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+    let memory = allocate(device, props, reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
     unsafe { device.bind_image_memory(image, memory, 0) }?;
     let view = unsafe {
         device.create_image_view(

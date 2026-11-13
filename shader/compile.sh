@@ -18,10 +18,11 @@ glslc -x glsl --target-env=vulkan1.1 -O \
 FILE_SIZE=$(stat -c%s "$SPV_PATH" 2>/dev/null || stat -f%z "$SPV_PATH" 2>/dev/null)
 echo "Written $FILE_SIZE bytes to $SPV_PATH"
 
-# The examples carry shaders of their own.
-for name in sample_frame sample_planes; do
-    EXAMPLE_SRC="$PROJECT_ROOT/examples/shader/$name.comp"
-    EXAMPLE_SPV="$PROJECT_ROOT/examples/shader/$name.spv"
+# An example and a test carry shaders of their own.
+for path in examples/shader/sample_frame tests/shader/sample_planes; do
+    name="$(basename "$path")"
+    EXAMPLE_SRC="$PROJECT_ROOT/$path.comp"
+    EXAMPLE_SPV="$PROJECT_ROOT/$path.spv"
     echo "Compiling $name.comp → $name.spv"
     glslc -x glsl --target-env=vulkan1.1 -O "$EXAMPLE_SRC" -o "$EXAMPLE_SPV"
     FILE_SIZE=$(stat -c%s "$EXAMPLE_SPV" 2>/dev/null || stat -f%z "$EXAMPLE_SPV" 2>/dev/null)

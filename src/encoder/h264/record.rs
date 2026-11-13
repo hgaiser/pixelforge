@@ -1,24 +1,25 @@
 //! H.264 per-frame encode recording: builds the StdVideo* graph for one frame
 //! and submits it. This is the part that genuinely differs from the other codecs.
 
-use super::H264;
+use super::lists::{b_frame_lists, p_frame_list_modifications};
+use super::{H264, ReferenceInfo};
 
 use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
-use crate::encoder::pipeline::EncodeFuture;
+use crate::encoder::gop::ReferencePattern;
 use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
-use crate::error::Result;
+use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
 
+/// What a constant QP is raised by for a B-frame that is not a reference.
+const B_FRAME_QP_OFFSET: u32 = 2;
+
 impl H264 {
-    pub(super) fn record(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture> {
+    pub(super) fn record(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()> {
         let is_idr = plan.is_idr();
         let is_reference = plan.is_reference();
+        let is_b = plan.is_b();
         let pic_order_cnt = plan.pic_order_cnt();
         let frame_num = self.frame_num_syntax;
 
@@ -34,11 +35,11 @@ impl H264 {
             frame_num,
             pic_order_cnt,
             is_idr,
-            self.l0_references.len(),
+            self.references.len(),
             common.current_dpb_slot
         );
 
-        let rc = RateControlPlan::new(&common.config, 26);
+        let rc = RateControlPlan::for_frame(&common.config, 26, plan, B_FRAME_QP_OFFSET, 51);
 
         // Reference frame invalidation: emit MMCO "unmark short-term" operations
         // for references dropped since the last frame, so the decoder evicts the
@@ -46,7 +47,7 @@ impl H264 {
         // surviving reference. Only valid on a non-IDR reference picture (an IDR
         // resets the DPB on its own). Kept alive for the whole `record` call so
         // the pointer handed to the encoder stays valid.
-        let ref_pic_marking_ops: Vec<ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry> =
+        let mut ref_pic_marking_ops: Vec<ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry> =
             if !is_idr && is_reference && !self.pending_unmark_frame_nums.is_empty() {
                 self.pending_unmark_frame_nums
                     .iter()
@@ -82,7 +83,9 @@ impl H264 {
         }
         // Only the references this frame predicts from go to the encode. The
         // rest of the window stays in its DPB slots, untouched.
-        let used_references = self.used_references();
+        let (list0, list1) = self.reference_lists(plan)?;
+        let used_references: Vec<ReferenceInfo> = list0.iter().chain(&list1).copied().collect();
+        let used_references = used_references.as_slice();
         let ref_dpb_slots: Vec<u8> = used_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
@@ -99,15 +102,13 @@ impl H264 {
 
         let slice_type = if is_idr {
             ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I
+        } else if is_b {
+            ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_B
         } else {
             ash::vk::native::StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P
         };
 
-        let picture_type = if is_idr {
-            ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
-        } else {
-            ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
-        };
+        let picture_type = super::picture_type(plan);
 
         // Build StdVideoEncodeH264SliceHeader.
         // num_ref_idx_active_override_flag is only present in P/B/SP slice headers per the H.264
@@ -118,15 +119,16 @@ impl H264 {
         let slice_header_flags = ash::vk::native::StdVideoEncodeH264SliceHeaderFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags::new_bitfield_1(
-                0,                // direct_spatial_mv_pred_flag
+                is_b as u32,      // direct_spatial_mv_pred_flag
                 use_ref_override, // num_ref_idx_active_override_flag
                 0,                // reserved
             ),
         };
 
-        let slice_qp_delta = match common.config.rate_control {
-            crate::encoder::RateControl::Cqp { qp } => (qp as i32 - 26) as i8,
-            _ => 0,
+        let slice_qp_delta = if rc.is_disabled() {
+            (rc.qp as i32 - 26) as i8
+        } else {
+            0
         };
 
         let slice_header = ash::vk::native::StdVideoEncodeH264SliceHeader {
@@ -139,7 +141,9 @@ impl H264 {
             reserved1: 0,
             cabac_init_idc:
                 ash::vk::native::StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
-            disable_deblocking_filter_idc: ash::vk::native::StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_ENABLED,
+            // The value is the syntax element `disable_deblocking_filter_idc`:
+            // `_DISABLED` (0) keeps the deblocking filter on.
+            disable_deblocking_filter_idc: ash::vk::native::StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_DISABLED,
             pWeightTable: std::ptr::null(),
         };
 
@@ -159,47 +163,87 @@ impl H264 {
         // STD_VIDEO_H264_NO_REFERENCE_PICTURE = 0xFF.
         const NO_REFERENCE_PICTURE: u8 = 0xFF;
         let mut ref_list0: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
-        let ref_list1: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
+        let mut ref_list1: [u8; 32] = [NO_REFERENCE_PICTURE; 32];
+        for (entry, reference) in ref_list0.iter_mut().zip(&list0) {
+            *entry = reference.dpb_slot;
+        }
+        for (entry, reference) in ref_list1.iter_mut().zip(&list1) {
+            *entry = reference.dpb_slot;
+        }
+
+        // A P-frame that marks references unused (B-frame references of no
+        // more use, or references lost by reference frame invalidation) still
+        // has them at the start of the list a decoder builds for it, because
+        // the marking only takes effect after the frame. So it names its
+        // references.
+        let mut list0_modifications: Vec<ash::vk::native::StdVideoEncodeH264RefListModEntry> =
+            if !is_idr && !is_b && use_adaptive_marking {
+                let frame_nums: Vec<u32> = list0.iter().map(|r| r.codec.frame_num).collect();
+                p_frame_list_modifications(frame_num, &frame_nums, 256)
+                    .into_iter()
+                    .map(|op| ash::vk::native::StdVideoEncodeH264RefListModEntry {
+                        modification_of_pic_nums_idc: if op.add {
+                            ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_ADD
+                        } else {
+                            ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_SHORT_TERM_SUBTRACT
+                        },
+                        abs_diff_pic_num_minus1: op.abs_diff_pic_num_minus1,
+                        long_term_pic_num: 0,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // The NVIDIA driver (615.78.08) writes the operations it is given
+        // and nothing more, so the operation that ends the list is one of
+        // them.
+        if !list0_modifications.is_empty() {
+            list0_modifications.push(ash::vk::native::StdVideoEncodeH264RefListModEntry {
+                modification_of_pic_nums_idc:
+                    ash::vk::native::StdVideoH264ModificationOfPicNumsIdc_STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END,
+                abs_diff_pic_num_minus1: 0,
+                long_term_pic_num: 0,
+            });
+        }
+        // The same driver ends the marking operations by itself only in a
+        // P-slice with no list operations. In a B-slice, or with list
+        // operations, the operation that ends them has to be given.
+        if use_adaptive_marking && (is_b || !list0_modifications.is_empty()) {
+            ref_pic_marking_ops.push(ash::vk::native::StdVideoEncodeH264RefPicMarkingEntry {
+                memory_management_control_operation:
+                    ash::vk::native::StdVideoH264MemMgmtControlOp_STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_END,
+                difference_of_pic_nums_minus1: 0,
+                long_term_pic_num: 0,
+                long_term_frame_idx: 0,
+                max_long_term_frame_idx_plus1: 0,
+            });
+        }
 
         let ref_lists_info_flags = ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags::new_bitfield_1(
-                0, // ref_pic_list_modification_flag_l0
-                0, // ref_pic_list_modification_flag_l1
-                0, // reserved
+                !list0_modifications.is_empty() as u32, // ref_pic_list_modification_flag_l0
+                0,                                      // ref_pic_list_modification_flag_l1
+                0,                                      // reserved
             ),
-        };
-
-        // Set up the reference list for P-frames.
-        let num_ref_l0 = if !is_idr && !self.l0_references.is_empty() {
-            let actual_count = self
-                .l0_references
-                .len()
-                .min(self.active_reference_count as usize)
-                .min(32);
-            for (i, ref_info) in self.l0_references.iter().take(actual_count).enumerate() {
-                ref_list0[i] = ref_info.dpb_slot;
-            }
-            actual_count
-        } else {
-            0
         };
 
         let ref_lists_info = ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
             flags: ref_lists_info_flags,
-            num_ref_idx_l0_active_minus1: if num_ref_l0 > 0 {
-                (num_ref_l0 - 1) as u8
-            } else {
-                0
-            },
-            num_ref_idx_l1_active_minus1: 0,
+            num_ref_idx_l0_active_minus1: list0.len().saturating_sub(1) as u8,
+            num_ref_idx_l1_active_minus1: list1.len().saturating_sub(1) as u8,
             RefPicList0: ref_list0,
             RefPicList1: ref_list1,
-            refList0ModOpCount: 0,
+            refList0ModOpCount: list0_modifications.len() as u8,
             refList1ModOpCount: 0,
             refPicMarkingOpCount: ref_pic_marking_ops.len() as u8,
             reserved1: [0; 7],
-            pRefList0ModOperations: std::ptr::null(),
+            pRefList0ModOperations: if list0_modifications.is_empty() {
+                std::ptr::null()
+            } else {
+                list0_modifications.as_ptr()
+            },
             pRefList1ModOperations: std::ptr::null(),
             pRefPicMarkingOperations: if ref_pic_marking_ops.is_empty() {
                 std::ptr::null()
@@ -218,7 +262,7 @@ impl H264 {
             PicOrderCnt: pic_order_cnt,
             temporal_id: 0,
             reserved1: [0; 3],
-            pRefLists: if !is_idr && (!self.l0_references.is_empty() || use_adaptive_marking) {
+            pRefLists: if !is_idr && (!used_references.is_empty() || use_adaptive_marking) {
                 &ref_lists_info
             } else {
                 std::ptr::null()
@@ -273,9 +317,8 @@ impl H264 {
             );
             l0_std_infos.push(ash::vk::native::StdVideoEncodeH264ReferenceInfo {
                 flags: std_reference_info_flags,
-                primary_pic_type:
-                    ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
-                FrameNum: ref_info.frame_num,
+                primary_pic_type: ref_info.codec.pic_type,
+                FrameNum: ref_info.codec.frame_num,
                 PicOrderCnt: ref_info.poc,
                 long_term_pic_num: 0,
                 long_term_frame_idx: 0,
@@ -307,11 +350,7 @@ impl H264 {
         // Reference info for the setup slot (this frame).
         let std_reference_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
             flags: std_reference_info_flags,
-            primary_pic_type: if is_idr {
-                ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
-            } else {
-                ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
-            },
+            primary_pic_type: picture_type,
             FrameNum: frame_num,
             PicOrderCnt: pic_order_cnt,
             long_term_pic_num: 0,
@@ -356,30 +395,23 @@ impl H264 {
             reference_slots_for_begin.extend_from_slice(&l0_slots);
         }
 
-        // Rate control.
-        let qp_bounds = if rc.is_disabled() { rc.qp as i32 } else { 18 };
-        let qp_bounds_max = if rc.is_disabled() { rc.qp as i32 } else { 42 };
-        let min_qp = vk::VideoEncodeH264QpKHR {
-            qp_i: qp_bounds,
-            qp_p: qp_bounds,
-            qp_b: qp_bounds,
-        };
-        let max_qp = vk::VideoEncodeH264QpKHR {
-            qp_i: qp_bounds_max,
-            qp_p: qp_bounds_max,
-            qp_b: qp_bounds_max,
+        // Rate control. With CQP the bounds hold the QP. With CBR and VBR
+        // there are no bounds: a fixed range keeps the driver from reaching
+        // the target on easy or hard content.
+        let qp = vk::VideoEncodeH264QpKHR {
+            qp_i: rc.qp as i32,
+            qp_p: rc.qp as i32,
+            qp_b: rc.qp as i32,
         };
         let codec_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
-            .use_min_qp(true)
-            .min_qp(min_qp)
-            .use_max_qp(true)
-            .max_qp(max_qp);
-        let codec_rate_control = vk::VideoEncodeH264RateControlInfoKHR::default()
-            .gop_frame_count(common.config.gop_size)
-            .idr_period(common.config.gop_size);
+            .use_min_qp(rc.is_disabled())
+            .min_qp(qp)
+            .use_max_qp(rc.is_disabled())
+            .max_qp(qp);
+        let codec_rate_control = self.rate_control_info(common);
 
         let first_frame = plan.is_first_frame();
-        let future = common.record_encode(EncodeCommands {
+        common.record_encode(EncodeCommands {
             begin_slots: &reference_slots_for_begin,
             encode_info: &encode_info,
             rate_control: &rc,
@@ -396,6 +428,79 @@ impl H264 {
         if use_adaptive_marking {
             self.pending_unmark_frame_nums.clear();
         }
-        Ok(future)
+        Ok(())
+    }
+
+    /// The references this frame predicts from, as `RefPicList0` and
+    /// `RefPicList1`.
+    ///
+    /// A P-frame uses the newest references, in decode order, which is the
+    /// order a decoder puts them in. A B-frame uses the nearest ones shown
+    /// before it and the nearest one shown after it.
+    fn reference_lists(
+        &self,
+        plan: &FramePlan,
+    ) -> Result<(Vec<ReferenceInfo>, Vec<ReferenceInfo>)> {
+        if plan.is_idr() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if !plan.is_b() {
+            return Ok((self.used_references().to_vec(), Vec::new()));
+        }
+        let current = plan.pic_order_cnt();
+        let references = self.references.as_slice();
+        let pocs: Vec<i32> = references.iter().map(|r| r.poc).collect();
+        let before = pocs.iter().filter(|&&poc| poc < current).count();
+        let after = pocs.len() - before;
+        if before == 0 || after == 0 {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "H.264 B-frame with POC {current} has {before} references before it and \
+                 {after} after it"
+            )));
+        }
+        let (l0, l1) = b_frame_lists(&pocs, current);
+        let take = |list: Vec<usize>, count: usize| -> Vec<ReferenceInfo> {
+            list.into_iter()
+                .take(count)
+                .map(|i| references[i])
+                .collect()
+        };
+        // Only references on the frame's own side of each list, so that no
+        // picture is in both and the count stays within the session's.
+        let l0_count = before.min(self.b_l0_reference_count as usize);
+        Ok((take(l0, l0_count), take(l1, 1)))
+    }
+
+    /// The GOP the rate control is told to expect.
+    fn rate_control_info(
+        &self,
+        common: &EncoderCommon,
+    ) -> vk::VideoEncodeH264RateControlInfoKHR<'static> {
+        let config = &common.config;
+        let info = vk::VideoEncodeH264RateControlInfoKHR::default()
+            .gop_frame_count(config.gop_size)
+            .idr_period(config.gop_size);
+        if config.b_frames == 0 {
+            return info;
+        }
+        // The count of B-frames has to be below the GOP length, so a GOP
+        // with no end is given the longest length there is.
+        let gop_frame_count = if config.gop_size == 0 {
+            u32::MAX
+        } else {
+            config.gop_size
+        };
+        let pattern = match common.gop.reference_pattern() {
+            Some(ReferencePattern::Flat) => {
+                vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+            }
+            Some(ReferencePattern::Dyadic) => {
+                vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_DYADIC
+            }
+            None => vk::VideoEncodeH264RateControlFlagsKHR::empty(),
+        };
+        info.gop_frame_count(gop_frame_count)
+            .consecutive_b_frame_count(config.b_frames.min(gop_frame_count - 1))
+            .flags(vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP | pattern)
     }
 }

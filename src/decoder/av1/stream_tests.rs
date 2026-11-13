@@ -20,6 +20,8 @@
 //! | `aom_10bit`       | 10-bit Main profile                                    |
 //! | `aom_grain`       | film grain (libaom denoiser)                           |
 //! | `svt_grain`       | SVT-AV1 with film grain, `update_grain = 0` reuse      |
+//! | `svt_hier`        | SVT-AV1 random access, three hierarchical levels of    |
+//! |                   | hidden frames                                          |
 //! | `aom_errres`      | error resilient frames, frame ids, `ref_order_hint`,   |
 //! |                   | S-frames                                               |
 //! | `aom_superres`    | superres                                               |
@@ -50,13 +52,14 @@ macro_rules! fixture {
     };
 }
 
-const FIXTURES: [(&str, &[u8], &str); 10] = [
+const FIXTURES: [(&str, &[u8], &str); 11] = [
     fixture!("aom_altref"),
     fixture!("aom_tiles"),
     fixture!("aom_tilegroups"),
     fixture!("aom_10bit"),
     fixture!("aom_grain"),
     fixture!("svt_grain"),
+    fixture!("svt_hier"),
     fixture!("aom_errres"),
     fixture!("aom_superres"),
     fixture!("aom_resize"),

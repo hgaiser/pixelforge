@@ -362,7 +362,7 @@ impl Encoder {
             Source::Rgb(rgb) => Some(rgb.format.vk_format()),
             Source::Yuv => None,
         };
-        Ok(match self.conversion() {
+        let plan = match self.conversion() {
             Conversion::None => {
                 if config.chroma_format == ChromaFormat::Yuv422 {
                     return Err(PixelForgeError::InvalidInput(
@@ -385,6 +385,21 @@ impl Encoder {
                 zero_copy: Access::Sample,
                 fallback: None,
             },
+        };
+        // A B-frame is encoded only once the frame after its group arrives.
+        // Read directly, it would keep the producer's buffer that long, and a
+        // compositor has few of them. Copied, the buffer is free at once.
+        Ok(match plan {
+            InputPlan {
+                zero_copy: Access::Encode,
+                vk_format,
+                ..
+            } if config.b_frames > 0 => InputPlan {
+                vk_format,
+                zero_copy: Access::Copy,
+                fallback: None,
+            },
+            plan => plan,
         })
     }
 
@@ -946,14 +961,13 @@ pub(crate) struct SyncFiles {
 }
 
 impl SyncFiles {
-    pub(crate) fn new(context: &VideoContext) -> Result<Self> {
+    pub(crate) fn new(context: &VideoContext, slots: usize) -> Result<Self> {
         if !context.external().sync_file {
             return Err(PixelForgeError::NoSuitableDevice(
                 "sync_file fences need VK_KHR_external_semaphore_fd".to_string(),
             ));
         }
         let device = context.device();
-        let slots = crate::encoder::pipeline::ENCODE_PIPELINE_DEPTH;
         let mut files = Self {
             context: context.clone(),
             fd_fn: ash::khr::external_semaphore_fd::Device::load(context.instance(), device),

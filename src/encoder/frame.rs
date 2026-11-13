@@ -129,6 +129,10 @@ impl<'a> Frame<'a> {
     ///
     /// For a producer that waits on sync_files, or to attach to the DMA-BUF
     /// with `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` before handing it back.
+    ///
+    /// With B-frames, [`Encoder::submit`](crate::Encoder::submit) returns
+    /// an error for a frame from [`Frame::input`] that asks for this: its
+    /// release is its encode, which may come in a later call.
     #[cfg(feature = "dmabuf")]
     pub fn signal_sync_file(mut self) -> Self {
         self.signal_sync_file = true;

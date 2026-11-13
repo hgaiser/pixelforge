@@ -1,0 +1,12 @@
+[package]
+name = "pixelforge-tools"
+version = "0.0.0"
+edition = "2024"
+description = "Command-line tools to develop and check pixelforge. Not published."
+license = "BSD-2-Clause"
+publish = false
+
+[dependencies]
+pixelforge = { path = ".." }
+pollster = "1.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

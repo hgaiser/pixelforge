@@ -26,12 +26,9 @@ use std::fs::File;
 use std::io::Write;
 
 use ash::vk::{self, TaggedStructure as _};
-use pixelforge::decoder::{DecodedFrame, Decoder};
+use pixelforge::Codec;
+use pixelforge::decoder::{DecodeConfig, DecodedFrame, Decoder, FramePoll};
 use pixelforge::vulkan::{VideoContext, VideoContextBuilder};
-
-#[allow(dead_code)]
-mod common;
-use common::decode_input;
 
 const SHADER: &[u8] = include_bytes!("shader/sample_frame.spv");
 
@@ -40,11 +37,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = std::env::args().skip(1);
     let input_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: sample_frame <input.264|.265|.obu|.ivf> [output.rgba]");
+        eprintln!("usage: sample_frame <input.264|.265|.obu> [output.rgba]");
         std::process::exit(1);
     });
     let output_path = args.next();
-    let (codec, input) = common::open_input(&input_path)?;
+    let codec = match input_path.rsplit('.').next() {
+        Some("264") => Codec::H264,
+        Some("265") => Codec::H265,
+        Some("obu") => Codec::AV1,
+        _ => return Err(format!("unknown stream extension in {input_path:?}").into()),
+    };
+    let stream = std::fs::read(&input_path)?;
 
     let validation = std::env::var("PIXELFORGE_VALIDATION").is_ok();
     let context = VideoContextBuilder::new()
@@ -63,8 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // picture's sharing set. Without this, sampling a decoded image from a
     // family the decoder did not share with is undefined.
     let consumer_family = context.compute_queue_family();
-    let config = common::decode_config(codec, &input)
-        .with_output_depth(8)
+    let config = DecodeConfig::new(codec)
+        .with_byte_stream()
         .with_consumer_queue_family(consumer_family);
 
     let mut output = output_path.as_ref().map(File::create).transpose()?;
@@ -76,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0usize;
     let start = std::time::Instant::now();
 
-    decode_input(&mut decoder, &input, |frame| {
+    let mut on_frame = |frame: DecodedFrame| -> Result<(), Box<dyn std::error::Error>> {
         let sampler = match &mut sampler {
             Some(s) => s,
             none => none.insert(Sampler::new(&context, consumer_family, &frame)?),
@@ -87,7 +90,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         count += 1;
         Ok(())
-    })?;
+    };
+    for (index, piece) in stream.chunks(64 * 1024).enumerate() {
+        decoder.decode(piece, index as u64)?;
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            on_frame(frame)?;
+        }
+    }
+    decoder.finish()?;
+    while let Some(frame) = pollster::block_on(decoder.next_frame())? {
+        on_frame(frame)?;
+    }
+    drop(on_frame);
 
     let elapsed = start.elapsed();
     println!(

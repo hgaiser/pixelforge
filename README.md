@@ -1,3 +1,5 @@
+![pixelforge](assets/banner-readme.png)
+
 # pixelforge
 
 [![CI](https://github.com/hgaiser/pixelforge/workflows/CI/badge.svg)](https://github.com/hgaiser/pixelforge/actions)
@@ -24,13 +26,14 @@ H.265 and AV1, for both encode and decode.
 - **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
+- **B-frames**: for all three codecs, flat or as a pyramid, where the
+  device can encode them. Off by default, since they add latency.
 - **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
-- **Utility helpers**: [`YuvUploader`] for easy YUV data upload to GPU.
+- **Utility helpers**: [`YuvUploader`] to upload YUV frames to the GPU,
+  and [`YuvDownloader`] to copy decoded frames back to the CPU.
 - **Optional DMA-BUF input**: import a producer's buffers, or allocate buffers
   for it, read with no copy where the driver allows, with sync_file fences
   (Linux only).
-
-> **Note**: B-frame encoding is not yet implemented, so there is no option for it.
 
 ## Supported Codecs
 
@@ -181,8 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 A live frame reserves a DPB slot, so
 [`DecodeConfig::with_output_depth`](decoder::DecodeConfig::with_output_depth)
 bounds how many can be outstanding before the decoder starts copying
-pictures out instead of handing over its own. Reading a frame back to the
-CPU is the consumer's job; `examples/common` shows one way.
+pictures out instead of handing over its own. To get a frame's samples on
+the CPU (for a file, a test or software processing), copy it with
+[`YuvDownloader`].
 
 ### RGB input
 
@@ -265,6 +269,61 @@ flight. The pixels are in one of:
   CPU, waits for that itself.
 - a `DmaBufImage`, a DMA-BUF (see below).
 
+### B-frames
+
+[`EncodeConfig::with_b_frames`] puts B-frames between two reference
+frames. A B-frame predicts from the frame shown before it and from the one
+shown after it, which costs fewer bits, and it costs latency: the encoder
+has to wait for the later frame. [`VideoContext::supports_b_frames`] says
+what the device can do for a codec, and [`Encoder::new`] returns an error
+for more than that.
+
+```rust
+let b_frames = encoder.config().b_frames as usize;
+let mut pending = VecDeque::new();
+for frame in frames {
+    pending.push_back(encoder.submit(Frame::image(frame))?);
+    // At most `b_frames` frames wait for the frame after their group, so
+    // the oldest future is only sure to resolve once more are pending.
+    // Waiting for it sooner never returns.
+    while pending.len() > b_frames {
+        let packet = pollster::block_on(pending.pop_front().unwrap())?;
+        // Write `packet.data`. The packets come in decode order.
+    }
+}
+// Encode the frames that still wait, then take the rest.
+encoder.flush()?;
+for future in pending {
+    let packet = pollster::block_on(future)?;
+}
+```
+
+What changes with B-frames:
+
+- The future of the k-th submitted frame resolves with the k-th packet of
+  the stream, in decode order. That is the packet of another frame, and
+  [`EncodedPacket::pts`] says which.
+- For H.264 and H.265, [`EncodedPacket::dts`] counts in decode order and
+  starts below zero, so it is never after `pts`. An AV1 stream has no
+  reordering of its own: its packets are in display order, with
+  `dts == pts`, and the frame encoded ahead travels hidden in an earlier
+  packet.
+- [`Encoder::request_idr`], [`Encoder::flush`], [`Encoder::repeat`] and
+  [`Encoder::reconfigure`] encode the frames that wait at once, as a
+  shorter group.
+- [`Encoder::invalidate_reference_frames`] drops every reference encoded
+  from the first lost frame on, also B-frames shown before it, because
+  the client lost those packets too. If no reference survives, the oldest
+  frame that waits for its group becomes the IDR at once.
+- With a constant QP, a B-frame gets a slightly higher QP than the
+  other frames, and one step more for each level of a pyramid.
+- A DMA-BUF is copied when it is submitted and never read directly, so
+  the producer gets its buffer back at once.
+
+How much B-frames save depends on the driver. On NVIDIA (615.78.08) they
+save bits with H.265 and AV1. With H.264 that driver predicts a B-frame
+from one direction only, and the stream gets larger than without them.
+
 ### Encoding on your own device
 
 An application that already renders with Vulkan can give pixelforge its own
@@ -319,27 +378,27 @@ cargo bench --bench encode
 
 ## Examples
 
-Run the examples with:
-
 ```
-# Query codec capabilities
+# What this device can encode and decode
 cargo run --example query_capabilities
 
-# Decode H.264 to raw YUV
-cargo run --example decode -- input.264 output.yuv
-
-# Encode, choosing the codec (h264, h265 or av1)
+# Encode frames from CPU memory (h264, h265 or av1)
 cargo run --example encode -- h265
 
-# Sample decoded frames through a ycbcr conversion (RGBA output)
-cargo run --example sample_frame -- input.264 out.rgba
+# Encode frames that the application draws on the GPU
+cargo run --example encode_gpu -- h265
 
-# Sample decoded frames through per-plane views (NV12 output)
-cargo run --example sample_planes -- input.264 out.yuv
+# Decode a stream to a raw YUV file
+cargo run --example decode -- input.264 output.yuv
+
+# Decode and sample the frames in a shader, with no copy (RGBA output)
+cargo run --example sample_frame -- input.264 out.rgba
 ```
 
-Correctness checks that need a video device and ffmpeg are integration
-tests, ignored by default:
+The `tools` crate in the repository has command-line tools to check the
+library, with more options: `cargo run -p pixelforge-tools --bin encode`
+and `--bin decode`. Correctness checks that need a video device are
+integration tests, ignored by default:
 
 ```
 cargo test -- --ignored
@@ -352,8 +411,7 @@ See [shader/README.md](shader/README.md) for details on editing and recompiling 
 
 ## TODO's
 
-1. [] H.265 and AV1 decoding.
-1. [] B-frames support (encode).
+1. [] Open GOPs.
 
 ## Contributing
 

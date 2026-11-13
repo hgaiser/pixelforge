@@ -16,10 +16,11 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 
 use crate::converter::RgbFormat;
-use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
+use crate::encoder::bframes::check_support as check_b_frame_support;
+use crate::encoder::gop::{GopFrameType, GopPlanner, GopPosition};
 use crate::encoder::input::{FrameInput, FrameSync, SourceOwnership};
 use crate::encoder::pipeline::{
-    ENCODE_PIPELINE_DEPTH, EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata,
+    Delivery, EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata,
 };
 use crate::encoder::profile::EncodeProfile;
 use crate::encoder::resources::{
@@ -29,7 +30,10 @@ use crate::encoder::resources::{
     upload_image_to_input,
 };
 use crate::encoder::rgb::RgbConversionCaps;
-use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControl, StreamColor};
+use crate::encoder::{
+    BFrameSupport, ColorDescription, EncodeConfig, EncodedPacket, EncodedPacketStats, FrameType,
+    RateControl, StreamColor,
+};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{TimelineChain, allocate_command_buffers};
@@ -61,8 +65,9 @@ pub(crate) struct EncoderCommon {
 
     /// Async slot rotation + bitstream readback.
     pub pipeline: EncodePipeline,
-    /// Frame-type/POC schedule.
-    pub gop: GopStructure,
+    /// Frame types, and the order frames are encoded in. Holds the frames
+    /// that wait for the reference frame after them.
+    pub gop: GopPlanner<QueuedFrame>,
     /// Monotonic display-order counter (presentation order).
     pub input_frame_num: u64,
     /// Monotonic encode-order counter (decode order / DTS; `0` => first frame).
@@ -89,17 +94,22 @@ pub(crate) struct EncoderCommon {
     pub upload_command_buffers: Vec<vk::CommandBuffer>,
     /// Signalled by each upload; the encode of the same frame waits on it.
     pub upload_timeline: TimelineChain,
-    /// What the current frame's encode submission waits for.
+    /// What the encode submission of the frame being encoded waits for.
     pub pending_waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
-    /// What the current frame's encode submission signals besides its
-    /// timeline: a release the caller asked for, when the encode is what
+    /// What the encode submission of the frame being encoded signals besides
+    /// its timeline: a release the caller asked for, when the encode is what
     /// reads the source last.
     pub pending_signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
-    /// What the current frame's encode reads.
+    /// What the encode of the frame being encoded reads.
     pub source: SourceBinding,
-    /// When the current frame's source is free again, if something before
-    /// the encode was the last to read it.
-    pub source_released: Option<TimelinePoint>,
+    /// Where the bitstream of the frame being encoded goes.
+    pub delivery: Delivery,
+    /// The point the last encode submission signals. `None` until the frame
+    /// being encoded was submitted.
+    pub encode_point: Option<TimelinePoint>,
+    /// The frames that were encoded and are not shown yet, see
+    /// [`VideoCodec::HIDDEN_FRAMES`].
+    pub hidden_frames: Vec<HiddenFrame>,
     /// The session's video profile, for images made after creation.
     #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
     pub profile: EncodeProfile,
@@ -108,30 +118,22 @@ pub(crate) struct EncoderCommon {
 }
 
 impl EncoderCommon {
-    /// Prologue: wait until the slot we are about to record over has been read
-    /// back, pull the next GOP position, and snapshot the counters this frame
-    /// will encode with.
-    pub fn begin_frame(&mut self) -> FramePlan {
-        self.pipeline.wait_current_free();
-        let gop = self.gop.get_next_frame();
-        let display_order = self.input_frame_num;
-        self.input_frame_num += 1;
-        FramePlan {
-            gop,
-            display_order,
-            encode_index: self.encode_frame_num,
-        }
-    }
-
-    /// Set up what the current frame's encode reads, copying the source into
-    /// the slot's input image first when it has to.
+    /// Set up what a frame's encode reads, copying the source into the input
+    /// image of `slot` first when it has to. Returns the frame, ready to wait
+    /// for its encode, and the point where its source is free again if
+    /// something before the encode is the last to read it.
     ///
     /// `sync.waits` go to the frame's first submission and
     /// `sync.release_signals` to the one that is last to read the source:
     /// the copy when there is one, the encode otherwise.
-    pub fn prepare_source(&mut self, input: FrameInput, sync: FrameSync) -> Result<()> {
+    pub fn prepare_source(
+        &mut self,
+        slot: usize,
+        input: FrameInput,
+        sync: FrameSync,
+    ) -> Result<(HeldFrame, Option<TimelinePoint>)> {
         let (slot_image, slot_view, slot_layout) = {
-            let slot = self.pipeline.current();
+            let slot = self.pipeline.slot(slot);
             (
                 slot.input_image,
                 slot.input_image_view,
@@ -144,14 +146,9 @@ impl EncoderCommon {
             extent: None,
             ownership: None,
         };
-        self.source_released = None;
-        self.pending_signals.clear();
-        match input {
-            FrameInput::InPlace => {
-                self.source = slot_binding;
-                self.pending_waits = sync.waits;
-                self.pending_signals = sync.release_signals;
-            }
+        let mut released = None;
+        let (source, waits, signals) = match input {
+            FrameInput::InPlace => (slot_binding, sync.waits, sync.release_signals),
             FrameInput::Copy { image, ownership } => {
                 let (semaphore, value) = self.upload_timeline.pending_signal();
                 let done = vk::SemaphoreSubmitInfo::default()
@@ -161,8 +158,7 @@ impl EncoderCommon {
                 let mut signals = vec![done];
                 signals.extend(sync.release_signals);
                 let params = UploadParams {
-                    upload_command_buffer: self.upload_command_buffers
-                        [self.pipeline.current_index()],
+                    upload_command_buffer: self.upload_command_buffers[slot],
                     src_image: image,
                     src_ownership: ownership,
                     dst_image: slot_image,
@@ -177,30 +173,49 @@ impl EncoderCommon {
                 };
                 upload_image_to_input(&self.context, &params)?;
                 self.upload_timeline.commit();
-                self.pipeline.current_mut().input_image_layout =
+                self.pipeline.slot_mut(slot).input_image_layout =
                     vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
                 let point = TimelinePoint::new(semaphore, value);
-                self.pending_waits = vec![point.wait_info()];
-                self.source_released = Some(point);
-                self.source = slot_binding;
+                released = Some(point);
+                (slot_binding, vec![point.wait_info()], Vec::new())
             }
             FrameInput::Direct {
                 image,
                 view,
                 extent,
                 ownership,
-            } => {
-                self.source = SourceBinding {
+            } => (
+                SourceBinding {
                     image,
                     view,
                     extent: Some(extent),
                     ownership: Some(ownership),
-                };
-                self.pending_waits = sync.waits;
-                self.pending_signals = sync.release_signals;
-            }
-        }
-        Ok(())
+                },
+                sync.waits,
+                sync.release_signals,
+            ),
+        };
+        Ok((
+            HeldFrame {
+                slot,
+                source,
+                waits,
+                signals,
+                submitted: std::time::Instant::now(),
+            },
+            released,
+        ))
+    }
+
+    /// Make `frame` the frame being encoded: the codec hooks record into its
+    /// slot and read its source from here on.
+    pub fn begin_encode(&mut self, frame: HeldFrame, delivery: Delivery) {
+        self.pipeline.begin_encode(frame.slot);
+        self.source = frame.source;
+        self.pending_waits = frame.waits;
+        self.pending_signals = frame.signals;
+        self.delivery = delivery;
+        self.encode_point = None;
     }
 
     /// The view the current frame's encode reads.
@@ -293,26 +308,26 @@ impl EncoderCommon {
         self.pipeline.set_pending_metadata(metadata);
     }
 
-    /// Submit the recorded command buffer for the current slot, mark its DPB
-    /// slot active, and return the future that resolves with its packet.
-    pub fn submit_frame(&mut self) -> Result<EncodeFuture> {
+    /// Submit the recorded command buffer for the current slot and mark its
+    /// DPB slot active. [`Self::encode_point`] is what the submission signals.
+    pub fn submit_frame(&mut self) -> Result<()> {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
         let waits = std::mem::take(&mut self.pending_waits);
         let signals = std::mem::take(&mut self.pending_signals);
-        let mut future = self.pipeline.submit_current(
+        let delivery = std::mem::replace(&mut self.delivery, Delivery::Packet);
+        let point = self.pipeline.submit_current(
             self.context.device(),
             self.context.sync2(),
             encode_queue,
             &waits,
             &signals,
+            delivery,
         )?;
-        if let Some(point) = self.source_released.take() {
-            future.set_released(point);
-        }
+        self.encode_point = Some(point);
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
-        Ok(future)
+        Ok(())
     }
 
     /// Record one frame's encode into the current slot's command buffer,
@@ -320,7 +335,7 @@ impl EncoderCommon {
     ///
     /// The codec builds what differs: the reference slots, the encode info
     /// with its picture info, and its rate control structs.
-    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<EncodeFuture>
+    pub fn record_encode<R, L>(&mut self, cmd: EncodeCommands<'_, R, L>) -> Result<()>
     where
         R: for<'x> vk::Extends<vk::VideoBeginCodingInfoKHR<'x>>
             + for<'x> vk::Extends<vk::VideoCodingControlInfoKHR<'x>>
@@ -374,8 +389,8 @@ impl EncoderCommon {
         // FFmpeg; required for AMD RADV).
         if cmd.reset {
             let mut codec_rc = cmd.codec_rate_control;
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+                .quality_level(self.config.quality_level);
             let control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(
                     vk::VideoCodingControlFlagsKHR::RESET
@@ -425,11 +440,6 @@ impl EncoderCommon {
         self.submit_frame()
     }
 
-    /// Epilogue: advance to the next pipeline slot.
-    pub fn advance(&mut self) {
-        self.pipeline.advance();
-    }
-
     /// The `ash` device handle.
     pub fn device(&self) -> &ash::Device {
         self.context.device()
@@ -449,14 +459,53 @@ pub(crate) struct SourceBinding {
     pub ownership: Option<SourceOwnership>,
 }
 
-/// Everything a single frame needs to know about its schedule, snapshotted by
-/// [`EncoderCommon::begin_frame`] so the codec hooks all see a consistent view.
+/// A submitted frame that waits for its encode: its pipeline slot, which holds
+/// the pixels unless the encode reads the source directly, and what the encode
+/// submission needs.
+pub(crate) struct HeldFrame {
+    pub slot: usize,
+    pub source: SourceBinding,
+    /// What the encode submission waits for.
+    pub waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// What the encode submission signals besides its timeline.
+    pub signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// When the frame was submitted, for the packet's latency.
+    pub submitted: std::time::Instant,
+}
+
+/// A frame the planner holds, or hands back to be encoded.
+pub(crate) struct QueuedFrame {
+    pub frame: HeldFrame,
+    /// Display order (PTS) since the encoder was made.
+    pub display_order: u64,
+}
+
+/// A frame that was encoded before frames shown earlier, in a codec that
+/// hides such a frame until its turn (see [`VideoCodec::HIDDEN_FRAMES`]).
+pub(crate) struct HiddenFrame {
+    pub display_order: u64,
+    /// The type of the frame, which is the type of the packet that shows it.
+    pub frame_type: FrameType,
+    /// The packet that shows the frame.
+    pub show_packet: Vec<u8>,
+    /// When the frame was submitted, for the packet's latency.
+    pub submitted: std::time::Instant,
+}
+
+/// Everything a single frame needs to know about its schedule, so the codec
+/// hooks all see a consistent view.
 pub(crate) struct FramePlan {
     pub gop: GopPosition,
     /// Presentation order (PTS).
     pub display_order: u64,
-    /// Encode order (DTS); `0` marks the very first encoded frame.
+    /// Encode order; `0` marks the very first encoded frame.
     pub encode_index: u64,
+    /// How far decode order runs ahead of display order, which the DTS is
+    /// shifted back by so it is never after the PTS.
+    pub reorder_delay: u32,
+    /// Whether the frame is encoded now and shown later, by a packet of its
+    /// own. Only with [`VideoCodec::HIDDEN_FRAMES`].
+    pub hidden: bool,
 }
 
 impl FramePlan {
@@ -465,6 +514,13 @@ impl FramePlan {
     }
     pub fn is_reference(&self) -> bool {
         self.gop.is_reference
+    }
+    pub fn is_b(&self) -> bool {
+        self.gop.frame_type == GopFrameType::B
+    }
+    /// 0 for IDR and P-frames, and the depth in the pyramid for a B-frame.
+    pub fn pyramid_level(&self) -> u8 {
+        self.gop.pyramid_level
     }
     pub fn is_first_frame(&self) -> bool {
         self.encode_index == 0
@@ -477,7 +533,14 @@ impl FramePlan {
         match self.gop.frame_type {
             GopFrameType::Idr => FrameType::Idr,
             GopFrameType::P => FrameType::P,
+            GopFrameType::B => FrameType::B,
         }
+    }
+    /// The packet's decode timestamp: the encode order, shifted back by the
+    /// reorder delay. Below zero for the first packets of a stream with
+    /// B-frames.
+    pub fn dts(&self) -> i64 {
+        self.encode_index as i64 - i64::from(self.reorder_delay)
     }
 }
 
@@ -551,8 +614,41 @@ impl RateControlPlan {
         }
     }
 
+    /// The decision for the frame `plan`. With a constant quantizer, a
+    /// B-frame gets a coarser one: no frame, or fewer frames, predict from
+    /// it, so its bits buy less. `b_offset` is what is added for a B-frame
+    /// that is not a reference; `max` is the largest quantizer the codec has.
+    pub fn for_frame(
+        config: &EncodeConfig,
+        controller_default_qp: u32,
+        plan: &FramePlan,
+        b_offset: u32,
+        max: u32,
+    ) -> Self {
+        let mut rc = Self::new(config, controller_default_qp);
+        if rc.is_disabled() && plan.is_b() {
+            rc.qp = (rc.qp + b_frame_qp_offset(plan, b_offset)).min(max);
+        }
+        rc
+    }
+
     pub fn is_disabled(&self) -> bool {
         self.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
+    }
+}
+
+/// What a constant quantizer is raised by for the B-frame `plan`.
+///
+/// Each level of a pyramid is a step of half `b_offset` more than the level
+/// above it: fewer frames predict from a deeper frame. A B-frame that is not
+/// a reference gets `b_offset` at least, also in a flat group, where it is at
+/// level 1.
+fn b_frame_qp_offset(plan: &FramePlan, b_offset: u32) -> u32 {
+    let by_level = u32::from(plan.pyramid_level()) * (b_offset / 2);
+    if plan.is_reference() {
+        by_level
+    } else {
+        by_level.max(b_offset)
     }
 }
 
@@ -562,6 +658,21 @@ impl RateControlPlan {
 /// parameter caches). The generic driver calls these hooks in order around each
 /// frame; everything else (slot rotation, upload, readback, teardown) is shared.
 pub(crate) trait VideoCodec: Sized + Send {
+    /// Whether the codec has no reordering of its own, and hides a frame
+    /// that is encoded before frames shown earlier (AV1).
+    ///
+    /// Such a frame has no packet: its bitstream goes in front of the next
+    /// packet. When its turn to be shown comes, a packet from
+    /// [`Self::show_packet`] shows it. So the packets are in display order,
+    /// and their decode timestamps are their presentation timestamps.
+    const HIDDEN_FRAMES: bool = false;
+
+    /// The packet that shows the hidden frame `plan`, which was just encoded
+    /// into `dpb_slot`. Only called with [`Self::HIDDEN_FRAMES`].
+    fn show_packet(&self, _plan: &FramePlan, _dpb_slot: u8) -> Vec<u8> {
+        Vec::new()
+    }
+
     /// Per-frame prologue: codec IDR/key-frame resets and header retrieval.
     /// Runs before recording; returns the packet's frame type and header.
     fn begin_picture(
@@ -573,11 +684,8 @@ pub(crate) trait VideoCodec: Sized + Send {
     /// Record the codec-specific encode commands and submit the frame. Builds
     /// the StdVideo* graph on its own stack (so the FFI pointers stay valid until
     /// `cmd_encode_video`) and finishes via [`EncoderCommon::submit_frame`].
-    fn record_picture(
-        &mut self,
-        common: &mut EncoderCommon,
-        plan: &FramePlan,
-    ) -> Result<EncodeFuture>;
+    /// An error means that nothing was submitted.
+    fn record_picture(&mut self, common: &mut EncoderCommon, plan: &FramePlan) -> Result<()>;
 
     /// Per-frame epilogue: advance reference lists, syntax counters and the next
     /// DPB slot. Runs after submission.
@@ -588,11 +696,12 @@ pub(crate) trait VideoCodec: Sized + Send {
     /// one.
     ///
     /// `first_lost_display_order` is the display order (the `pts` reported on
-    /// encoded packets) of the earliest frame the client lost. In a linear P
-    /// chain every reference at or after that frame is transitively undecodable,
-    /// so all of them are dropped. Returns `true` if a usable reference survives
-    /// (the next P-frame can be predicted from it); `false` if none remain and
-    /// the caller must fall back to an IDR.
+    /// encoded packets) of the earliest frame the client lost. The client
+    /// lost every frame encoded after it too, so every reference from the
+    /// first one encoded that is shown at or after it is dropped (see
+    /// [`ReferenceSet::invalidate`](crate::encoder::references::ReferenceSet::invalidate)).
+    /// Returns `true` if a usable reference survives; `false` if none remain
+    /// and the caller must fall back to an IDR.
     fn invalidate_references(
         &mut self,
         common: &mut EncoderCommon,
@@ -627,62 +736,245 @@ pub struct CodecEncoder<C: VideoCodec> {
 unsafe impl<C: VideoCodec> Send for CodecEncoder<C> {}
 
 impl<C: VideoCodec> CodecEncoder<C> {
-    /// The internal input image for the current slot (a `ColorConverter::convert`
-    /// target that avoids an intermediate copy).
+    /// The input image of the slot the next frame takes (a
+    /// `ColorConverter::convert` target that avoids an intermediate copy).
     pub fn input_image(&self) -> vk::Image {
         self.common.pipeline.input_image()
     }
 
-    /// Encode one frame from `input`, returning a future for its packet.
-    /// See [`crate::Encoder::submit`].
+    /// Take one frame from `input`, returning a future for the next packet
+    /// of the stream. See [`crate::Encoder::submit`].
+    ///
+    /// The frame is encoded now, or, as a B-frame, once the reference frame
+    /// after it is submitted. Either way the frames the planner hands back
+    /// are encoded here, in encode order.
     pub fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
-        let plan = self.common.begin_frame();
-        self.common.prepare_source(input, sync)?;
+        self.take_frame(input, sync, false)
+    }
 
-        let setup = self.codec.begin_picture(&mut self.common, &plan)?;
-        self.common.set_pending_metadata(SlotPacketMetadata {
-            frame_type: plan.frame_type(),
-            pts: plan.display_order,
-            dts: plan.encode_index,
-            header: setup.header,
-            timestamps: [0; 2],
-            now: std::time::Instant::now(),
-        });
+    /// Take one frame and encode it now, with the frames that wait before
+    /// it: a frame that must not wait, because its source is another slot's
+    /// image ([`crate::Encoder::repeat`]).
+    pub fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture> {
+        self.take_frame(input, sync, true)
+    }
 
-        let future = self.codec.record_picture(&mut self.common, &plan)?;
-        self.common.encode_frame_num += 1;
-        self.codec.end_picture(&mut self.common, &plan);
-        self.common.advance();
+    fn take_frame(
+        &mut self,
+        input: FrameInput,
+        sync: FrameSync,
+        now: bool,
+    ) -> Result<EncodeFuture> {
+        // Waits until the slot we are about to record over was read back.
+        let slot = self.common.pipeline.next_index();
+        let (frame, released) = self.common.prepare_source(slot, input, sync)?;
+        self.common.pipeline.take_slot();
+        let mut future = self.common.pipeline.new_future();
+
+        let display_order = self.common.input_frame_num;
+        self.common.input_frame_num += 1;
+        let queued = QueuedFrame {
+            frame,
+            display_order,
+        };
+        let mut ready = Vec::new();
+        if now {
+            ready.extend(self.common.gop.close());
+        }
+        ready.extend(self.common.gop.push(queued));
+        if now {
+            ready.extend(self.common.gop.close());
+        }
+        let encoded = self.encode_ready(ready)?;
+        // A frame written in place and still waiting has nothing to release:
+        // the future keeps the point it was made with, which is signalled.
+        let point = encoded
+            .into_iter()
+            .find_map(|(order, point)| (order == display_order).then_some(point));
+        if let Some(point) = released.or(point) {
+            future.set_released(point);
+        }
         Ok(future)
     }
 
-    /// End-of-stream barrier: wait for all in-flight frames to be read back.
+    /// Encode `ready` in its order, and return the display order of each
+    /// frame with the point its encode submission signals.
+    ///
+    /// If an encode fails, nothing more is encoded: the frames left, and the
+    /// frames that wait, are dropped, the futures not yet resolved resolve
+    /// with an error, and the next frame is an IDR, because the reference
+    /// state after a failed encode is not known.
+    fn encode_ready(
+        &mut self,
+        ready: Vec<(QueuedFrame, GopPosition)>,
+    ) -> Result<Vec<(u64, TimelinePoint)>> {
+        let reorder_delay = self.common.gop.reorder_delay();
+        // A frame is hidden if a frame after it in this order is shown
+        // before it. A group is always handed over whole, so the frames
+        // after it are all here.
+        let display_orders: Vec<u64> = ready.iter().map(|(q, _)| q.display_order).collect();
+        let mut encoded = Vec::with_capacity(ready.len());
+        let mut ready = ready.into_iter().enumerate();
+        while let Some((index, (queued, gop))) = ready.next() {
+            let plan = FramePlan {
+                gop,
+                display_order: queued.display_order,
+                encode_index: self.common.encode_frame_num,
+                reorder_delay,
+                hidden: C::HIDDEN_FRAMES
+                    && display_orders[index + 1..]
+                        .iter()
+                        .any(|&later| later < queued.display_order),
+            };
+            let slot = queued.frame.slot;
+            let result = self
+                .encode_planned(queued.frame, &plan)
+                .and_then(|point| self.show_hidden_frames(&plan).map(|()| point));
+            match result {
+                Ok(point) => encoded.push((plan.display_order, point)),
+                Err(e) => {
+                    self.common.hidden_frames.clear();
+                    let left = ready.map(|(_, (queued, _))| queued);
+                    let waiting = self.common.gop.abandon();
+                    self.common.pipeline.release(slot);
+                    for queued in left.chain(waiting) {
+                        self.common.pipeline.release(queued.frame.slot);
+                    }
+                    self.common.pipeline.drop_waiting_futures();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(encoded)
+    }
+
+    /// Encode the frames that wait now, as a shorter group.
+    pub fn close_group(&mut self) -> Result<()> {
+        let ready = self.common.gop.close();
+        self.encode_ready(ready).map(|_| ())
+    }
+
+    /// After the shown frame `plan`, show the hidden frames whose turn it
+    /// is: those that come next in display order. Each gets a packet made
+    /// here, with no encode.
+    fn show_hidden_frames(&mut self, plan: &FramePlan) -> Result<()> {
+        if plan.hidden {
+            return Ok(());
+        }
+        let mut next = plan.display_order + 1;
+        while let Some(index) = self
+            .common
+            .hidden_frames
+            .iter()
+            .position(|hidden| hidden.display_order == next)
+        {
+            let hidden = self.common.hidden_frames.swap_remove(index);
+            let latency = hidden.submitted.elapsed().as_nanos() as u64;
+            self.common.pipeline.submit_synthetic(EncodedPacket {
+                data: hidden.show_packet,
+                frame_type: hidden.frame_type,
+                pts: hidden.display_order,
+                dts: hidden.display_order as i64,
+                stats: EncodedPacketStats {
+                    gpu_time_ns: None,
+                    frame_latency_ns: latency,
+                    wall_latency_ns: 0,
+                },
+            })?;
+            next += 1;
+        }
+        Ok(())
+    }
+
+    /// Encode `frame` now, as `plan` says. Returns the point its encode
+    /// submission signals. An error means that nothing was submitted.
+    fn encode_planned(&mut self, frame: HeldFrame, plan: &FramePlan) -> Result<TimelinePoint> {
+        let submitted = frame.submitted;
+        let delivery = if plan.hidden {
+            Delivery::Carry
+        } else {
+            Delivery::Packet
+        };
+        self.common.begin_encode(frame, delivery);
+
+        let setup = self.codec.begin_picture(&mut self.common, plan)?;
+        self.common.set_pending_metadata(SlotPacketMetadata {
+            frame_type: plan.frame_type(),
+            pts: plan.display_order,
+            // With hidden frames the packets are in display order.
+            dts: if C::HIDDEN_FRAMES {
+                plan.display_order as i64
+            } else {
+                plan.dts()
+            },
+            header: setup.header,
+            timestamps: [0; 2],
+            now: submitted,
+        });
+
+        let dpb_slot = self.common.current_dpb_slot;
+        self.codec.record_picture(&mut self.common, plan)?;
+        self.common.encode_frame_num += 1;
+        if plan.hidden {
+            self.common.hidden_frames.push(HiddenFrame {
+                display_order: plan.display_order,
+                frame_type: plan.frame_type(),
+                show_packet: self.codec.show_packet(plan, dpb_slot),
+                submitted,
+            });
+        }
+        self.codec.end_picture(&mut self.common, plan);
+        Ok(self
+            .common
+            .encode_point
+            .take()
+            .expect("record_picture submits the frame"))
+    }
+
+    /// End-of-stream barrier: encode the frames that wait, then wait for all
+    /// in-flight frames to be read back.
     pub fn flush(&mut self) -> Result<()> {
+        self.close_group()?;
         self.common.pipeline.flush();
         Ok(())
     }
 
-    /// Force the next frame to be an IDR/key frame.
+    /// Force the next frame to be an IDR/key frame. The frames that wait
+    /// are encoded now, before it.
     pub fn request_idr(&mut self) {
         self.common.gop.request_idr();
+        if let Err(e) = self.close_group() {
+            // Their futures resolve with the error.
+            tracing::warn!("Encoding the frames before a requested IDR failed: {e}");
+        }
     }
 
     /// Reference frame invalidation: drop references the client lost and predict
     /// the next frame from a surviving reference, falling back to an IDR when no
     /// reference survives. See [`crate::Encoder::invalidate_reference_frames`].
+    ///
+    /// For the IDR, the oldest frame that waits for its group is encoded as
+    /// one at once, so no frame is encoded from the lost references.
     pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        if !self
+        if self
             .codec
             .invalidate_references(&mut self.common, first_lost_display_order)
         {
-            self.common.gop.request_idr();
+            return;
+        }
+        let ready = self.common.gop.restart();
+        if let Err(e) = self.encode_ready(ready) {
+            // Its future resolves with the error, and the next frame is an IDR.
+            tracing::warn!("Encoding the IDR after lost references failed: {e}");
         }
     }
 
     /// Rebuild session parameters with a new stream colour; the next frame is
     /// an IDR/key frame carrying the updated header.
     pub fn set_color(&mut self, color: StreamColor) -> Result<()> {
-        // Drain in-flight encodes before mutating shared session parameters.
+        // Encode the frames that wait with the old parameters, and drain
+        // in-flight encodes before mutating shared session parameters.
+        self.close_group()?;
         self.common.pipeline.wait_all_free();
         let desc = color.description();
 
@@ -768,6 +1060,9 @@ pub(crate) struct CommonInitRequest<'a> {
     /// What the hardware RGB conversion supports for this profile, queried
     /// alongside the codec capabilities when `rgb_input` is set.
     pub rgb_caps: Option<RgbConversionCaps>,
+    /// What the encoder can do with B-frames for this profile, from the
+    /// codec's capabilities.
+    pub b_frame_support: BFrameSupport,
 }
 
 /// Result of [`build_encoder_common`]: the assembled common state plus the
@@ -778,6 +1073,10 @@ pub(crate) struct CommonInit {
     pub reference_window: u32,
     /// How many of the newest of those one frame predicts from.
     pub active_reference_count: u32,
+    /// How many references one frame may use at most, which is what the
+    /// session was made with. More than `active_reference_count` only with
+    /// B-frames, which use a reference on each side.
+    pub session_active_references: u32,
 }
 
 /// The device-capability fields the generic init needs, resolved once by the
@@ -790,6 +1089,23 @@ pub(crate) struct DeviceVideoCaps {
     pub max_active_reference_pictures: u32,
     pub flags: vk::VideoCapabilityFlagsKHR,
     pub std_header_version: vk::ExtensionProperties,
+}
+
+/// Check `config.quality_level` against the device's
+/// `VkVideoEncodeCapabilitiesKHR::maxQualityLevels`.
+///
+/// Call it before anything else uses the level: a quality level query for a
+/// level the device does not have is invalid usage.
+pub(crate) fn check_quality_level(config: &EncodeConfig, max_quality_levels: u32) -> Result<()> {
+    if config.quality_level >= max_quality_levels {
+        return Err(PixelForgeError::NoSuitableDevice(format!(
+            "{:?} encode: quality level {} is not available, the device has levels 0 to {}",
+            config.codec,
+            config.quality_level,
+            max_quality_levels.saturating_sub(1)
+        )));
+    }
+    Ok(())
 }
 
 /// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
@@ -857,6 +1173,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     // Capabilities were queried by the codec (which chains its codec-specific
     // capability struct, required by the driver) via [`query_video_caps`].
     let capabilities = req.caps;
+    check_b_frame_support(config, req.b_frame_support)?;
 
     // Align the coded extent to lcm(codec block size, device granularity), then
     // clamp up to the device minimum and re-align.
@@ -971,11 +1288,28 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     }
     // At least 1: `max_dpb_slots_supported` is at least 2, and every codec's
     // window cap and `MAX_DPB_SLOTS` are larger.
+    let gop = GopPlanner::new(config.gop_size, config.b_frames, config.b_frame_references);
+    // The B-frames of a pyramid that are references are held on top of the
+    // window, which is the P-frames.
+    let b_reference_count = gop.b_reference_count();
     let window_limit = req
         .max_reference_window
         .min(max_dpb_slots_supported - 1)
-        .min(MAX_DPB_SLOTS - 1);
-    let reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
+        .min(MAX_DPB_SLOTS - 1)
+        .saturating_sub(b_reference_count)
+        .max(1);
+    let mut reference_window = (config.max_reference_frames as usize).clamp(1, window_limit);
+    // A B-frame predicts from a reference on each side, so both have to stay.
+    if config.b_frames > 0 && reference_window < 2 {
+        if window_limit < 2 {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "B-frames need a reference window of 2, and the device allows {window_limit} \
+                 with {b_reference_count} B-frame references"
+            )));
+        }
+        tracing::info!("B-frames: reference window raised from {reference_window} to 2");
+        reference_window = 2;
+    }
     let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
         .min(req.max_frame_references);
@@ -990,9 +1324,17 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     if max_active_reference_pictures < 1 && max_active_supported >= 1 {
         max_active_reference_pictures = 1;
     }
-    // B-frames are not yet supported, so a reconstructed-frame slot plus the
-    // window is enough.
-    let dpb_slot_count = reference_window + 1;
+    // A B-frame uses a reference on each side, whatever a P-frame uses. The
+    // B-frame support check has made sure that the device allows two.
+    let session_active_references = if config.b_frames > 0 {
+        max_active_reference_pictures.max(2)
+    } else {
+        max_active_reference_pictures
+    };
+    // The window, the B-frame references, and a slot for the reconstructed
+    // frame. A B-frame that is not a reference takes that slot too and
+    // leaves it free again.
+    let dpb_slot_count = reference_window + b_reference_count + 1;
     tracing::debug!(
         "Reference window {reference_window}, {max_active_reference_pictures} used per frame \
          (device: {max_dpb_slots_supported} DPB slots, {max_active_supported} active, \
@@ -1018,7 +1360,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         })
         .reference_picture_format(reference_picture_format)
         .max_dpb_slots(dpb_slot_count as u32)
-        .max_active_reference_pictures(max_active_reference_pictures as u32)
+        .max_active_reference_pictures(session_active_references as u32)
         .std_header_version(&std_header_version);
     if rgb_session.is_some() {
         session_create_info = session_create_info.push(&mut rgb_session_info);
@@ -1072,14 +1414,16 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         bitstream_buffer_size: req.bitstream_buffer_size,
         profile_info,
         command_pool: cmd.command_pool,
+        held_frames: config.b_frames as usize,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
     })?;
 
-    // B-frames are not yet supported, so an I-P GOP. Match the SPS's POC
-    // wrap (no-op for AV1, which keys off order hints).
-    let mut gop = GopStructure::new(config.gop_size);
-    gop.set_max_poc_lsb(4);
+    let upload_command_buffers = allocate_command_buffers(
+        context,
+        cmd.upload_command_pool,
+        pipeline.slot_count() as u32,
+    )?;
 
     let common = EncoderCommon {
         context: context.clone(),
@@ -1105,16 +1449,14 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         command_pool: cmd.command_pool,
         upload_command_pool: cmd.upload_command_pool,
         upload_fence: cmd.upload_fence,
-        upload_command_buffers: allocate_command_buffers(
-            context,
-            cmd.upload_command_pool,
-            ENCODE_PIPELINE_DEPTH as u32,
-        )?,
+        upload_command_buffers,
         upload_timeline: TimelineChain::new(context)?,
         pending_waits: Vec::new(),
         pending_signals: Vec::new(),
         source: SourceBinding::default(),
-        source_released: None,
+        delivery: Delivery::Packet,
+        encode_point: None,
+        hidden_frames: Vec::new(),
         profile: req.profile,
         rgb_input: req.rgb_input,
     };
@@ -1123,5 +1465,39 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         common,
         reference_window: reference_window as u32,
         active_reference_count: max_active_reference_pictures as u32,
+        session_active_references: session_active_references as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn b_frame(is_reference: bool, pyramid_level: u8) -> FramePlan {
+        FramePlan {
+            gop: GopPosition {
+                frame_type: GopFrameType::B,
+                pic_order_cnt: 2,
+                is_reference,
+                pyramid_level,
+            },
+            display_order: 1,
+            encode_index: 2,
+            reorder_delay: 1,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn b_frame_qp_offset_grows_with_the_level() {
+        // A flat group, and a pyramid of 3, as before levels counted.
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 1), 2), 2);
+        assert_eq!(b_frame_qp_offset(&b_frame(true, 1), 2), 1);
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 2), 2), 2);
+        // A pyramid of 7: one more for each level.
+        assert_eq!(b_frame_qp_offset(&b_frame(true, 2), 2), 2);
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 2), 3);
+        // AV1 steps by 4.
+        assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 8), 12);
+    }
 }
