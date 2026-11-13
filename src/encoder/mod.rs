@@ -704,6 +704,12 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
+    /// Whether this is the first frame shown after
+    /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
+    /// returned `true`: it predicts only from frames before the loss, so a
+    /// client that stopped decoding at the loss can start again here.
+    /// Moonlight's protocol marks it as frame type 5. Never set on a key frame.
+    pub is_recovery_frame: bool,
     /// Presentation timestamp: the number of the frame in the order it was
     /// submitted.
     pub pts: u64,
@@ -1048,6 +1054,7 @@ mod tests {
             let packet = EncodedPacket {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x67],
                 frame_type: FrameType::Idr,
+                is_recovery_frame: false,
                 pts: 0,
                 dts: 0,
                 stats: EncodedPacketStats::default(),

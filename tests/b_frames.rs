@@ -163,10 +163,10 @@ fn control_calls_close_the_group() -> Result<(), Box<dyn std::error::Error>> {
                     submitted += 1;
                 }
                 // The references from before the loss survive: no IDR.
-                30 => encoder.invalidate_reference_frames(submitted - 2),
+                30 => assert!(encoder.invalidate_reference_frames(submitted - 2)),
                 // Every reference is lost.
                 33 => {
-                    encoder.invalidate_reference_frames(0);
+                    assert!(!encoder.invalidate_reference_frames(0));
                     restart = submitted - u64::from(b_frames)..=submitted;
                 }
                 // Everything submitted is encoded, and the stream goes on.

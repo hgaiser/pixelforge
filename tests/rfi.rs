@@ -147,6 +147,7 @@ fn run_codec(
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
     let mut recovery_is_key: Option<bool> = None;
     let mut later_key_frames = 0;
+    let mut recovery_frames = Vec::new();
 
     let mut drain_one = |pending: &mut VecDeque<pixelforge::EncodeFuture>,
                          output_file: &mut File,
@@ -158,6 +159,9 @@ fn run_codec(
         }
         if packet.pts > 0 && packet.is_key_frame() {
             later_key_frames += 1;
+        }
+        if packet.is_recovery_frame {
+            recovery_frames.push(packet.pts);
         }
         output_file.write_all(&packet.data)?;
         Ok(())
@@ -174,7 +178,9 @@ fn run_codec(
         // just before encoding frame `INVALIDATE_AT`.
         if i == INVALIDATE_AT {
             let first_lost = INVALIDATE_AT - INVALIDATE_COUNT;
-            encoder.invalidate_reference_frames(first_lost);
+            if !encoder.invalidate_reference_frames(first_lost) {
+                return Err("invalidation left no reference to recover from".into());
+            }
         }
 
         let slot = encoder.input_slot()?;
@@ -191,6 +197,15 @@ fn run_codec(
     }
     drop(output_file);
     drop(drain_one);
+
+    // One packet is marked as the recovery frame; without B-frames, the
+    // frame submitted right after the invalidation.
+    match (recovery_frames.as_slice(), b_frames) {
+        ([_], Some(_)) | ([INVALIDATE_AT], None) => {}
+        (frames, _) => {
+            return Err(format!("frames {frames:?} were marked as the recovery frame").into());
+        }
+    }
 
     if later_key_frames > 0 {
         return Err(

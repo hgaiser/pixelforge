@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add `EncodedPacket::is_recovery_frame`, set on the first frame shown after an invalidation that recovers without a keyframe, so a streaming host can tell the client where to start decoding again.
+
+### Changed
+
+- **Breaking:** `Encoder::invalidate_reference_frames` returns whether a reference survived (`false`: the next frame is an IDR).
+
 ## [0.12.1] - 15-11-2026
 
 ### Fixed
