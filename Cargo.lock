@@ -62,14 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ash"
-version = "0.38.0+1.4.352"
-source = "git+https://github.com/ash-rs/ash?rev=f4c2ca3e4f6b998d5254ad101a32f024d87cdec2#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -266,14 +258,23 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pixelforge"
 version = "0.11.0"
 dependencies = [
- "ash",
  "env_logger",
  "futures-channel",
  "futures-core",
+ "pixelforge-ash",
  "pollster",
  "thiserror",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pixelforge-ash"
+version = "0.38.1+1.4.352.f4c2ca3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d81c4ac49b6f49a334783c30092ad10953deb6345f6e0fc287ed49f47675232"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ default = []
 dmabuf = []
 
 [dependencies]
-ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2", features = ["loaded"] }
+ash = { package = "pixelforge-ash", version = "0.38.1", features = ["loaded"] }
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-core = { version = "0.3", default-features = false }
 thiserror = "2.0"
