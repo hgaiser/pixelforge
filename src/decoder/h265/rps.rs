@@ -187,8 +187,8 @@ fn predict_rps(reference: &StRps, delta_rps: i32, used: u32, use_delta: u32) -> 
         out.delta_poc_s0.push(delta_rps);
         out.used_s0.push(flag(used, num_delta));
     }
-    for j in 0..num_negative {
-        let d_poc = reference.delta_poc_s0[j] + delta_rps;
+    for (j, &delta_poc) in reference.delta_poc_s0[..num_negative].iter().enumerate() {
+        let d_poc = delta_poc + delta_rps;
         if d_poc < 0 && flag(use_delta, j) {
             out.delta_poc_s0.push(d_poc);
             out.used_s0.push(flag(used, j));
@@ -207,8 +207,11 @@ fn predict_rps(reference: &StRps, delta_rps: i32, used: u32, use_delta: u32) -> 
         out.delta_poc_s1.push(delta_rps);
         out.used_s1.push(flag(used, num_delta));
     }
-    for j in 0..reference.num_positive_pics() {
-        let d_poc = reference.delta_poc_s1[j] + delta_rps;
+    for (j, &delta_poc) in reference.delta_poc_s1[..reference.num_positive_pics()]
+        .iter()
+        .enumerate()
+    {
+        let d_poc = delta_poc + delta_rps;
         if d_poc > 0 && flag(use_delta, num_negative + j) {
             out.delta_poc_s1.push(d_poc);
             out.used_s1.push(flag(used, num_negative + j));

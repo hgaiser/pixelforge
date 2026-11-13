@@ -654,21 +654,21 @@ pub(crate) fn parse_film_grain(
     g.ar_coeff_lag = r.f(2)? as u8;
     let num_pos_luma = 2 * g.ar_coeff_lag as usize * (g.ar_coeff_lag as usize + 1);
     let num_pos_chroma = if g.num_y_points != 0 {
-        for i in 0..num_pos_luma {
-            g.ar_coeffs_y_plus_128[i] = r.f(8)? as u8;
+        for coeff in &mut g.ar_coeffs_y_plus_128[..num_pos_luma] {
+            *coeff = r.f(8)? as u8;
         }
         num_pos_luma + 1
     } else {
         num_pos_luma
     };
     if g.chroma_scaling_from_luma || g.num_cb_points != 0 {
-        for i in 0..num_pos_chroma {
-            g.ar_coeffs_cb_plus_128[i] = r.f(8)? as u8;
+        for coeff in &mut g.ar_coeffs_cb_plus_128[..num_pos_chroma] {
+            *coeff = r.f(8)? as u8;
         }
     }
     if g.chroma_scaling_from_luma || g.num_cr_points != 0 {
-        for i in 0..num_pos_chroma {
-            g.ar_coeffs_cr_plus_128[i] = r.f(8)? as u8;
+        for coeff in &mut g.ar_coeffs_cr_plus_128[..num_pos_chroma] {
+            *coeff = r.f(8)? as u8;
         }
     }
     g.ar_coeff_shift_minus_6 = r.f(2)? as u8;

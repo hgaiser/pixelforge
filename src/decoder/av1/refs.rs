@@ -114,9 +114,9 @@ impl RefState {
                 let mut shown = self.slots[header.frame_to_show_map_idx as usize].clone();
                 // A key frame may be shown this way at most once.
                 shown.showable_frame = false;
-                for i in 0..NUM_REF_FRAMES {
+                for (i, slot) in self.slots.iter_mut().enumerate() {
                     if (header.refresh_frame_flags >> i) & 1 != 0 {
-                        self.slots[i] = shown.clone();
+                        *slot = shown.clone();
                     }
                 }
             }
@@ -152,9 +152,9 @@ impl RefState {
             film_grain: header.film_grain.clone(),
             dpb_slot,
         };
-        for i in 0..NUM_REF_FRAMES {
+        for (i, target) in self.slots.iter_mut().enumerate() {
             if (header.refresh_frame_flags >> i) & 1 != 0 {
-                self.slots[i] = slot.clone();
+                *target = slot.clone();
             }
         }
     }
