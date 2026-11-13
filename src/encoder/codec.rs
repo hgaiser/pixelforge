@@ -1395,7 +1395,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     }
     let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
-        .min(req.max_frame_references);
+        .min(req.max_frame_references)
+        .min(
+            config
+                .active_reference_frames
+                .map_or(usize::MAX, |n| n as usize),
+        );
     // `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` predicts from fewer references than
     // the device allows, to reproduce a device with tighter limits.
     if let Some(cap) = std::env::var("PIXELFORGE_MAX_ACTIVE_REFERENCES")

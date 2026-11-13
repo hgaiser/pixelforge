@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `EncodeConfig::with_active_reference_frames`, to predict from fewer references than the device allows while keeping the whole window for invalidation. On RADV, H.264 takes about 75% longer to encode a frame with two references than with one.
 - Add `EncodedPacket::is_recovery_frame`, set on the first frame shown after an invalidation that recovers without a keyframe, so a streaming host can tell the client where to start decoding again.
 
 ### Changed

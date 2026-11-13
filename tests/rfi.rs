@@ -81,13 +81,18 @@ fn rfi() -> Result<(), Box<dyn std::error::Error>> {
             BFrameSupport::Flat => Some(BFrameReferences::Flat),
             BFrameSupport::Pyramid => Some(BFrameReferences::Pyramid),
         };
-        let runs = std::iter::once(None).chain(b_frames.map(Some));
-        for references in runs {
-            let name = match references {
-                None => format!("{codec:?}"),
-                Some(references) => format!("{codec:?} B-frames {references:?}"),
+        // Without B-frames, also predicting from one reference, as a streaming
+        // host does to save encode time: the rest of the window recovers.
+        let runs = [(None, None), (None, Some(1))]
+            .into_iter()
+            .chain(b_frames.map(|references| (Some(references), None)));
+        for (references, active) in runs {
+            let name = match (references, active) {
+                (None, None) => format!("{codec:?}"),
+                (None, Some(active)) => format!("{codec:?} predicting from {active}"),
+                (Some(references), _) => format!("{codec:?} B-frames {references:?}"),
             };
-            if let Err(e) = run_codec(&context, &dir, codec, references, &input_path) {
+            if let Err(e) = run_codec(&context, &dir, codec, references, active, &input_path) {
                 println!("{name}: FAIL: {e}");
                 failures.push(format!("{name}: {e}"));
             }
@@ -105,10 +110,15 @@ fn run_codec(
     dir: &std::path::Path,
     codec: Codec,
     b_frames: Option<BFrameReferences>,
+    active_references: Option<u32>,
     input_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ext = if codec == Codec::AV1 { "obu" } else { "bin" };
-    let suffix = if b_frames.is_some() { "_b" } else { "" };
+    let suffix = match (b_frames, active_references) {
+        (Some(_), _) => "_b".to_string(),
+        (None, Some(active)) => format!("_active{active}"),
+        (None, None) => String::new(),
+    };
     let output_filename = dir
         .join(format!("output_rfi_{codec:?}{suffix}.{ext}"))
         .to_string_lossy()
@@ -130,6 +140,10 @@ fn run_codec(
     .with_gop_size(0);
     let config = match b_frames {
         Some(references) => config.with_b_frames(3).with_b_frame_references(references),
+        None => config,
+    };
+    let config = match active_references {
+        Some(active) => config.with_active_reference_frames(active),
         None => config,
     };
     // At most `b_frames` frames wait for their group, so with more futures
@@ -250,7 +264,7 @@ fn run_codec(
     }
 
     println!(
-        "{codec:?} {b_frames:?}: PASS — recovered with a P-frame, full-stream PSNR {psnr:.2} dB"
+        "{codec:?} {b_frames:?} {active_references:?}: PASS — recovered with a P-frame, full-stream PSNR {psnr:.2} dB"
     );
     Ok(())
 }

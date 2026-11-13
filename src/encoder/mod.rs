@@ -443,6 +443,11 @@ pub struct EncodeConfig {
     /// as the device allows, which can be fewer. The device's DPB size can
     /// also lower it.
     pub max_reference_frames: u32,
+    /// The most references one frame predicts from, below the device's limit;
+    /// `None` predicts from as many as the device allows. Fewer cost less to
+    /// encode, and the rest of the window stays for invalidation. B-frames
+    /// still predict from one reference on each side.
+    pub active_reference_frames: Option<u32>,
     /// How many B-frames go between two reference frames; see
     /// [`Self::with_b_frames`].
     pub b_frames: u32,
@@ -499,6 +504,7 @@ impl EncodeConfig {
             },
             gop_size: DEFAULT_GOP_SIZE,
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            active_reference_frames: None,
             b_frames: 0,
             b_frame_references: BFrameReferences::Flat,
             virtual_buffer_size_ms: 1000,
@@ -565,6 +571,13 @@ impl EncodeConfig {
     /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
+        self
+    }
+
+    /// Set the most references a frame predicts from (see
+    /// [`active_reference_frames`](Self::active_reference_frames)).
+    pub fn with_active_reference_frames(mut self, count: u32) -> Self {
+        self.active_reference_frames = Some(count);
         self
     }
 
