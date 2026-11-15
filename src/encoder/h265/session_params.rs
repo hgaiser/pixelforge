@@ -20,9 +20,11 @@ impl H265 {
         let config = &common.config;
 
         let ctb_log2_size_y: u8 = 5;
-        // 8x8, the smallest coding block. Vulkan has no capability for it, and
-        // a larger minimum stops the encoder from using small blocks.
-        let min_cb_log2_size_y: u8 = 3;
+        // 16x16. An 8x8 minimum makes streams 3% to 18% smaller, but on NVIDIA
+        // (RTX 5080, 615.78.08) it makes the encode about ten times slower:
+        // about 11 ms instead of 1 ms per 1080p frame. Vulkan has no capability
+        // that tells which minimum a driver encodes fast.
+        let min_cb_log2_size_y: u8 = 4;
         let log2_min_transform_block_size: u8 = 2;
         let log2_max_transform_block_size: u8 = 5;
 

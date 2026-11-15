@@ -247,9 +247,11 @@ What the drivers do with B-frames, as far as it was checked:
 
 `scripts/compare_b0.sh` builds v0.11.0 in a worktree and compares its output
 with the working tree's for each codec, with CQP and CBR. Without B-frames all
-streams now differ from v0.11.0, for four reasons, all intended: H.264 has its
-deblocking filter on, H.264 CBR has no QP bounds, H.265 has 8x8 as its
-smallest coding block, and AV1 uses CDEF and loop restoration. Before those
+streams now differ from v0.11.0, for three reasons, all intended: H.264 has its
+deblocking filter on, H.264 CBR has no QP bounds, and AV1 uses CDEF and loop
+restoration. (v0.12.0 also used 8x8 as the smallest H.265 coding block; that
+made NVIDIA encode about ten times slower, so it is 16x16 again, as in v0.11.0.)
+Before those
 changes, `h265-*-gop0` was the only difference: there v0.11.0 gave the driver
 a picture order count that wrapped at 512, and the count no longer wraps. Run
 it after a change to the encode flow, with a base revision that has those
