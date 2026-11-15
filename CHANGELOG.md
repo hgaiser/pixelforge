@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 15-11-2026
+
+### Fixed
+
+- Make 16x16 the smallest H.265 coding block again. With 8x8, NVIDIA encodes about ten times slower (about 11 ms instead of 1 ms per 1080p frame on an RTX 5080), so latency went up. Streams are 3% to 18% larger again.
+
 ## [0.12.0] - 13-11-2026
 
 ### Added
