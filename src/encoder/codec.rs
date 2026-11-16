@@ -115,6 +115,9 @@ pub(crate) struct EncoderCommon {
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
     pub rgb_input: Option<RgbFormat>,
+    /// What the session's rate control was set to by the last encode
+    /// submitted. `None` before the first.
+    pub rate_control_state: Option<RateControlState>,
 }
 
 impl EncoderCommon {
@@ -342,28 +345,23 @@ impl EncoderCommon {
             + TaggedStructure<'static>
             + Copy,
         L: for<'x> vk::Extends<vk::VideoEncodeRateControlLayerInfoKHR<'x>>
-            + TaggedStructure<'static>,
+            + TaggedStructure<'static>
+            + Copy,
     {
         let slot = self.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
         let timestamp_query_pool = slot.timestamp_query_pool;
-        let rc = cmd.rate_control;
+        let state = cmd.rate_control.state();
+        // What the session's rate control is set to before this frame. Begin
+        // coding has to state it, and a control command then changes it to
+        // this frame's, without a reset, when the bitrate changed.
+        let current = self.rate_control_state.unwrap_or(state);
+        let change = !cmd.reset && current != state;
 
         let mut codec_layer = cmd.codec_layer;
-        let rc_layers = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(self.config.frame_rate.numerator)
-            .frame_rate_denominator(self.config.frame_rate.denominator)
-            .push(&mut codec_layer)];
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
-        }
+        let rc_layers = [self.rate_control_layer(state).push(&mut codec_layer)];
+        let mut rc_info = self.rate_control_info(state, &rc_layers);
 
         reset_start_timestamp(self.device(), command_buffer, timestamp_query_pool);
 
@@ -371,7 +369,11 @@ impl EncoderCommon {
         // extension structs. The first frame sets rate control with the
         // control command below, after RESET, rather than here.
         let mut begin_codec_rc = cmd.codec_rate_control;
-        let mut begin_rc = rc_info;
+        let mut begin_codec_layer = cmd.codec_layer;
+        let begin_layers = [self
+            .rate_control_layer(current)
+            .push(&mut begin_codec_layer)];
+        let mut begin_rc = self.rate_control_info(current, &begin_layers);
         let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
             .video_session(self.session)
             .video_session_parameters(self.session_params)
@@ -386,20 +388,33 @@ impl EncoderCommon {
         }
 
         // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command (matches
-        // FFmpeg; required for AMD RADV).
-        if cmd.reset {
+        // FFmpeg; required for AMD RADV). A new bitrate alone is RATE_CONTROL
+        // only: the coding state stays, so the stream needs no key frame.
+        if cmd.reset || change {
             let mut codec_rc = cmd.codec_rate_control;
             let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
                 .quality_level(self.config.quality_level);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
+            let mut control_info = vk::VideoCodingControlInfoKHR::default()
                 .push(&mut rc_info)
-                .push(&mut codec_rc)
-                .push(&mut quality_level_info);
+                .push(&mut codec_rc);
+            control_info = if cmd.reset {
+                control_info
+                    .flags(
+                        vk::VideoCodingControlFlagsKHR::RESET
+                            | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                            | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                    )
+                    .push(&mut quality_level_info)
+            } else {
+                tracing::debug!(
+                    "Rate control: {} to {} bits per second on average, peak {} to {}",
+                    current.average_bitrate,
+                    state.average_bitrate,
+                    current.max_bitrate,
+                    state.max_bitrate,
+                );
+                control_info.flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
+            };
             unsafe {
                 self.video_queue_fn
                     .cmd_control_video_coding(command_buffer, &control_info);
@@ -437,7 +452,36 @@ impl EncoderCommon {
                 .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
         }
 
-        self.submit_frame()
+        self.submit_frame()?;
+        self.rate_control_state = Some(state);
+        Ok(())
+    }
+
+    /// The rate control layer for `state`, without the codec's layer info.
+    fn rate_control_layer(
+        &self,
+        state: RateControlState,
+    ) -> vk::VideoEncodeRateControlLayerInfoKHR<'static> {
+        vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(u64::from(state.average_bitrate))
+            .max_bitrate(u64::from(state.max_bitrate))
+            .frame_rate_numerator(self.config.frame_rate.numerator)
+            .frame_rate_denominator(self.config.frame_rate.denominator)
+    }
+
+    /// The rate control info for `state`, with its `layers`.
+    fn rate_control_info<'a>(
+        &self,
+        state: RateControlState,
+        layers: &'a [vk::VideoEncodeRateControlLayerInfoKHR<'a>],
+    ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
+        let info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(state.mode);
+        if state.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            return info;
+        }
+        info.layers(layers)
+            .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+            .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms)
     }
 
     /// The `ash` device handle.
@@ -635,6 +679,25 @@ impl RateControlPlan {
     pub fn is_disabled(&self) -> bool {
         self.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
     }
+
+    /// What the session's rate control state holds of this decision.
+    pub fn state(&self) -> RateControlState {
+        RateControlState {
+            mode: self.mode,
+            average_bitrate: self.average_bitrate,
+            max_bitrate: self.max_bitrate,
+        }
+    }
+}
+
+/// What a video session's rate control is set to, of what changes between
+/// frames. The quantizer of a constant quantizer is not in it: it goes with
+/// each frame's picture info, not with the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateControlState {
+    pub mode: vk::VideoEncodeRateControlModeFlagsKHR,
+    pub average_bitrate: u32,
+    pub max_bitrate: u32,
 }
 
 /// What a constant quantizer is raised by for the B-frame `plan`.
@@ -991,6 +1054,12 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.codec.invalidate_header_cache();
         self.common.gop.request_idr();
         Ok(())
+    }
+
+    /// Encode the frames from now on with `rate_control`, which the caller
+    /// checked. The frames that wait for their group are among them.
+    pub fn set_rate_control(&mut self, rate_control: RateControl) {
+        self.common.config.rate_control = rate_control;
     }
 }
 
@@ -1459,6 +1528,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         hidden_frames: Vec::new(),
         profile: req.profile,
         rgb_input: req.rgb_input,
+        rate_control_state: None,
     };
 
     Ok(CommonInit {

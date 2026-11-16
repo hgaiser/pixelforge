@@ -180,6 +180,28 @@ impl RateControl {
         }
         Ok(())
     }
+
+    /// Why an encoder made with `initial` cannot change to this, if it
+    /// cannot: the mode has to stay, and the peak cannot go above the one it
+    /// was made with.
+    pub(crate) fn check_change_from(&self, initial: RateControl) -> crate::error::Result<()> {
+        let invalid = |reason: String| Err(crate::error::PixelForgeError::InvalidInput(reason));
+        match (initial, *self) {
+            (Self::Cqp { .. }, Self::Cqp { .. }) => Ok(()),
+            (Self::Cbr { bitrate: limit }, Self::Cbr { bitrate: peak })
+            | (Self::Vbr { max: limit, .. }, Self::Vbr { max: peak, .. }) => {
+                if peak > limit {
+                    return invalid(format!(
+                        "a peak bitrate of {peak} is above the {limit} the encoder was made with"
+                    ));
+                }
+                Ok(())
+            }
+            _ => invalid(format!(
+                "the rate control mode cannot change, from {initial:?} to {self:?}"
+            )),
+        }
+    }
 }
 
 /// Encode usage hints.
@@ -789,6 +811,46 @@ mod tests {
     // RateControl tests.
     mod rate_control_tests {
         use super::*;
+
+        #[test]
+        fn a_change_keeps_the_mode_and_stays_below_the_peak() {
+            let cbr = RateControl::Cbr { bitrate: 8_000_000 };
+            let vbr = RateControl::Vbr {
+                target: 6_000_000,
+                max: 8_000_000,
+            };
+            let cqp = RateControl::Cqp { qp: 26 };
+
+            assert!(
+                RateControl::Cbr { bitrate: 2_000_000 }
+                    .check_change_from(cbr)
+                    .is_ok()
+            );
+            assert!(cbr.check_change_from(cbr).is_ok());
+            assert!(
+                RateControl::Cbr { bitrate: 8_000_001 }
+                    .check_change_from(cbr)
+                    .is_err()
+            );
+
+            let lower = RateControl::Vbr {
+                target: 1_000_000,
+                max: 2_000_000,
+            };
+            assert!(lower.check_change_from(vbr).is_ok());
+            let above = RateControl::Vbr {
+                target: 6_000_000,
+                max: 9_000_000,
+            };
+            assert!(above.check_change_from(vbr).is_err());
+
+            assert!(RateControl::Cqp { qp: 40 }.check_change_from(cqp).is_ok());
+
+            assert!(cbr.check_change_from(vbr).is_err());
+            assert!(vbr.check_change_from(cbr).is_err());
+            assert!(cqp.check_change_from(cbr).is_err());
+            assert!(cbr.check_change_from(cqp).is_err());
+        }
 
         #[test]
         fn defaults_are_a_constant_quantizer() {

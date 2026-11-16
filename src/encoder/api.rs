@@ -8,7 +8,7 @@ use super::frame::{Frame, FrameSource, InputSlot};
 use super::input::{FrameInput, FrameSync, SourceOwnership};
 use super::source::{Conversion, Source, plan};
 use super::source_image::SourceImage;
-use super::{Codec, EncodeConfig, EncodeFuture, StreamColor};
+use super::{Codec, EncodeConfig, EncodeFuture, RateControl, StreamColor};
 use crate::converter::ColorConverter;
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
@@ -29,6 +29,7 @@ pub(crate) trait EncoderApi: Send {
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
     fn set_color(&mut self, color: StreamColor) -> Result<()>;
+    fn set_rate_control(&mut self, rate_control: RateControl);
 }
 
 impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
@@ -55,6 +56,9 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
     }
     fn set_color(&mut self, color: StreamColor) -> Result<()> {
         CodecEncoder::set_color(self, color)
+    }
+    fn set_rate_control(&mut self, rate_control: RateControl) {
+        CodecEncoder::set_rate_control(self, rate_control)
     }
 }
 
@@ -135,8 +139,44 @@ impl Encoder {
     }
 
     /// The configuration, with any colour description set since.
+    ///
+    /// Its [`EncodeConfig::rate_control`] is the one the encoder was made
+    /// with. [`Self::rate_control`] is the one it uses now.
     pub fn config(&self) -> &EncodeConfig {
         &self.config
+    }
+
+    /// The rate control the encoder uses now: the one it was made with, or
+    /// the last one [`Self::set_rate_control`] set.
+    pub fn rate_control(&self) -> RateControl {
+        self.inner.common().config.rate_control
+    }
+
+    /// Change the bitrate from the next frame encoded on, with no key frame.
+    ///
+    /// For a stream that follows the capacity of a network: a sender that
+    /// sees the link get slower lowers the bitrate, and raises it again
+    /// later.
+    ///
+    /// The rate control mode stays the one the encoder was made with, so
+    /// `rate_control` has to be of the same kind as
+    /// [`EncodeConfig::rate_control`]. Its peak (the bitrate of
+    /// [`RateControl::Cbr`], the `max` of [`RateControl::Vbr`]) can be at
+    /// most the peak the encoder was made with: the stream header states a
+    /// level, which is chosen for that peak. To have room to go up, make the
+    /// encoder with the highest bitrate the stream may use, and lower it
+    /// right away. A [`RateControl::Cqp`] can change to another quantizer.
+    ///
+    /// The encode of the next frame changes the session's rate control with
+    /// a control command, without a reset, so the stream goes on with no
+    /// IDR. With B-frames, the frames that wait for their group are encoded
+    /// after this, so they use the new bitrate too. The change lasts across
+    /// [`Self::reconfigure`].
+    pub fn set_rate_control(&mut self, rate_control: RateControl) -> Result<()> {
+        rate_control.check(self.config.codec)?;
+        rate_control.check_change_from(self.config.rate_control)?;
+        self.inner.set_rate_control(rate_control);
+        Ok(())
     }
 
     /// The encoder's input image for the next frame, to write it in place.
@@ -525,6 +565,9 @@ impl Encoder {
         self.inner.flush()?;
         let encoded = self.inner.common().input_frame_num;
         let mut next = Self::new(self.context.clone(), config)?;
+        // Made with the rate control the encoder was made with, it goes on
+        // with the one set since, which was checked against that.
+        next.inner.set_rate_control(self.rate_control());
         next.pts_offset = self.pts_offset + encoded;
         next.id = self.id;
         // A slot taken before is not a slot of the new encoder.
