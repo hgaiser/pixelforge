@@ -282,7 +282,7 @@ fn roundtrip(
     let mut decoded_size = (WIDTH, HEIGHT);
 
     decode_stream(&mut decoder, &bitstream, |frame| {
-        decoded_size = (frame.width, frame.height);
+        decoded_size = (frame.width(), frame.height());
         write_nv12(&frame, &mut readback, &mut out)?;
         decoded_count += 1;
         Ok(())

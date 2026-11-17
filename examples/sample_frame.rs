@@ -187,7 +187,7 @@ impl Sampler {
         frame: &DecodedFrame,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = context.device().clone();
-        let format = frame.chroma_format;
+        let format = frame.chroma_format();
         let _ = format;
         let picture_format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
@@ -200,7 +200,7 @@ impl Sampler {
             device.create_sampler_ycbcr_conversion(
                 &vk::SamplerYcbcrConversionCreateInfo::default()
                     .format(picture_format)
-                    .ycbcr_model(if frame.height <= 576 {
+                    .ycbcr_model(if frame.height() <= 576 {
                         vk::SamplerYcbcrModelConversion::YCBCR_601
                     } else {
                         vk::SamplerYcbcrModelConversion::YCBCR_709
@@ -361,8 +361,8 @@ impl Sampler {
             staging: vk::Buffer::null(),
             staging_memory: vk::DeviceMemory::null(),
             frame_views: std::collections::HashMap::new(),
-            width: frame.width,
-            height: frame.height,
+            width: frame.width(),
+            height: frame.height(),
             format: picture_format,
             target_initialised: false,
         };
@@ -397,10 +397,10 @@ impl Sampler {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
         let mut push = [0u32; 4];
-        push[0] = frame.width;
-        push[1] = frame.height;
-        push[2] = frame.coded_width;
-        push[3] = frame.coded_height;
+        push[0] = frame.width();
+        push[1] = frame.height();
+        push[2] = frame.coded_width();
+        push[3] = frame.coded_height();
 
         unsafe {
             device
@@ -416,23 +416,23 @@ impl Sampler {
             // decoder is still using it as a reference. Only the frame's own
             // planes need a barrier if it came from the copying fallback.
             let mut barriers = Vec::new();
-            if frame.layout != vk::ImageLayout::GENERAL {
+            if frame.layout() != vk::ImageLayout::GENERAL {
                 barriers.push(
                     vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
                         .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                        .old_layout(frame.layout)
+                        .old_layout(frame.layout())
                         .new_layout(vk::ImageLayout::GENERAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(frame.image)
+                        .image(frame.image())
                         .subresource_range(vk::ImageSubresourceRange {
                             aspect_mask: vk::ImageAspectFlags::COLOR,
                             base_mip_level: 0,
                             level_count: 1,
-                            base_array_layer: frame.array_layer,
+                            base_array_layer: frame.array_layer(),
                             layer_count: 1,
                         }),
                 );
@@ -488,8 +488,8 @@ impl Sampler {
             );
             device.cmd_dispatch(
                 self.command_buffer,
-                frame.width.div_ceil(8),
-                frame.height.div_ceil(8),
+                frame.width().div_ceil(8),
+                frame.height().div_ceil(8),
                 1,
             );
 
@@ -572,7 +572,7 @@ impl Sampler {
     /// frame has to be prepared to be resized. Cached views go too: they belong
     /// to images the decoder has moved on from.
     fn resize_for(&mut self, frame: &DecodedFrame) -> Result<(), Box<dyn std::error::Error>> {
-        if self.width == frame.width && self.height == frame.height {
+        if self.width == frame.width() && self.height == frame.height() {
             return Ok(());
         }
         unsafe {
@@ -587,8 +587,8 @@ impl Sampler {
             self.device.destroy_image(self.target, None);
             self.device.free_memory(self.target_memory, None);
         }
-        self.width = frame.width;
-        self.height = frame.height;
+        self.width = frame.width();
+        self.height = frame.height();
         self.target_initialised = false;
         self.create_target()
     }
@@ -603,9 +603,9 @@ impl Sampler {
         // Keyed on the generation as well as the handle: a rebuilt session
         // destroys its images and drivers reuse handles.
         let key = (
-            frame.generation,
-            ash::vk::Handle::as_raw(frame.image),
-            frame.array_layer,
+            frame.generation(),
+            ash::vk::Handle::as_raw(frame.image()),
+            frame.array_layer(),
         );
         if let Some(view) = self.frame_views.get(&key) {
             return Ok(*view);
@@ -616,14 +616,14 @@ impl Sampler {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .push(&mut conversion_info)
-                    .image(frame.image)
+                    .image(frame.image())
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(self.format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
                         level_count: 1,
-                        base_array_layer: frame.array_layer,
+                        base_array_layer: frame.array_layer(),
                         layer_count: 1,
                     }),
                 None,

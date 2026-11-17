@@ -189,7 +189,7 @@ fn check_no_latency(name: &str) -> Result<(), Box<dyn std::error::Error>> {
                 other => panic!("{name}: no frame after access unit {i} ({other:?})"),
             }
         };
-        assert_eq!(frame.pts, i as u64, "{name}: frame order");
+        assert_eq!(frame.pts(), i as u64, "{name}: frame order");
     }
     Ok(())
 }

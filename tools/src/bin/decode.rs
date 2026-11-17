@@ -56,14 +56,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut generation = None;
     let mut on_frame =
         |frame: pixelforge::decoder::DecodedFrame| -> Result<(), Box<dyn std::error::Error>> {
-            if generation.is_some_and(|g| g != frame.generation) {
+            if generation.is_some_and(|g| g != frame.generation()) {
                 println!(
                     "  generation {} -> {} at frame {count}: the decoder rebuilt its images",
                     generation.unwrap(),
-                    frame.generation
+                    frame.generation()
                 );
             }
-            generation = Some(frame.generation);
+            generation = Some(frame.generation());
             if let Some(file) = output.as_mut() {
                 let yuv = downloader.download(&frame)?;
                 file.write_all(&yuv.y)?;

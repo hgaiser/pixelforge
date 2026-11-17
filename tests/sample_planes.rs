@@ -62,7 +62,7 @@ fn plane_views_match_the_decoder() -> Result<(), Box<dyn std::error::Error>> {
         let mut planes: Option<PlaneReader> = None;
         let mut count = 0;
         common::decode_stream(&mut decoder, &std::fs::read(path)?, |frame| {
-            if !frame.plane_views {
+            if !frame.plane_views() {
                 return Err(format!("{path}: no per-plane views on this device").into());
             }
             let reader = match &mut planes {
@@ -253,7 +253,7 @@ impl PlaneReader {
         }?[0];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
 
-        let (w, h) = (frame.width, frame.height);
+        let (w, h) = (frame.width(), frame.height());
         let out = [
             make_plane(&device, &memory_properties, w, h, vk::Format::R8_UNORM)?,
             make_plane(
@@ -327,7 +327,7 @@ impl PlaneReader {
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        let push = [frame.width, frame.height];
+        let push = [frame.width(), frame.height()];
         let y_size = self.width as u64 * self.height as u64;
 
         unsafe {
@@ -357,12 +357,12 @@ impl PlaneReader {
                     0,
                 ),
             ];
-            if frame.layout != vk::ImageLayout::GENERAL {
+            if frame.layout() != vk::ImageLayout::GENERAL {
                 barriers.push(to_general(
-                    frame.image,
-                    frame.layout,
+                    frame.image(),
+                    frame.layout(),
                     vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1,
-                    frame.array_layer,
+                    frame.array_layer(),
                 ));
             }
             device.cmd_pipeline_barrier2(
@@ -392,8 +392,8 @@ impl PlaneReader {
             );
             device.cmd_dispatch(
                 self.command_buffer,
-                frame.width.div_ceil(8),
-                frame.height.div_ceil(8),
+                frame.width().div_ceil(8),
+                frame.height().div_ceil(8),
                 1,
             );
 
@@ -403,7 +403,7 @@ impl PlaneReader {
             ];
             // Give the frame back in the layout it reports: the decoder, and
             // anyone else reading the frame, go by `frame.layout`.
-            if frame.layout != vk::ImageLayout::GENERAL {
+            if frame.layout() != vk::ImageLayout::GENERAL {
                 after.push(
                     vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -411,16 +411,16 @@ impl PlaneReader {
                         .dst_stage_mask(vk::PipelineStageFlags2::NONE)
                         .dst_access_mask(vk::AccessFlags2::NONE)
                         .old_layout(vk::ImageLayout::GENERAL)
-                        .new_layout(frame.layout)
+                        .new_layout(frame.layout())
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(frame.image)
+                        .image(frame.image())
                         .subresource_range(vk::ImageSubresourceRange {
                             aspect_mask: vk::ImageAspectFlags::PLANE_0
                                 | vk::ImageAspectFlags::PLANE_1,
                             base_mip_level: 0,
                             level_count: 1,
-                            base_array_layer: frame.array_layer,
+                            base_array_layer: frame.array_layer(),
                             layer_count: 1,
                         }),
                 );
@@ -497,7 +497,7 @@ impl PlaneReader {
     /// frame has to be prepared to be resized. Cached views go too: they belong
     /// to images the decoder has moved on from.
     fn resize_for(&mut self, frame: &DecodedFrame) -> Result<(), Box<dyn std::error::Error>> {
-        if self.width == frame.width && self.height == frame.height {
+        if self.width == frame.width() && self.height == frame.height() {
             return Ok(());
         }
         unsafe {
@@ -516,8 +516,8 @@ impl PlaneReader {
             self.device.destroy_buffer(self.staging, None);
             self.device.free_memory(self.staging_memory, None);
         }
-        self.width = frame.width;
-        self.height = frame.height;
+        self.width = frame.width();
+        self.height = frame.height();
         let (w, h) = (self.width, self.height);
         self.out = [
             make_plane(
@@ -555,9 +555,9 @@ impl PlaneReader {
         // destroys its images and drivers reuse handles, so a handle alone can
         // name two different images over a decode's lifetime.
         let key = (
-            frame.generation,
-            ash::vk::Handle::as_raw(frame.image),
-            frame.array_layer,
+            frame.generation(),
+            ash::vk::Handle::as_raw(frame.image()),
+            frame.array_layer(),
         );
         if let Some(views) = self.views.get(&key) {
             return Ok(*views);
@@ -583,14 +583,14 @@ impl PlaneReader {
                 self.device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
                         .push(&mut view_usage)
-                        .image(frame.image)
+                        .image(frame.image())
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
                         .subresource_range(vk::ImageSubresourceRange {
                             aspect_mask: aspect,
                             base_mip_level: 0,
                             level_count: 1,
-                            base_array_layer: frame.array_layer,
+                            base_array_layer: frame.array_layer(),
                             layer_count: 1,
                         }),
                     None,

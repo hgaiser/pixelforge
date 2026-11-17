@@ -159,7 +159,7 @@
 //!         // Take what the GPU has finished with; `Pending` just means "not yet".
 //!         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
 //!             // `frame.image` is a decoder-owned GPU image, valid until dropped.
-//!             let _ = frame.image;
+//!             let _ = frame.image();
 //!         }
 //!     }
 //!
@@ -167,7 +167,7 @@
 //!     // held back, and closes the source.
 //!     decoder.finish()?;
 //!     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-//!         let _ = frame.image;
+//!         let _ = frame.image();
 //!     }
 //!     Ok(())
 //! }
