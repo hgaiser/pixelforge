@@ -11,8 +11,8 @@ use super::ExternalSupport;
 use super::queues;
 use super::{
     DecodeQueueFamilies, DeviceExtensions, DeviceFeatures, DeviceQueue, DeviceRequirements,
-    QueueRoles, VideoContext, VideoContextBuilder, VideoContextInner, decode_extension_names,
-    find_decode_queue_families, query_decode_codecs, scan_queue_families,
+    QueueLocks, QueueRoles, VideoContext, VideoContextBuilder, VideoContextInner,
+    decode_extension_names, find_decode_queue_families, query_decode_codecs, scan_queue_families,
     supports_internally_synchronized_queues, supports_unified_image_layouts,
 };
 use crate::encoder::Codec;
@@ -439,6 +439,12 @@ impl VideoContextBuilder {
         let encode_plan = plan.encode.as_ref();
         Ok(VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
+                queue_locks: QueueLocks::new([
+                    video_encode_queue,
+                    video_decode_queue,
+                    Some(transfer_queue),
+                    Some(compute_queue),
+                ]),
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 entry,

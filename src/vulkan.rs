@@ -661,8 +661,52 @@ fn check_decode_support(
     }
 }
 
+/// One lock for each distinct queue the context uses.
+///
+/// A `VkQueue` is externally synchronized: two threads may not submit to it at
+/// once. A context is `Clone` and `Sync`, so decoders, encoders and uploaders
+/// made from clones of it may run on different threads, and several of them
+/// can share a queue, whatever their roles. Every submission takes the lock of
+/// its queue's handle. Roles do not matter: the transfer and compute roles may
+/// well be one queue.
+struct QueueLocks {
+    locks: Vec<(vk::Queue, std::sync::Mutex<()>)>,
+    /// For a queue the context does not know. Not expected, but a lock that
+    /// is too wide is better than none.
+    other: std::sync::Mutex<()>,
+}
+
+impl QueueLocks {
+    fn new(queues: impl IntoIterator<Item = Option<vk::Queue>>) -> Self {
+        let mut locks: Vec<(vk::Queue, std::sync::Mutex<()>)> = Vec::new();
+        for queue in queues.into_iter().flatten() {
+            if !locks.iter().any(|(q, _)| *q == queue) {
+                locks.push((queue, std::sync::Mutex::new(())));
+            }
+        }
+        Self {
+            locks,
+            other: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn lock(&self, queue: vk::Queue) -> std::sync::MutexGuard<'_, ()> {
+        let mutex = self
+            .locks
+            .iter()
+            .find(|(q, _)| *q == queue)
+            .map_or(&self.other, |(_, m)| m);
+        // The guarded data is `()`, so a panic while holding it left nothing
+        // inconsistent.
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Inner struct holding the actual Vulkan resources.
 struct VideoContextInner {
+    queue_locks: QueueLocks,
     entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -752,6 +796,54 @@ impl VideoContext {
     /// Get the Vulkan device.
     pub fn device(&self) -> &ash::Device {
         &self.inner.device
+    }
+
+    /// `vkQueueSubmit` on one of this context's queues, under the queue's lock.
+    ///
+    /// Use this, and not `device().queue_submit`, to submit to a queue got
+    /// from this context: the same queue may be used by other threads through
+    /// clones of the context, and Vulkan forbids two threads submitting to one
+    /// queue at once.
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueSubmit`, except for the queue's synchronization, which this
+    /// takes care of.
+    pub unsafe fn submit(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.device.queue_submit(queue, submits, fence) }
+    }
+
+    /// `vkQueueSubmit2` on one of this context's queues, under the queue's
+    /// lock. See [`submit`](Self::submit).
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueSubmit2`, except for the queue's synchronization.
+    pub unsafe fn submit2(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.sync2.queue_submit2(queue, submits, fence) }
+    }
+
+    /// `vkQueueWaitIdle` on one of this context's queues, under the queue's
+    /// lock. See [`submit`](Self::submit).
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueWaitIdle`, except for the queue's synchronization.
+    pub unsafe fn wait_queue_idle(&self, queue: vk::Queue) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.device.queue_wait_idle(queue) }
     }
 
     pub(crate) fn sync2(&self) -> &ash::khr::synchronization2::Device {
@@ -1454,6 +1546,12 @@ impl VideoContext {
 
         Ok(Self {
             inner: std::sync::Arc::new(VideoContextInner {
+                queue_locks: QueueLocks::new([
+                    video_encode_queue,
+                    video_decode_queue,
+                    Some(transfer_queue),
+                    Some(compute_queue),
+                ]),
                 entry,
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),

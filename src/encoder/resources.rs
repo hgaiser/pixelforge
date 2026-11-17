@@ -394,7 +394,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
     unsafe { device.reset_fences(&[params.fence]) }
         .map_err(PixelForgeError::vk("vkResetFences"))?;
-    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
+    unsafe { context.submit(params.queue, &[submit_info], params.fence) }
         .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
     unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
         .map_err(PixelForgeError::vk("vkWaitForFences"))?;
@@ -618,12 +618,8 @@ pub(crate) fn upload_image_to_input(
         .command_buffer_infos(&command_buffers)
         .signal_semaphore_infos(params.signals);
 
-    unsafe {
-        context
-            .sync2()
-            .queue_submit2(params.upload_queue, &[submit_info], vk::Fence::null())
-    }
-    .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
+    unsafe { context.submit2(params.upload_queue, &[submit_info], vk::Fence::null()) }
+        .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
 
     Ok(())
 }
@@ -821,8 +817,7 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
 ///
 /// The command buffer must have been ended.
 pub(crate) unsafe fn submit_encode_only(
-    device: &ash::Device,
-    sync2: &ash::khr::synchronization2::Device,
+    context: &VideoContext,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
@@ -838,14 +833,15 @@ pub(crate) unsafe fn submit_encode_only(
         .signal_semaphore_infos(signal_infos);
 
     unsafe {
-        device
+        context
+            .device()
             .reset_fences(&[fence])
             .map_err(PixelForgeError::vk("vkResetFences"))?;
     }
 
     unsafe {
-        sync2
-            .queue_submit2(encode_queue, &[submit_info], fence)
+        context
+            .submit2(encode_queue, &[submit_info], fence)
             .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
     }
 

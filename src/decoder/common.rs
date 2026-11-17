@@ -709,10 +709,8 @@ impl DecoderCommon {
     /// The submission is chained onto the decode timeline, so the GPU still runs
     /// decodes in decode order despite the CPU running ahead.
     pub fn submit_decode(&mut self) -> Result<()> {
-        let device = self.context.device().clone();
         let queue = self.decode_queue;
-        self.pipeline
-            .submit_decode(&device, self.context.sync2(), queue)
+        self.pipeline.submit_decode(&self.context, queue)
     }
 
     /// Record `vkCmdBeginVideoCoding`, `vkCmdDecodeVideo` and

@@ -243,10 +243,10 @@ impl DecodePipeline {
     /// Chains onto the decode timeline so the GPU keeps decodes in decode order.
     pub(crate) fn submit_decode(
         &mut self,
-        device: &ash::Device,
-        sync2: &ash::khr::synchronization2::Device,
+        context: &VideoContext,
         decode_queue: vk::Queue,
     ) -> Result<()> {
+        let device = context.device();
         let slot = &self.slots[self.current_slot];
         let (semaphore, signal_value) = self.decodes.pending_signal();
 
@@ -289,8 +289,8 @@ impl DecodePipeline {
             .signal_semaphore_infos(&signals);
 
         unsafe {
-            sync2
-                .queue_submit2(decode_queue, &[submit], slot.decode_fence)
+            context
+                .submit2(decode_queue, &[submit], slot.decode_fence)
                 .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
 
@@ -305,10 +305,10 @@ impl DecodePipeline {
     /// so copies complete in submission order.
     pub(crate) fn submit_copy(
         &mut self,
-        device: &ash::Device,
-        sync2: &ash::khr::synchronization2::Device,
+        context: &VideoContext,
         transfer_queue: vk::Queue,
     ) -> Result<()> {
+        let device = context.device();
         let slot = &self.slots[self.current_slot];
         let (copy_semaphore, signal_value) = self.copies.pending_signal();
 
@@ -345,8 +345,8 @@ impl DecodePipeline {
             .signal_semaphore_infos(&signals);
 
         unsafe {
-            sync2
-                .queue_submit2(transfer_queue, &[submit], slot.transfer_fence)
+            context
+                .submit2(transfer_queue, &[submit], slot.transfer_fence)
                 .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
 

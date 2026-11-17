@@ -922,8 +922,7 @@ impl ColorConverter {
                 .reset_fences(&[self.fence])
                 .map_err(PixelForgeError::vk("vkResetFences"))?;
             self.context
-                .sync2()
-                .queue_submit2(self.context.compute_queue(), &[submit_info], self.fence)
+                .submit2(self.context.compute_queue(), &[submit_info], self.fence)
                 .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
         }
         self.timeline.commit();

@@ -543,7 +543,7 @@ impl Sampler {
             device.end_command_buffer(self.command_buffer)?;
             let buffers = [self.command_buffer];
             device.reset_fences(&[self.fence])?;
-            device.queue_submit(
+            self.context.submit(
                 self.queue,
                 &[vk::SubmitInfo::default().command_buffers(&buffers)],
                 self.fence,

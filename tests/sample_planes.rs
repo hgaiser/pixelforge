@@ -115,7 +115,7 @@ fn allocate(
 
 /// Reads a decoded picture's two planes as ordinary textures.
 struct PlaneReader {
-    _context: VideoContext,
+    context: VideoContext,
     device: ash::Device,
     queue: vk::Queue,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -268,7 +268,7 @@ impl PlaneReader {
         let (staging, staging_memory) = make_staging(&device, &memory_properties, w, h)?;
 
         Ok(Self {
-            _context: context.clone(),
+            context: context.clone(),
             device,
             queue: context.compute_queue(),
             memory_properties,
@@ -465,7 +465,7 @@ impl PlaneReader {
             device.end_command_buffer(self.command_buffer)?;
             let buffers = [self.command_buffer];
             device.reset_fences(&[self.fence])?;
-            device.queue_submit(
+            self.context.submit(
                 self.queue,
                 &[vk::SubmitInfo::default().command_buffers(&buffers)],
                 self.fence,

@@ -156,9 +156,7 @@ impl DecoderCommon {
 
     /// Submit the recorded reorder copy without waiting for it.
     pub fn submit_copy(&mut self) -> Result<()> {
-        let device = self.context.device().clone();
         let queue = self.transfer_queue;
-        self.pipeline
-            .submit_copy(&device, self.context.sync2(), queue)
+        self.pipeline.submit_copy(&self.context, queue)
     }
 }

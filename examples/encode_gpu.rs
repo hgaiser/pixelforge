@@ -339,7 +339,8 @@ impl Canvas {
                 .command_buffers(std::slice::from_ref(&cb))
                 .signal_semaphores(std::slice::from_ref(&self.timeline))
                 .push(&mut timeline_info);
-            device.queue_submit(self.context.compute_queue(), &[submit], self.fence)?;
+            self.context
+                .submit(self.context.compute_queue(), &[submit], self.fence)?;
         }
         Ok(TimelinePoint::new(self.timeline, self.drawn))
     }

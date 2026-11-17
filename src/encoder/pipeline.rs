@@ -539,8 +539,7 @@ impl EncodePipeline {
     /// order. Returns the point the encode signals.
     pub(crate) fn submit_current(
         &mut self,
-        device: &ash::Device,
-        sync2: &ash::khr::synchronization2::Device,
+        context: &VideoContext,
         encode_queue: vk::Queue,
         external_waits: &[vk::SemaphoreSubmitInfo<'static>],
         extra_signals: &[vk::SemaphoreSubmitInfo<'static>],
@@ -608,8 +607,7 @@ impl EncodePipeline {
         .collect();
         unsafe {
             submit_encode_only(
-                device,
-                sync2,
+                context,
                 command_buffer,
                 readback.fence,
                 encode_queue,

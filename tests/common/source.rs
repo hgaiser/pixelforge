@@ -54,8 +54,8 @@ pub unsafe fn one_shot<F: FnOnce(vk::CommandBuffer)>(
         device.end_command_buffer(cb)?;
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        device.queue_submit(context.compute_queue(), &[submit], vk::Fence::null())?;
-        device.queue_wait_idle(context.compute_queue())?;
+        context.submit(context.compute_queue(), &[submit], vk::Fence::null())?;
+        context.wait_queue_idle(context.compute_queue())?;
         device.destroy_command_pool(pool, None);
     }
     Ok(())

@@ -321,8 +321,7 @@ impl EncoderCommon {
         let signals = std::mem::take(&mut self.pending_signals);
         let delivery = std::mem::replace(&mut self.delivery, Delivery::Packet);
         let point = self.pipeline.submit_current(
-            self.context.device(),
-            self.context.sync2(),
+            &self.context,
             encode_queue,
             &waits,
             &signals,
@@ -1069,9 +1068,11 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
             let common = &mut self.common;
             let device = common.context.device();
             // Wait on just the queues this encoder used, not the whole device.
-            let _ = device.queue_wait_idle(common.context.transfer_queue());
+            let _ = common
+                .context
+                .wait_queue_idle(common.context.transfer_queue());
             if let Some(q) = common.context.video_encode_queue() {
-                let _ = device.queue_wait_idle(q);
+                let _ = common.context.wait_queue_idle(q);
             }
 
             common.pipeline.destroy(device);

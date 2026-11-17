@@ -631,8 +631,11 @@ impl YuvUploader {
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
-        unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
+        unsafe {
+            self.context
+                .submit(self.context.transfer_queue(), &[submit_info], self.fence)
+        }
+        .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
             .map_err(PixelForgeError::vk("vkWaitForFences"))?;
@@ -666,7 +669,7 @@ impl Drop for YuvUploader {
         let device = self.context.device();
         unsafe {
             // Wait for this uploader's queue before destroying resources.
-            let _ = device.queue_wait_idle(self.context.transfer_queue());
+            let _ = self.context.wait_queue_idle(self.context.transfer_queue());
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
             device.destroy_buffer(self.staging_buffer, None);
@@ -888,8 +891,8 @@ impl YuvDownloader {
                 .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
             let submit =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-            device
-                .queue_submit(self.context.transfer_queue(), &[submit], self.fence)
+            self.context
+                .submit(self.context.transfer_queue(), &[submit], self.fence)
                 .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
             device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
