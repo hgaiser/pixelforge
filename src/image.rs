@@ -719,6 +719,9 @@ pub struct YuvDownloader {
     /// Staging buffer, its memory and its size, made larger when a frame
     /// needs more.
     staging: Option<(vk::Buffer, vk::DeviceMemory, usize)>,
+    /// Whether the staging memory is host coherent. If not, it is cached and
+    /// needs an invalidate before the CPU reads it.
+    staging_coherent: bool,
 }
 
 impl YuvDownloader {
@@ -751,6 +754,7 @@ impl YuvDownloader {
             command_buffer,
             fence,
             staging: None,
+            staging_coherent: true,
         })
     }
 
@@ -908,6 +912,14 @@ impl YuvDownloader {
             let data = device
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .map_err(PixelForgeError::vk("vkMapMemory"))? as *const u8;
+            if !self.staging_coherent {
+                device
+                    .invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                        .memory(memory)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE)])
+                    .map_err(PixelForgeError::vk("vkInvalidateMappedMemoryRanges"))?;
+            }
             for row in 0..frame.height as usize {
                 y.extend_from_slice(std::slice::from_raw_parts(
                     data.add(row * y_stride),
@@ -956,10 +968,21 @@ impl YuvDownloader {
                 )
                 .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
             let requirements = device.get_buffer_memory_requirements(buffer);
-            let Some(memory_type) = self.context.find_memory_type(
-                requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            ) else {
+            // Cached memory first: the CPU reads it fast, where write-combined
+            // memory (what plain coherent memory often is) reads very slowly.
+            // Coherent memory is the fallback.
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE;
+            let find = |flags| {
+                self.context
+                    .find_memory_type(requirements.memory_type_bits, host | flags)
+            };
+            let cached = vk::MemoryPropertyFlags::HOST_CACHED;
+            let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+            let Some((memory_type, is_coherent)) = find(cached | coherent)
+                .map(|t| (t, true))
+                .or_else(|| find(cached).map(|t| (t, false)))
+                .or_else(|| find(coherent).map(|t| (t, true)))
+            else {
                 device.destroy_buffer(buffer, None);
                 return Err(PixelForgeError::NoSuitableDevice(
                     "no host-visible memory to download frames into".to_string(),
@@ -983,6 +1006,7 @@ impl YuvDownloader {
                 return Err(PixelForgeError::vulkan("vkBindBufferMemory", e));
             }
             self.staging = Some((buffer, memory, requirements.size as usize));
+            self.staging_coherent = is_coherent;
             Ok((buffer, memory))
         }
     }
