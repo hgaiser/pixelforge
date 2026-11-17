@@ -292,7 +292,8 @@ impl FramePool {
             return;
         }
         unsafe {
-            common.context.device().device_wait_idle().ok();
+            // The pool image may be a copy target of a submission in flight.
+            common.pipeline.wait_all_free();
             common.context.device().destroy_image(p.image, None);
             common.context.device().free_memory(p.memory, None);
         }

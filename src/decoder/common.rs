@@ -518,7 +518,6 @@ impl DecoderCommon {
             );
         }
         unsafe {
-            self.context.device().device_wait_idle().ok();
             self.video_queue_fn
                 .destroy_video_session_parameters(session.session_params, None);
             if let Some((image, memory, view)) = session.output_image {
@@ -807,7 +806,6 @@ impl Drop for DecoderCommon {
         // staging buffers and fences below are freed nothing is in flight.
         self.destroy_session();
         unsafe {
-            self.context.device().device_wait_idle().ok();
             let device = self.context.device().clone();
             self.pipeline.destroy(&device);
             self.context

@@ -665,8 +665,8 @@ impl Drop for YuvUploader {
     fn drop(&mut self) {
         let device = self.context.device();
         unsafe {
-            // Wait for all GPU work to finish before destroying resources.
-            let _ = device.device_wait_idle();
+            // Wait for this uploader's queue before destroying resources.
+            let _ = device.queue_wait_idle(self.context.transfer_queue());
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
             device.destroy_buffer(self.staging_buffer, None);
