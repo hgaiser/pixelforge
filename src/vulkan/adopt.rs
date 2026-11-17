@@ -407,7 +407,15 @@ impl VideoContextBuilder {
         let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let queue = |q: DeviceQueue| unsafe { device.get_device_queue(q.family, q.index) };
+        // `vkGetDeviceQueue2`, so a queue created with flags is found.
+        let queue = |q: DeviceQueue| unsafe {
+            device.get_device_queue2(
+                &vk::DeviceQueueInfo2::default()
+                    .flags(q.flags)
+                    .queue_family_index(q.family)
+                    .queue_index(q.index),
+            )
+        };
         let video_encode_queue = encode.map(queue);
         let video_decode_queue = decode.map(queue);
         let transfer_queue = queue(transfer);

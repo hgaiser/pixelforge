@@ -14,20 +14,35 @@ use crate::error::{PixelForgeError, Result};
 use ash::vk;
 
 /// One queue on a device: a queue family and an index within it, as passed to
-/// `vkGetDeviceQueue`.
+/// `vkGetDeviceQueue2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct DeviceQueue {
     /// Queue family index.
     pub family: u32,
     /// Index of the queue within its family. The caller must have created at
     /// least `index + 1` queues in `family`.
     pub index: u32,
+    /// The flags the queue was created with in `VkDeviceQueueCreateInfo`, for
+    /// example `INTERNALLY_SYNCHRONIZED_KHR`. A queue created with flags can
+    /// be fetched only with the same flags. Empty by default.
+    pub flags: vk::DeviceQueueCreateFlags,
 }
 
 impl DeviceQueue {
     /// Queue `index` of `family`.
     pub fn new(family: u32, index: u32) -> Self {
-        Self { family, index }
+        Self {
+            family,
+            index,
+            flags: vk::DeviceQueueCreateFlags::empty(),
+        }
+    }
+
+    /// Set the flags the queue was created with.
+    pub fn with_flags(mut self, flags: vk::DeviceQueueCreateFlags) -> Self {
+        self.flags = flags;
+        self
     }
 }
 
