@@ -81,8 +81,9 @@ fn rfi() -> Result<(), Box<dyn std::error::Error>> {
             BFrameSupport::Flat => Some(BFrameReferences::Flat),
             BFrameSupport::Pyramid => Some(BFrameReferences::Pyramid),
         };
-        // Without B-frames, also predicting from one reference, as a streaming
-        // host does to save encode time: the rest of the window recovers.
+        // Without B-frames, also run predicting from one reference (as a streaming
+        // host may, to save encode time) and check that the rest of the window
+        // still recovers.
         let runs = [(None, None), (None, Some(1))]
             .into_iter()
             .chain(b_frames.map(|references| (Some(references), None)));

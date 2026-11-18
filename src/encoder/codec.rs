@@ -964,8 +964,8 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.begin_encode(frame, delivery);
 
         let setup = self.codec.begin_picture(&mut self.common, plan)?;
-        // The first frame shown after a recovering invalidation; an IDR in
-        // between (one was asked for) recovers by itself.
+        // The first frame shown after an invalidation that kept a reference. An
+        // IDR requested in between recovers by itself and isn't marked.
         let is_recovery_frame = !plan.hidden
             && std::mem::take(&mut self.common.recovery_pending)
             && plan.frame_type() != FrameType::Idr;

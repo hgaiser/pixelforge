@@ -443,7 +443,7 @@ pub struct EncodeConfig {
     /// as the device allows, which can be fewer. The device's DPB size can
     /// also lower it.
     pub max_reference_frames: u32,
-    /// The most references one frame predicts from, below the device's limit;
+    /// The most references one frame predicts from, capped at the device's limit;
     /// `None` predicts from as many as the device allows. Fewer cost less to
     /// encode, and the rest of the window stays for invalidation. B-frames
     /// still predict from one reference on each side.
