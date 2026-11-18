@@ -8,6 +8,19 @@ repository = "https://github.com/hgaiser/pixelforge"
 keywords = ["vulkan", "video", "encoding", "decoding", "h264"]
 categories = ["multimedia::video", "graphics"]
 readme = "README.md"
+# Tracked files that a user of the crate does not need. Keep the shaders (the
+# compiled one is built in) and `tests/`, whose fixtures the tests embed.
+exclude = [
+    "/.cargo/",
+    "/.github/",
+    "/.gitignore",
+    "/AGENTS.md",
+    "/README.tpl",
+    "/assets/",
+    "/docs/",
+    "/scripts/",
+    "/testdata/",
+]
 
 [workspace]
 members = [".", "tools"]
