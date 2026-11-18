@@ -105,6 +105,10 @@ impl DecodeDpb {
         }
     }
 
+    pub fn reset(&mut self) {
+        *self = Self::new(self.slot_count, self.pins.clone());
+    }
+
     /// Current reference pictures, in the order they were decoded.
     pub fn references(&self) -> &[RefPicture] {
         &self.refs
@@ -835,6 +839,35 @@ mod tests {
         assert_eq!(dpb.references().len(), 1);
         // The slot is reusable immediately.
         assert_eq!(dpb.try_allocate_slot().unwrap(), slot);
+    }
+
+    #[test]
+    fn reset_restores_initial_dpb_and_keeps_pins() {
+        let sps = sps(1);
+        let pins = Arc::new(SlotPins::default());
+        let mut dpb = DecodeDpb::new(4, pins.clone());
+        let slot = decode_ref(&mut dpb, &sps, &header(15, 0));
+        pins.pin(slot);
+        decode_ref(
+            &mut dpb,
+            &sps,
+            &header_with_mmco(
+                1,
+                0,
+                vec![Mmco::MaxLongTermIdx {
+                    max_long_term_frame_idx_plus1: 2,
+                }],
+            ),
+        );
+        assert_eq!(dpb.prev_frame_num_offset, 16);
+        assert_eq!(dpb.max_long_term_frame_idx, Some(1));
+
+        dpb.reset();
+        assert!(dpb.references().is_empty());
+        assert_eq!(dpb.prev_frame_num_offset, 0);
+        assert_eq!(dpb.prev_frame_num, 0);
+        assert_eq!(dpb.max_long_term_frame_idx, None);
+        assert_eq!(dpb.try_allocate_slot(), Some(1));
     }
 
     #[test]

@@ -98,7 +98,10 @@ pub(crate) struct DecodeSession {
     pub dpb: Vec<Arc<DpbImage>>,
     /// Whether each slot has been written at least once (governs the
     /// UNDEFINED-vs-DPB old layout in the pre-decode barrier).
-    pub dpb_slot_active: Vec<bool>,
+    dpb_slot_written: Vec<bool>,
+    /// Initialize the Vulkan DPB before the next decode. Image layouts survive
+    /// the coding reset, so they are tracked separately.
+    pub needs_reset: bool,
     pub use_layered_dpb: bool,
 
     /// True when the driver decodes into the DPB image directly; false when a
@@ -465,7 +468,8 @@ impl DecoderCommon {
             chroma_format: plan.chroma_format,
             dpb,
             slot_pins: Arc::new(SlotPins::default()),
-            dpb_slot_active: vec![false; plan.slot_count],
+            dpb_slot_written: vec![false; plan.slot_count],
+            needs_reset: true,
             use_layered_dpb: plan.use_layered_dpb,
             coincide: plan.coincide,
             spare_slots: plan.spare_slots,
@@ -590,7 +594,7 @@ impl DecoderCommon {
         // afterwards.
         let picture_layout = self.picture_layout();
         let (dst_image, dst_layer) = session.dpb_image_for_slot(slot);
-        let old_layout = if session.dpb_slot_active[slot as usize] {
+        let old_layout = if session.dpb_slot_written[slot as usize] {
             picture_layout
         } else {
             vk::ImageLayout::UNDEFINED
@@ -710,24 +714,21 @@ impl DecoderCommon {
     /// decodes in decode order despite the CPU running ahead.
     pub fn submit_decode(&mut self) -> Result<()> {
         let queue = self.decode_queue;
-        self.pipeline.submit_decode(&self.context, queue)
+        self.pipeline.submit_decode(&self.context, queue)?;
+        self.session.as_mut().expect("active session").needs_reset = false;
+        Ok(())
     }
 
     /// Record `vkCmdBeginVideoCoding`, `vkCmdDecodeVideo` and
     /// `vkCmdEndVideoCoding` from a linked `record`, resetting the session
-    /// first if this is its first decode.
+    /// first if this decode starts a new sequence after creation or reset.
     pub fn record_coding<C: RecordCodec>(&self, record: &DecodeRecord<C>) {
         let command_buffer = self.decode_command_buffer();
-        // A session's first decode sees no active slot.
-        let first_use = self
-            .session
-            .as_ref()
-            .is_none_or(|s| !s.dpb_slot_active.iter().any(|&a| a));
+        let needs_reset = self.session.as_ref().expect("active session").needs_reset;
         unsafe {
             self.video_queue_fn
                 .cmd_begin_video_coding(command_buffer, record.begin_info());
-            // On the first use of the session, all DPB slots must be reset.
-            if first_use {
+            if needs_reset {
                 let control = vk::VideoCodingControlInfoKHR::default()
                     .flags(vk::VideoCodingControlFlagsKHR::RESET);
                 self.video_queue_fn
@@ -757,7 +758,7 @@ impl DecoderCommon {
         let output_layout = self.output_layout();
         let generation = self.generation;
         let session = self.session.as_mut().expect("a picture was just decoded");
-        session.dpb_slot_active[slot as usize] = true;
+        session.dpb_slot_written[slot as usize] = true;
         let (image, image_view, layout, array_layer) = if session.coincide {
             let (image, layer) = session.dpb_image_for_slot(slot);
             (image, session.dpb_entry(slot).2, picture_layout, layer)

@@ -190,6 +190,10 @@ impl DecodeDpb {
         }
     }
 
+    pub fn reset(&mut self) {
+        *self = Self::new(self.slot_count, self.pins.clone());
+    }
+
     /// Current reference pictures, in the order they were decoded.
     ///
     /// After [`Self::begin_picture`] these are exactly the pictures in the

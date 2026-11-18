@@ -99,6 +99,14 @@ impl Av1Parser {
         Self::default()
     }
 
+    /// Clear reference and partial-frame state while retaining the sequence.
+    pub fn reset(&mut self) {
+        *self = Self {
+            sequence: self.sequence.take(),
+            ..Self::default()
+        };
+    }
+
     /// The sequence header in effect, once one has been seen.
     pub fn sequence_header(&self) -> Option<&SequenceHeader> {
         self.sequence.as_ref()

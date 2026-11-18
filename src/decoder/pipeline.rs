@@ -40,7 +40,7 @@
 //! instead: past it, pictures are copied out rather than pinned.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use ash::vk::{self, Handle};
@@ -96,6 +96,8 @@ struct WorkItem {
     frames: Vec<DecodedFrame>,
     /// End of stream: after this item's frames, the consumer sees `None`.
     end_of_stream: bool,
+    /// Acknowledge delivery to a caller waiting for a flush.
+    delivered: Option<Sender<()>>,
 }
 
 /// Rotating set of [`DecodeSlot`]s, the timelines that order their submissions,
@@ -199,6 +201,15 @@ impl DecodePipeline {
     /// state and at teardown.
     pub(crate) fn wait_all_free(&self) {
         self.slot_sync.wait_all_free();
+    }
+
+    /// Wait for submitted work and for the completion thread to send its frames.
+    pub(crate) fn drain_submitted(&mut self) {
+        // An error can leave a submission in the current slot before hand-off.
+        if self.last_fence.is_some() {
+            self.end_picture(Vec::new());
+        }
+        self.wait_all_free();
     }
 
     /// Ensure the current slot's staging buffer holds at least `size` bytes.
@@ -372,8 +383,25 @@ impl DecodePipeline {
             fence,
             frames,
             end_of_stream: false,
+            delivered: None,
         });
         self.current_slot = (self.current_slot + 1) % self.slots.len();
+    }
+
+    /// Send `frames` after earlier submissions and wait until they are sent.
+    pub(crate) fn flush_stream(&mut self, frames: Vec<DecodedFrame>) -> Result<()> {
+        self.drain_submitted();
+        let (delivered, completion) = mpsc::channel();
+        self.send(WorkItem {
+            slot_index: None,
+            fence: None,
+            frames,
+            end_of_stream: false,
+            delivered: Some(delivered),
+        });
+        completion.recv().map_err(|_| {
+            PixelForgeError::Driver("decode completion thread stopped during flush".to_string())
+        })
     }
 
     /// End the stream: deliver `frames`, then close the channel so the consumer
@@ -384,6 +412,7 @@ impl DecodePipeline {
             fence: None,
             frames,
             end_of_stream: true,
+            delivered: None,
         });
     }
 
@@ -469,6 +498,9 @@ fn run_completion_thread(
         }
         if let Some(index) = work.slot_index {
             slot_sync.set_free(index);
+        }
+        if let Some(delivered) = work.delivered {
+            let _ = delivered.send(());
         }
     }
 }

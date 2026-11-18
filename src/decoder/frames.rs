@@ -480,6 +480,15 @@ impl ReorderBuffer {
         Ok(Retained::Pool { index })
     }
 
+    /// Release buffered pictures once their GPU work has completed.
+    pub fn discard(&mut self) {
+        for entry in self.buffered.drain(..) {
+            if let Retained::Pool { index } = entry.retained {
+                self.pool.images[index].state = PoolState::Free;
+            }
+        }
+    }
+
     /// Emit every buffered picture in display order. Call at end of stream.
     pub fn flush(&mut self) -> Vec<DecodedFrame> {
         self.drain_all()

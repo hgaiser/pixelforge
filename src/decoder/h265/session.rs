@@ -472,6 +472,13 @@ impl CodecDecoder for H265Decoder {
         &mut self.common
     }
 
+    fn reset(&mut self) {
+        if let Some(dpb) = &mut self.dpb {
+            dpb.reset();
+        }
+        self.pending_eos = false;
+    }
+
     fn complete_prefix(buffer: &[u8]) -> usize {
         super::complete_prefix(buffer)
     }

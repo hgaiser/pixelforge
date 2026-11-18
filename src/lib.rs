@@ -180,6 +180,14 @@
 //! the CPU (for a file, a test or software processing), copy it with
 //! [`YuvDownloader`].
 //!
+//! To seek, call [`Decoder::reset`] and feed again from a keyframe. The
+//! decoder keeps the session for unchanged stream parameters and discards
+//! buffered input and pictures still waiting for reordering. Frames already
+//! sent to the source can still be read. Use the `pts` supplied with each
+//! call to distinguish frames from before and after the seek. At the end of
+//! a sequence, [`Decoder::flush`] delivers the remaining frames and keeps the
+//! decoder ready for another keyframe.
+//!
 //! ## RGB input
 //!
 //! An encoder takes RGB frames once it is told what they are, with a

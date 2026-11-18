@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::decoder::common::DecoderCommon;
 use crate::decoder::frames::{DecodedPicture, ReorderBuffer};
 use crate::decoder::{DecodeConfig, DecodeStatus, DecoderApi, FrameReceiver, Framing};
-use crate::error::Result;
+use crate::error::{PixelForgeError, Result};
 
 /// What a codec does; everything else is [`StreamDecoder`]'s.
 pub(crate) trait CodecDecoder: Send {
@@ -25,6 +25,9 @@ pub(crate) trait CodecDecoder: Send {
     /// The shared Vulkan state, which the codec owns.
     fn common(&self) -> &DecoderCommon;
     fn common_mut(&mut self) -> &mut DecoderCommon;
+
+    /// Forget picture and reference state, keeping stream parameters.
+    fn reset(&mut self);
 
     /// How many leading bytes of `buffer` hold coded pictures known to be
     /// complete.
@@ -94,6 +97,7 @@ pub(crate) struct StreamDecoder<C: CodecDecoder> {
     /// that does not exist yet, so they are skipped and the caller is told to
     /// request a keyframe. This is the normal state when joining a stream.
     awaiting_keyframe: bool,
+    finished: bool,
 }
 
 impl<C: CodecDecoder> StreamDecoder<C> {
@@ -105,6 +109,7 @@ impl<C: CodecDecoder> StreamDecoder<C> {
             carry: Vec::new(),
             carry_pts: 0,
             awaiting_keyframe: true,
+            finished: false,
         }
     }
 
@@ -124,7 +129,8 @@ impl<C: CodecDecoder> StreamDecoder<C> {
         let split = C::complete_prefix(&buffer);
 
         let result = if split > 0 {
-            self.decode_frames(&buffer[..split], self.carry_pts)
+            let pts = if carried == 0 { pts } else { self.carry_pts };
+            self.decode_frames(&buffer[..split], pts)
         } else {
             // Not enough bytes to complete a picture yet.
             Ok(DecodeStatus::Buffered)
@@ -203,6 +209,34 @@ impl<C: CodecDecoder> StreamDecoder<C> {
         }
         Ok(DecodeStatus::Buffered)
     }
+
+    fn check_open(&self) -> Result<()> {
+        if self.finished {
+            return Err(PixelForgeError::InvalidInput(
+                "decoder has already finished".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reset_input(&mut self) {
+        self.carry.clear();
+        self.carry_pts = 0;
+        self.awaiting_keyframe = true;
+        if let Some(session) = &mut self.codec.common_mut().session {
+            session.needs_reset = true;
+        }
+        self.codec.reset();
+    }
+
+    fn decode_tail(&mut self) -> Result<()> {
+        // End of stream is also a picture boundary in byte-stream framing.
+        if !self.carry.is_empty() {
+            let tail = std::mem::take(&mut self.carry);
+            self.decode_frames(&tail, self.carry_pts)?;
+        }
+        Ok(())
+    }
 }
 
 impl<C: CodecDecoder> DecoderApi for StreamDecoder<C> {
@@ -215,18 +249,30 @@ impl<C: CodecDecoder> DecoderApi for StreamDecoder<C> {
         }
     }
 
+    fn reset(&mut self) -> Result<()> {
+        self.check_open()?;
+        self.codec.common_mut().pipeline.drain_submitted();
+        self.reorder.discard();
+        self.reset_input();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.check_open()?;
+        self.decode_tail()?;
+        let frames = self.reorder.flush();
+        self.codec.common_mut().pipeline.flush_stream(frames)?;
+        self.reset_input();
+        Ok(())
+    }
+
     /// Decode what is still buffered and emit the pictures held for
     /// reordering. Call at end of stream.
     fn finish(&mut self) -> Result<()> {
-        // In byte-stream framing the tail is a picture that was never seen to
-        // end because nothing followed it. End of stream is what ends it.
-        if !self.carry.is_empty() {
-            let tail = std::mem::take(&mut self.carry);
-            let pts = self.carry_pts;
-            self.decode_frames(&tail, pts)?;
-        }
+        self.decode_tail()?;
         let frames = self.reorder.flush();
         self.codec.common_mut().finish_stream(frames);
+        self.finished = true;
         Ok(())
     }
 
