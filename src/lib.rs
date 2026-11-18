@@ -184,7 +184,9 @@
 //! decoder keeps the session for unchanged stream parameters and discards
 //! buffered input and pictures still waiting for reordering. Frames already
 //! sent to the source can still be read. Use the `pts` supplied with each
-//! call to distinguish frames from before and after the seek.
+//! call to distinguish frames from before and after the seek. At the end of
+//! a sequence, [`Decoder::flush`] delivers the remaining frames and keeps the
+//! decoder ready for another keyframe.
 //!
 //! ## RGB input
 //!

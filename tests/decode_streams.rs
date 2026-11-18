@@ -354,3 +354,62 @@ fn reset_h264_drops_reorder_and_keeps_parameter_sets() -> Result<(), Box<dyn std
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn flush_delivers_tail_and_allows_reuse() -> Result<(), Box<dyn std::error::Error>> {
+    use pixelforge::decoder::DecodeStatus;
+
+    common::init_logging();
+    let context = VideoContextBuilder::new()
+        .app_name("pixelforge-decode-flush")
+        .require_decode(Codec::H264)
+        .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+        .build()?;
+    let config = DecodeConfig::new(Codec::H264).with_byte_stream();
+    let mut readback = pixelforge::YuvDownloader::new(&context)?;
+    let mut fresh = Decoder::new(context.clone(), config.clone())?;
+    let mut decoder = Decoder::new(context, config)?;
+    let stream = include_bytes!("data/bframes.264");
+    let units = h264_access_units(stream);
+    fresh.decode(stream, 0)?;
+    fresh.finish()?;
+    let mut reference = Vec::new();
+    while let Some(frame) = pollster::block_on(fresh.next_frame())? {
+        reference.push((frame.display_order(), readback.download(&frame)?));
+    }
+    assert_eq!(reference.len(), units.len());
+
+    decoder.flush()?;
+    assert!(matches!(decoder.try_next_frame()?, FramePoll::Pending));
+    for pts in [10, 20] {
+        if pts == 20 {
+            assert_eq!(
+                decoder.decode(&stream[units[0].len()..], 1)?,
+                DecodeStatus::NeedsKeyframe
+            );
+            decoder.flush()?;
+            assert!(matches!(decoder.try_next_frame()?, FramePoll::Pending));
+        }
+        decoder.decode(stream, pts)?;
+        decoder.flush()?;
+        for (order, expected) in &reference {
+            let FramePoll::Frame(frame) = decoder.try_next_frame()? else {
+                panic!("flushed frame {order} must be ready when flush returns");
+            };
+            assert_eq!(frame.pts(), pts);
+            assert_eq!(frame.display_order(), *order);
+            assert_eq!(frame.generation(), 1);
+            let actual = readback.download(&frame)?;
+            assert!(actual.y == expected.y && actual.uv == expected.uv);
+        }
+        assert!(matches!(decoder.try_next_frame()?, FramePoll::Pending));
+    }
+    decoder.finish()?;
+    assert!(matches!(
+        decoder.flush(),
+        Err(pixelforge::PixelForgeError::InvalidInput(_))
+    ));
+    assert!(pollster::block_on(decoder.next_frame())?.is_none());
+    Ok(())
+}

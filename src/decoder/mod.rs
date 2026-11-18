@@ -433,6 +433,7 @@ pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<
 trait DecoderApi: Send {
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus>;
     fn reset(&mut self) -> Result<()>;
+    fn flush(&mut self) -> Result<()>;
     fn finish(&mut self) -> Result<()>;
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
@@ -546,6 +547,11 @@ impl Decoder {
         self.sink.reset()
     }
 
+    /// Deliver remaining frames. See [`DecodeSink::flush`].
+    pub fn flush(&mut self) -> Result<()> {
+        self.sink.flush()
+    }
+
     /// End the stream. See [`DecodeSink::finish`].
     pub fn finish(&mut self) -> Result<()> {
         self.sink.finish()
@@ -612,6 +618,21 @@ impl DecodeSink {
     /// reported by the source.
     pub fn reset(&mut self) -> Result<()> {
         self.inner.reset()
+    }
+
+    /// End the current sequence and keep the source open for another one.
+    ///
+    /// Decodes the remaining input as at [`finish`](Self::finish), then emits
+    /// the pictures still held for reordering in display order. On success,
+    /// all frames have been sent to the source, so
+    /// [`DecodeSource::try_next_frame`] can drain them until
+    /// [`FramePoll::Pending`].
+    ///
+    /// Feeding can resume at a keyframe, with the same retained parameters as
+    /// after [`reset`](Self::reset). Like that call, this fails after a
+    /// successful `finish`. It can also fail while decoding the buffered tail.
+    pub fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
     }
 
     /// End the stream: decode whatever is still buffered, emit the frames held

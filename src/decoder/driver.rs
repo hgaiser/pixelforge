@@ -209,6 +209,34 @@ impl<C: CodecDecoder> StreamDecoder<C> {
         }
         Ok(DecodeStatus::Buffered)
     }
+
+    fn check_open(&self) -> Result<()> {
+        if self.finished {
+            return Err(PixelForgeError::InvalidInput(
+                "decoder has already finished".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reset_input(&mut self) {
+        self.carry.clear();
+        self.carry_pts = 0;
+        self.awaiting_keyframe = true;
+        if let Some(session) = &mut self.codec.common_mut().session {
+            session.needs_reset = true;
+        }
+        self.codec.reset();
+    }
+
+    fn decode_tail(&mut self) -> Result<()> {
+        // End of stream is also a picture boundary in byte-stream framing.
+        if !self.carry.is_empty() {
+            let tail = std::mem::take(&mut self.carry);
+            self.decode_frames(&tail, self.carry_pts)?;
+        }
+        Ok(())
+    }
 }
 
 impl<C: CodecDecoder> DecoderApi for StreamDecoder<C> {
@@ -222,34 +250,26 @@ impl<C: CodecDecoder> DecoderApi for StreamDecoder<C> {
     }
 
     fn reset(&mut self) -> Result<()> {
-        if self.finished {
-            return Err(PixelForgeError::InvalidInput(
-                "decoder has already finished".to_string(),
-            ));
-        }
-        let common = self.codec.common_mut();
-        common.pipeline.drain_submitted();
+        self.check_open()?;
+        self.codec.common_mut().pipeline.drain_submitted();
         self.reorder.discard();
-        self.carry.clear();
-        self.carry_pts = 0;
-        self.awaiting_keyframe = true;
-        if let Some(session) = &mut common.session {
-            session.needs_reset = true;
-        }
-        self.codec.reset();
+        self.reset_input();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.check_open()?;
+        self.decode_tail()?;
+        let frames = self.reorder.flush();
+        self.codec.common_mut().pipeline.flush_stream(frames)?;
+        self.reset_input();
         Ok(())
     }
 
     /// Decode what is still buffered and emit the pictures held for
     /// reordering. Call at end of stream.
     fn finish(&mut self) -> Result<()> {
-        // In byte-stream framing the tail is a picture that was never seen to
-        // end because nothing followed it. End of stream is what ends it.
-        if !self.carry.is_empty() {
-            let tail = std::mem::take(&mut self.carry);
-            let pts = self.carry_pts;
-            self.decode_frames(&tail, pts)?;
-        }
+        self.decode_tail()?;
         let frames = self.reorder.flush();
         self.codec.common_mut().finish_stream(frames);
         self.finished = true;
