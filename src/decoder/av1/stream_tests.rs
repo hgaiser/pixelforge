@@ -622,3 +622,36 @@ fn corrupt_streams_do_not_panic() {
         }
     }
 }
+
+#[test]
+fn reset_keeps_sequence_header_and_forgets_references() {
+    let data = fixture("aom_altref");
+    let starts = temporal_unit_starts(data).unwrap();
+    let mut parser = Av1Parser::new();
+    let mut keyframe = None;
+    for obu in iter_obus(&data[..starts[1]]) {
+        let obu = obu.unwrap();
+        if let Some(Av1Event::Frame(_)) = parser.parse_obu(&obu).unwrap() {
+            keyframe = Some(obu);
+            parser.commit_frame(Some(0)).unwrap();
+        }
+    }
+    let keyframe = keyframe.unwrap();
+    assert!(parser.refs().dpb_slot_in_use(0));
+
+    parser.reset();
+    assert!(parser.sequence_header().is_some());
+    assert_eq!(*parser.refs(), Default::default());
+    assert!(iter_obus(&data[starts[1]..starts[2]]).any(|obu| {
+        matches!(
+            parser.parse_obu(&obu.unwrap()).unwrap(),
+            Some(Av1Event::MissingReferences(_))
+        )
+    }));
+    assert!(matches!(
+        parser.parse_obu(&keyframe).unwrap(),
+        Some(Av1Event::Frame(_))
+    ));
+    parser.commit_frame(Some(1)).unwrap();
+    assert!(parser.refs().dpb_slot_in_use(1));
+}

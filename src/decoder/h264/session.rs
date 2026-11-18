@@ -554,6 +554,12 @@ impl CodecDecoder for H264Decoder {
         &mut self.common
     }
 
+    fn reset(&mut self) {
+        if let Some(dpb) = &mut self.dpb {
+            dpb.reset();
+        }
+    }
+
     fn complete_prefix(buffer: &[u8]) -> usize {
         super::complete_prefix(buffer)
     }

@@ -207,3 +207,150 @@ fn h264_zerolatency_has_no_delay() -> Result<(), Box<dyn std::error::Error>> {
 fn h264_novui_poc2_has_no_delay() -> Result<(), Box<dyn std::error::Error>> {
     check_no_latency("novui_poc2.264")
 }
+
+/// Compare replay after a discontinuity with a decoder started at the seek
+/// point. Priming and replay use different PTS so an old frame cannot pass.
+fn check_reset(
+    codec: Codec,
+    priming: &[u8],
+    seek: &[u8],
+    expected_count: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    let context = VideoContextBuilder::new()
+        .app_name("pixelforge-decode-reset")
+        .require_decode(codec)
+        .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+        .build()?;
+    let config = DecodeConfig::new(codec).with_byte_stream();
+    let mut readback = pixelforge::YuvDownloader::new(&context)?;
+    let mut fresh = Decoder::new(context.clone(), config.clone())?;
+    let (mut sink, mut source) = Decoder::new(context, config)?.split();
+
+    const BEFORE: u64 = 10;
+    const AFTER: u64 = 20;
+    sink.decode(priming, BEFORE)?;
+    sink.reset()?;
+    let FramePoll::Frame(old) = source.try_next_frame()? else {
+        panic!("reset must leave submitted frames on the source");
+    };
+    let generation = old.generation();
+    let old_pixels = readback.download(&old)?;
+    assert_eq!(old.pts(), BEFORE);
+    while let FramePoll::Frame(frame) = source.try_next_frame()? {
+        assert_eq!(frame.pts(), BEFORE);
+    }
+
+    sink.decode(seek, AFTER)?;
+    fresh.decode(seek, AFTER)?;
+    sink.finish()?;
+    fresh.finish()?;
+    let mut count = 0;
+    while let Some(frame) = pollster::block_on(source.next_frame())? {
+        let expected = pollster::block_on(fresh.next_frame())?.expect("extra frame after reset");
+        assert_eq!(frame.pts(), AFTER);
+        assert_eq!(frame.display_order(), expected.display_order());
+        assert_eq!(frame.generation(), generation);
+        assert_eq!(frame.is_keyframe(), expected.is_keyframe());
+        let actual = readback.download(&frame)?;
+        let expected = readback.download(&expected)?;
+        assert!(
+            actual.y == expected.y && actual.uv == expected.uv,
+            "frame {count}"
+        );
+        count += 1;
+    }
+    assert!(pollster::block_on(fresh.next_frame())?.is_none());
+    assert!(count > 0);
+    if let Some(expected) = expected_count {
+        assert_eq!(count, expected);
+    }
+    let still_held = readback.download(&old)?;
+    assert!(old_pixels.y == still_held.y && old_pixels.uv == still_held.uv);
+    assert!(matches!(
+        sink.reset(),
+        Err(pixelforge::PixelForgeError::InvalidInput(_))
+    ));
+    Ok(())
+}
+
+macro_rules! reset_tests {
+    ($($test:ident: $codec:expr, $prime:literal, $seek:literal, $count:expr;)*) => {
+        $(
+            #[test]
+            #[ignore = "requires a Vulkan Video device"]
+            fn $test() -> Result<(), Box<dyn std::error::Error>> {
+                check_reset(
+                    $codec,
+                    include_bytes!($prime),
+                    include_bytes!($seek),
+                    $count,
+                )
+            }
+        )*
+    };
+}
+
+reset_tests! {
+    reset_h264_bframes: Codec::H264, "data/bframes.264", "data/bframes.264", None;
+    reset_h265_closedgop: Codec::H265, "data/closedgop.265", "data/closedgop.265", None;
+    reset_h265_cra: Codec::H265, "data/opengop.265", "data/cra_start.265", Some(6);
+    reset_h265_main10: Codec::H265, "data/main10.265", "data/main10.265", None;
+    reset_av1_altref: Codec::AV1, "data/av1/aom_altref.obu", "data/av1/aom_altref.obu", None;
+}
+
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn reset_h264_drops_reorder_and_keeps_parameter_sets() -> Result<(), Box<dyn std::error::Error>> {
+    use pixelforge::decoder::DecodeStatus::*;
+
+    common::init_logging();
+    let units = h264_access_units(include_bytes!("data/bframes.264"));
+    // Skip SPS, PPS and SEI to feed just the IDR slice after the first decode.
+    let key = units[0]
+        .windows(4)
+        .position(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5)
+        .map(|i| &units[0][i..])
+        .expect("first access unit has an IDR slice");
+    for force_copy in [false, true] {
+        let mut builder = VideoContextBuilder::new()
+            .app_name("pixelforge-decode-reset")
+            .require_decode(Codec::H264)
+            .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok());
+        if force_copy {
+            builder = builder.without_unified_image_layouts();
+        }
+        let context = builder.build()?;
+        let mut decoder = Decoder::new(context, DecodeConfig::new(Codec::H264))?;
+        decoder.reset()?;
+        assert_eq!(decoder.decode(units[0], 0)?, Decoded);
+        decoder.reset()?;
+        assert!(matches!(decoder.try_next_frame()?, FramePoll::Pending));
+        assert_eq!(decoder.decode(units[1], 0)?, NeedsKeyframe);
+
+        // The fixture holds two frames for reordering. Vary the number of
+        // decodes before each reset, without waiting for the last submission.
+        let mut copied_images = std::collections::HashSet::new();
+        for seek in 1..=300u64 {
+            let following = seek as usize % 8;
+            assert_eq!(decoder.decode(key, seek)?, Decoded);
+            for unit in &units[1..=following] {
+                assert_eq!(decoder.decode(unit, seek)?, Decoded);
+            }
+            decoder.reset()?;
+            let mut sent = 0;
+            while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+                assert_eq!(frame.pts(), seek);
+                assert_eq!(frame.generation(), 1);
+                if force_copy {
+                    copied_images.insert(frame.image());
+                }
+                sent += 1;
+            }
+            assert_eq!(sent, (1 + following).saturating_sub(2), "seek {seek}");
+        }
+        // Eight pictures is the most any iteration can put in the pool.
+        assert!(copied_images.len() <= 8, "copy pool grew across resets");
+    }
+    Ok(())
+}

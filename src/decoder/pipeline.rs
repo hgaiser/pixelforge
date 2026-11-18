@@ -201,6 +201,15 @@ impl DecodePipeline {
         self.slot_sync.wait_all_free();
     }
 
+    /// Wait for submitted work and for the completion thread to send its frames.
+    pub(crate) fn drain_submitted(&mut self) {
+        // An error can leave a submission in the current slot before hand-off.
+        if self.last_fence.is_some() {
+            self.end_picture(Vec::new());
+        }
+        self.wait_all_free();
+    }
+
     /// Ensure the current slot's staging buffer holds at least `size` bytes.
     ///
     /// Growing destroys the old buffer, so the slot must already be free (the

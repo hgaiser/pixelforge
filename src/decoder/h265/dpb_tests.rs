@@ -663,3 +663,43 @@ fn rejects_bad_input() {
             .is_err()
     );
 }
+
+#[test]
+fn reset_restores_cra_start_state_and_keeps_pins() {
+    let sps = sps(1);
+    let pins = Arc::new(SlotPins::default());
+    let mut dpb = DecodeDpb::new(6, pins.clone());
+    let (_, slot) = decode(&mut dpb, nal(NalType::IdrNLp, 0), &idr(), &sps);
+    pins.pin(slot);
+    for lsb in [6, 12, 2] {
+        decode(
+            &mut dpb,
+            nal(NalType::TrailR, 0),
+            &slice(lsb, &[(-6, true)], &[]),
+            &sps,
+        );
+    }
+    assert_eq!(dpb.prev_tid0_poc, 18);
+
+    dpb.reset();
+    assert!(dpb.references().is_empty());
+    assert_eq!(dpb.prev_tid0_poc, 0);
+    assert_eq!(
+        skip_reason(&mut dpb, nal(NalType::TrailR, 0), &slice(4, &[], &[]), &sps),
+        SkipReason::AwaitingIrap
+    );
+
+    let (cra, new_slot) = decode(
+        &mut dpb,
+        nal(NalType::Cra, 0),
+        &slice(4, &[(-2, false)], &[]),
+        &sps,
+    );
+    assert_ne!(new_slot, slot);
+    assert!(cra.is_keyframe && cra.no_rasl_output_flag);
+    assert_eq!(cra.poc, 4);
+    assert_eq!(
+        skip_reason(&mut dpb, nal(NalType::RaslR, 0), &slice(3, &[], &[]), &sps),
+        SkipReason::RaslWithoutReferences
+    );
+}

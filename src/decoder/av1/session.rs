@@ -224,6 +224,15 @@ impl Av1Decoder {
                     });
                 }
                 Some(Av1Event::Frame(frame)) => {
+                    // An intra-only picture can parse without references,
+                    // but only a key frame can start decoding.
+                    if self.common.session.as_ref().is_none_or(|s| s.needs_reset)
+                        && frame.header.frame_type != FrameType::Key
+                    {
+                        self.parser.discard_frame();
+                        missing.get_or_insert_with(|| "no key frame decoded yet".to_string());
+                        continue;
+                    }
                     // The frame shown by the previous one has already been
                     // handed over; close off its pipeline slot first.
                     if let Decoded::Shown(_) = outcome {
@@ -457,6 +466,12 @@ impl CodecDecoder for Av1Decoder {
 
     fn common_mut(&mut self) -> &mut DecoderCommon {
         &mut self.common
+    }
+
+    fn reset(&mut self) {
+        self.parser.reset();
+        self.grain_applied.fill(false);
+        self.shown_since_key = 0;
     }
 
     fn complete_prefix(buffer: &[u8]) -> usize {
