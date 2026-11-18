@@ -72,6 +72,9 @@ pub(crate) struct EncoderCommon {
     pub input_frame_num: u64,
     /// Monotonic encode-order counter (decode order / DTS; `0` => first frame).
     pub encode_frame_num: u64,
+    /// Set when an invalidation left a reference to predict from: the next
+    /// frame shown is the recovery frame, see [`crate::EncodedPacket::is_recovery_frame`].
+    pub recovery_pending: bool,
 
     pub dpb_images: Vec<vk::Image>,
     pub dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -935,6 +938,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
             self.common.pipeline.submit_synthetic(EncodedPacket {
                 data: hidden.show_packet,
                 frame_type: hidden.frame_type,
+                is_recovery_frame: false,
                 pts: hidden.display_order,
                 dts: hidden.display_order as i64,
                 stats: EncodedPacketStats {
@@ -960,8 +964,14 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.begin_encode(frame, delivery);
 
         let setup = self.codec.begin_picture(&mut self.common, plan)?;
+        // The first frame shown after an invalidation that kept a reference. An
+        // IDR requested in between recovers by itself and isn't marked.
+        let is_recovery_frame = !plan.hidden
+            && std::mem::take(&mut self.common.recovery_pending)
+            && plan.frame_type() != FrameType::Idr;
         self.common.set_pending_metadata(SlotPacketMetadata {
             frame_type: plan.frame_type(),
+            is_recovery_frame,
             pts: plan.display_order,
             // With hidden frames the packets are in display order.
             dts: if C::HIDDEN_FRAMES {
@@ -1017,18 +1027,21 @@ impl<C: VideoCodec> CodecEncoder<C> {
     ///
     /// For the IDR, the oldest frame that waits for its group is encoded as
     /// one at once, so no frame is encoded from the lost references.
-    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) -> bool {
         if self
             .codec
             .invalidate_references(&mut self.common, first_lost_display_order)
         {
-            return;
+            self.common.recovery_pending = true;
+            return true;
         }
+        self.common.recovery_pending = false;
         let ready = self.common.gop.restart();
         if let Err(e) = self.encode_ready(ready) {
             // Its future resolves with the error, and the next frame is an IDR.
             tracing::warn!("Encoding the IDR after lost references failed: {e}");
         }
+        false
     }
 
     /// Rebuild session parameters with a new stream colour; the next frame is
@@ -1382,7 +1395,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     }
     let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
-        .min(req.max_frame_references);
+        .min(req.max_frame_references)
+        .min(
+            config
+                .active_reference_frames
+                .map_or(usize::MAX, |n| n as usize),
+        );
     // `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` predicts from fewer references than
     // the device allows, to reproduce a device with tighter limits.
     if let Some(cap) = std::env::var("PIXELFORGE_MAX_ACTIVE_REFERENCES")
@@ -1509,6 +1527,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         gop,
         input_frame_num: 0,
         encode_frame_num: 0,
+        recovery_pending: false,
         dpb_images,
         dpb_image_memories,
         dpb_image_views,

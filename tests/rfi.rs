@@ -81,13 +81,19 @@ fn rfi() -> Result<(), Box<dyn std::error::Error>> {
             BFrameSupport::Flat => Some(BFrameReferences::Flat),
             BFrameSupport::Pyramid => Some(BFrameReferences::Pyramid),
         };
-        let runs = std::iter::once(None).chain(b_frames.map(Some));
-        for references in runs {
-            let name = match references {
-                None => format!("{codec:?}"),
-                Some(references) => format!("{codec:?} B-frames {references:?}"),
+        // Without B-frames, also run predicting from one reference (as a streaming
+        // host may, to save encode time) and check that the rest of the window
+        // still recovers.
+        let runs = [(None, None), (None, Some(1))]
+            .into_iter()
+            .chain(b_frames.map(|references| (Some(references), None)));
+        for (references, active) in runs {
+            let name = match (references, active) {
+                (None, None) => format!("{codec:?}"),
+                (None, Some(active)) => format!("{codec:?} predicting from {active}"),
+                (Some(references), _) => format!("{codec:?} B-frames {references:?}"),
             };
-            if let Err(e) = run_codec(&context, &dir, codec, references, &input_path) {
+            if let Err(e) = run_codec(&context, &dir, codec, references, active, &input_path) {
                 println!("{name}: FAIL: {e}");
                 failures.push(format!("{name}: {e}"));
             }
@@ -105,10 +111,15 @@ fn run_codec(
     dir: &std::path::Path,
     codec: Codec,
     b_frames: Option<BFrameReferences>,
+    active_references: Option<u32>,
     input_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ext = if codec == Codec::AV1 { "obu" } else { "bin" };
-    let suffix = if b_frames.is_some() { "_b" } else { "" };
+    let suffix = match (b_frames, active_references) {
+        (Some(_), _) => "_b".to_string(),
+        (None, Some(active)) => format!("_active{active}"),
+        (None, None) => String::new(),
+    };
     let output_filename = dir
         .join(format!("output_rfi_{codec:?}{suffix}.{ext}"))
         .to_string_lossy()
@@ -132,6 +143,10 @@ fn run_codec(
         Some(references) => config.with_b_frames(3).with_b_frame_references(references),
         None => config,
     };
+    let config = match active_references {
+        Some(active) => config.with_active_reference_frames(active),
+        None => config,
+    };
     // At most `b_frames` frames wait for their group, so with more futures
     // pending than that the oldest is ready (this also checks that claim).
     let held = config.b_frames.max(2) as usize;
@@ -147,6 +162,7 @@ fn run_codec(
     let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
     let mut recovery_is_key: Option<bool> = None;
     let mut later_key_frames = 0;
+    let mut recovery_frames = Vec::new();
 
     let mut drain_one = |pending: &mut VecDeque<pixelforge::EncodeFuture>,
                          output_file: &mut File,
@@ -158,6 +174,9 @@ fn run_codec(
         }
         if packet.pts > 0 && packet.is_key_frame() {
             later_key_frames += 1;
+        }
+        if packet.is_recovery_frame {
+            recovery_frames.push(packet.pts);
         }
         output_file.write_all(&packet.data)?;
         Ok(())
@@ -174,7 +193,9 @@ fn run_codec(
         // just before encoding frame `INVALIDATE_AT`.
         if i == INVALIDATE_AT {
             let first_lost = INVALIDATE_AT - INVALIDATE_COUNT;
-            encoder.invalidate_reference_frames(first_lost);
+            if !encoder.invalidate_reference_frames(first_lost) {
+                return Err("invalidation left no reference to recover from".into());
+            }
         }
 
         let slot = encoder.input_slot()?;
@@ -191,6 +212,15 @@ fn run_codec(
     }
     drop(output_file);
     drop(drain_one);
+
+    // One packet is marked as the recovery frame; without B-frames, the
+    // frame submitted right after the invalidation.
+    match (recovery_frames.as_slice(), b_frames) {
+        ([_], Some(_)) | ([INVALIDATE_AT], None) => {}
+        (frames, _) => {
+            return Err(format!("frames {frames:?} were marked as the recovery frame").into());
+        }
+    }
 
     if later_key_frames > 0 {
         return Err(
@@ -235,7 +265,7 @@ fn run_codec(
     }
 
     println!(
-        "{codec:?} {b_frames:?}: PASS — recovered with a P-frame, full-stream PSNR {psnr:.2} dB"
+        "{codec:?} {b_frames:?} {active_references:?}: PASS — recovered with a P-frame, full-stream PSNR {psnr:.2} dB"
     );
     Ok(())
 }

@@ -27,7 +27,7 @@ pub(crate) trait EncoderApi: Send {
     fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn request_idr(&mut self);
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) -> bool;
     fn set_color(&mut self, color: StreamColor) -> Result<()>;
     fn set_rate_control(&mut self, rate_control: RateControl);
 }
@@ -51,7 +51,7 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
     fn request_idr(&mut self) {
         CodecEncoder::request_idr(self)
     }
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) -> bool {
         CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
     }
     fn set_color(&mut self, color: StreamColor) -> Result<()> {
@@ -497,7 +497,12 @@ impl Encoder {
     /// their group are encoded later from the references that survive. If
     /// none survives, the oldest frame that waits is encoded at once as the
     /// IDR.
-    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+    ///
+    /// Returns `true` when a reference survives: the next frame shown
+    /// recovers from it and its packet has
+    /// [`EncodedPacket::is_recovery_frame`](super::EncodedPacket::is_recovery_frame)
+    /// set. `false` means the next frame is an IDR.
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) -> bool {
         let local = first_lost_display_order.saturating_sub(self.pts_offset);
         self.inner.invalidate_reference_frames(local)
     }
