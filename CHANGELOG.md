@@ -5,16 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] - 18-11-2026
 
 ### Added
 
-- Add `EncodeConfig::with_active_reference_frames`, to predict from fewer references than the device allows while keeping the whole window for invalidation. On RADV, H.264 takes about 75% longer to encode a frame with two references than with one.
-- Add `EncodedPacket::is_recovery_frame`, set on the first frame shown after an invalidation that recovers without a keyframe, so a streaming host can tell the client where to start decoding again.
+- Add `EncodeConfig::with_active_reference_frames`, to predict from fewer references than the device allows while keeping the whole window for invalidation. On RADV, H.264 takes about 75% longer to encode a frame with two references than with one, @porkloin (#62)
+- Add `EncodedPacket::is_recovery_frame`, set on the first frame shown after an invalidation that recovers without a keyframe, so a streaming host can tell the client where to start decoding again, @porkloin (#62)
+- Add `Encoder::set_rate_control`, to change the bitrate of a running encoder without an IDR.
+- Add `Decoder::reset` and `DecodeSink::reset`, to seek without rebuilding the decoder. It keeps the session and the parameter sets, and feeding goes on at a keyframe, @trmosala (#61)
+- Add `Decoder::flush` and `DecodeSink::flush`, to deliver the frames held for reordering and keep the source open, @trmosala (#61)
+- Add `VideoContext::submit`, `submit2` and `wait_queue_idle`, to use a queue of the context under its lock.
 
 ### Changed
 
-- **Breaking:** `Encoder::invalidate_reference_frames` returns whether a reference survived (`false`: the next frame is an IDR).
+- **Breaking:** `Encoder::invalidate_reference_frames` returns whether a reference survived (`false`: the next frame is an IDR), @porkloin (#62)
+- **Breaking:** The fields of `DecodedFrame` are private. Read them with accessors, for example `frame.image()`.
+- **Breaking:** Every submission takes a lock for its queue, as a queue is externally synchronized. An application that shares a queue with a context submits through `VideoContext::submit` or `submit2`.
+- Download decoded frames through cached host memory, which is faster for `YuvDownloader`.
+
+### Fixed
+
+- Fix the first picture of a byte-stream `decode` call getting the `pts` of the previous call, or 0 on a new decoder, @trmosala (#61)
+- Wait on the pipeline fences, not on the whole device, when a decoder or a download waits.
+- Fix an adopted device's queues: fetch them with `vkGetDeviceQueue2` and their flags.
 
 ## [0.12.1] - 15-11-2026
 
