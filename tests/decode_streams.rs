@@ -413,3 +413,46 @@ fn flush_delivers_tail_and_allows_reuse() -> Result<(), Box<dyn std::error::Erro
     assert!(pollster::block_on(decoder.next_frame())?.is_none());
     Ok(())
 }
+
+/// Each copying picture uses two queues. Reuse the slots enough times for
+/// validation to catch a reset racing the decode queue's fence signal when
+/// PIXELFORGE_VALIDATION is enabled.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn copied_pictures_wait_for_decode_fences() -> Result<(), Box<dyn std::error::Error>> {
+    use tracing_subscriber::fmt::writer::{MakeWriterExt, TestWriter};
+
+    common::init_logging();
+    let log = common::scratch_dir("copied_picture_fences").join("validation.log");
+    let output = File::create(&log)?.and(TestWriter::new());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(output)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let context = VideoContextBuilder::new()
+        .require_decode(Codec::H264)
+        .without_unified_image_layouts()
+        .enable_validation(std::env::var_os("PIXELFORGE_VALIDATION").is_some())
+        .build()?;
+    let mut decoder = Decoder::new(context, DecodeConfig::new(Codec::H264))?;
+    let stream = include_bytes!("data/bframes.264");
+    for i in 0..64 {
+        decoder.decode(stream, i)?;
+        decoder.flush()?;
+        let mut frames = 0;
+        while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
+            assert_eq!(frame.pts(), i);
+            frames += 1;
+        }
+        assert_eq!(frames, 30);
+    }
+    let messages = std::fs::read_to_string(log)?;
+    assert!(!messages.contains("Validation layer requested but not available"));
+    assert!(!messages.contains("VK_EXT_debug_utils not available"));
+    assert!(
+        !messages.contains("vkResetFences()"),
+        "reset a pending fence"
+    );
+    Ok(())
+}
