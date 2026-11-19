@@ -347,14 +347,20 @@ pub(crate) fn create_bitstream_buffer(
 
     let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
 
-    let memory_type_index = find_memory_type(
-        context.memory_properties(),
-        mem_requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or_else(|| {
-        PixelForgeError::NoSuitableDevice("No suitable memory type for buffer".to_string())
-    })?;
+    // The CPU reads an encoder's output back every frame, which is slow from
+    // uncached (write-combined) memory, so prefer a cached type for it.
+    let props = context.memory_properties();
+    let types = mem_requirements.memory_type_bits;
+    let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let cached = coherent | vk::MemoryPropertyFlags::HOST_CACHED;
+    let read_back = usage.contains(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR);
+    let memory_type_index = read_back
+        .then(|| find_memory_type(props, types, cached))
+        .flatten()
+        .or_else(|| find_memory_type(props, types, coherent))
+        .ok_or_else(|| {
+            PixelForgeError::NoSuitableDevice("No suitable memory type for buffer".to_string())
+        })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_requirements.size)
