@@ -74,6 +74,7 @@ pub(crate) enum Decoded {
 
 /// Drives a [`CodecDecoder`].
 pub(crate) struct StreamDecoder<C: CodecDecoder> {
+    // Dropped first to drain in-flight copies before the reorder pool releases its images.
     codec: C,
 
     /// Display-order reordering, which holds pictures by pinning their DPB
@@ -286,14 +287,5 @@ impl<C: CodecDecoder> DecoderApi for StreamDecoder<C> {
             .session
             .as_ref()
             .map(|s| s.picture_format)
-    }
-}
-
-impl<C: CodecDecoder> Drop for StreamDecoder<C> {
-    fn drop(&mut self) {
-        // The reorder pool's images must be freed while the codec's
-        // `DecoderCommon` (and its device) is still alive. Fields drop after
-        // this, so the codec goes afterwards.
-        self.reorder.destroy(self.codec.common());
     }
 }
