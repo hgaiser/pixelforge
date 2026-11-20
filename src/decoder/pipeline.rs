@@ -21,13 +21,12 @@
 //! decode queue need not support transfer operations (it does not on RADV), so
 //! it cannot be recorded into the decode command buffer. It gets a timeline of
 //! its own and waits on two things: the decode that produced the picture, and
-//! the previous copy. Chaining copies to each other is what makes "the last
-//! submission finished" imply "every earlier one finished", which is the whole
-//! basis for one fence covering a batch of frames.
+//! the previous copy. These timelines order the GPU work, but a semaphore
+//! signal can precede its submission's fence signal.
 //!
 //! # Completion
 //!
-//! A single background *completion thread* waits on each picture's fence and
+//! A single background *completion thread* waits on each picture's submitted fences and
 //! then sends its frames onward, so they reach the consumer in decode order
 //! with the GPU work behind them already finished. Only the calling thread ever
 //! touches a queue or a timeline; the completion thread only waits on fences
@@ -43,7 +42,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use ash::vk::{self, Handle};
+use ash::vk;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 use crate::decoder::DecodedFrame;
@@ -90,8 +89,8 @@ struct WorkItem {
     /// Slot to release once this item's work is finished. `None` for an item
     /// that submitted nothing.
     slot_index: Option<usize>,
-    /// Fence signalling this item's GPU work, if it submitted any.
-    fence: Option<vk::Fence>,
+    /// Fences for this picture's decode and copy, when submitted.
+    fences: [Option<vk::Fence>; 2],
     /// Frames this item hands to the consumer.
     frames: Vec<DecodedFrame>,
     /// End of stream: after this item's frames, the consumer sees `None`.
@@ -111,8 +110,8 @@ pub(crate) struct DecodePipeline {
     /// Orders reorder copies against each other.
     copies: TimelineChain,
 
-    /// The fence of the most recent submission, whichever queue it went to.
-    last_fence: Option<vk::Fence>,
+    /// Decode and copy fences recorded after successful queue submissions.
+    submitted_fences: [Option<vk::Fence>; 2],
 
     slot_sync: Arc<SlotSync>,
     /// Sends submitted work to the completion thread. Dropped on shutdown.
@@ -173,7 +172,7 @@ impl DecodePipeline {
                 current_slot: 0,
                 decodes: TimelineChain::new(context)?,
                 copies: TimelineChain::new(context)?,
-                last_fence: None,
+                submitted_fences: [None; 2],
                 slot_sync,
                 work_tx: Some(work_tx),
                 completion_thread: Some(completion_thread),
@@ -206,7 +205,7 @@ impl DecodePipeline {
     /// Wait for submitted work and for the completion thread to send its frames.
     pub(crate) fn drain_submitted(&mut self) {
         // An error can leave a submission in the current slot before hand-off.
-        if self.last_fence.is_some() {
+        if self.submitted_fences != [None; 2] {
             self.end_picture(Vec::new());
         }
         self.wait_all_free();
@@ -306,7 +305,7 @@ impl DecodePipeline {
         }
 
         self.decodes.commit();
-        self.last_fence = Some(self.slots[self.current_slot].decode_fence);
+        self.submitted_fences[0] = Some(slot.decode_fence);
         Ok(())
     }
 
@@ -362,25 +361,21 @@ impl DecodePipeline {
         }
 
         self.copies.commit();
-        self.last_fence = Some(self.slots[self.current_slot].transfer_fence);
+        self.submitted_fences[1] = Some(slot.transfer_fence);
         Ok(())
     }
 
     /// Close off the current picture: hand its slot and frames to the
     /// completion thread and move to the next slot.
-    ///
-    /// The picture's work is tied to its most recent submission's fence. Both
-    /// timelines order the copy after its own decode, so waiting on the later
-    /// fence covers the earlier submission too.
     pub(crate) fn end_picture(&mut self, frames: Vec<DecodedFrame>) {
         let slot_index = self.current_slot;
-        let fence = self.last_fence.take();
+        let fences = std::mem::take(&mut self.submitted_fences);
         // Busy before the hand-off, so the completion thread cannot clear the
         // flag before it is set.
         self.slot_sync.set_busy(slot_index);
         self.send(WorkItem {
             slot_index: Some(slot_index),
-            fence,
+            fences,
             frames,
             end_of_stream: false,
             delivered: None,
@@ -394,7 +389,7 @@ impl DecodePipeline {
         let (delivered, completion) = mpsc::channel();
         self.send(WorkItem {
             slot_index: None,
-            fence: None,
+            fences: [None; 2],
             frames,
             end_of_stream: false,
             delivered: Some(delivered),
@@ -409,7 +404,7 @@ impl DecodePipeline {
     pub(crate) fn finish_stream(&mut self, frames: Vec<DecodedFrame>) {
         self.send(WorkItem {
             slot_index: None,
-            fence: None,
+            fences: [None; 2],
             frames,
             end_of_stream: true,
             delivered: None,
@@ -462,7 +457,7 @@ impl DecodePipeline {
     }
 }
 
-/// Completion-thread body: wait for each item's fence, then send its frames on.
+/// Completion-thread body: wait for each item's fences, then send its frames on.
 ///
 /// Sending happens *before* the slot is freed, so once every slot is free every
 /// frame has already been handed over. A dropped receiver makes the send a
@@ -476,10 +471,13 @@ fn run_completion_thread(
     let mut frames_tx = Some(frames_tx);
 
     for work in work_rx {
-        if let Some(fence) = work.fence
-            && !fence.is_null()
-        {
-            let wait = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        let fences: &[_] = match work.fences {
+            [Some(decode), Some(copy)] => &[decode, copy],
+            [Some(fence), None] | [None, Some(fence)] => &[fence],
+            [None, None] => &[],
+        };
+        if !fences.is_empty() {
+            let wait = unsafe { device.wait_for_fences(fences, true, u64::MAX) };
             if let Err(e) = wait
                 && let Some(tx) = &frames_tx
             {
