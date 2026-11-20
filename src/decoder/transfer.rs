@@ -72,7 +72,7 @@ impl DecoderCommon {
 
         let to_transfer = [
             vk::ImageMemoryBarrier2 {
-                src_stage_mask: vk::PipelineStageFlags2::NONE,
+                src_stage_mask: vk::PipelineStageFlags2::COPY,
                 src_access_mask: vk::AccessFlags2::NONE,
                 dst_stage_mask: vk::PipelineStageFlags2::COPY,
                 dst_access_mask: vk::AccessFlags2::TRANSFER_READ,
@@ -81,7 +81,7 @@ impl DecoderCommon {
                 ..range(frame.image, base_layer)
             },
             vk::ImageMemoryBarrier2 {
-                src_stage_mask: vk::PipelineStageFlags2::NONE,
+                src_stage_mask: vk::PipelineStageFlags2::COPY,
                 src_access_mask: vk::AccessFlags2::NONE,
                 dst_stage_mask: vk::PipelineStageFlags2::COPY,
                 dst_access_mask: vk::AccessFlags2::TRANSFER_WRITE,
@@ -142,7 +142,7 @@ impl DecoderCommon {
         let restore = [vk::ImageMemoryBarrier2 {
             src_stage_mask: vk::PipelineStageFlags2::COPY,
             src_access_mask: vk::AccessFlags2::TRANSFER_READ,
-            dst_stage_mask: vk::PipelineStageFlags2::NONE,
+            dst_stage_mask: vk::PipelineStageFlags2::COPY,
             dst_access_mask: vk::AccessFlags2::NONE,
             old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             new_layout: frame.layout,
