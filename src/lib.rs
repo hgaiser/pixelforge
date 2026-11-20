@@ -479,7 +479,7 @@ pub use encoder::{
 pub use error::PixelForgeError;
 pub use image::{DownloadedFrame, YuvDownloader, YuvLayout, YuvUploader};
 pub use sync::TimelinePoint;
-pub use vulkan::VideoContextBuilder;
+pub use vulkan::{VideoContextBuilder, VideoInstance};
 
 /// Re-export VideoContext for convenience.
 pub use vulkan::VideoContext;

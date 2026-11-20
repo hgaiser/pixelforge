@@ -472,7 +472,7 @@ impl VideoContextBuilder {
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
-                debug_messenger: None,
+                _instance: None,
             }),
         })
     }
