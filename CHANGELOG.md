@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 20-11-2026
+
+### Added
+
+- Add `VideoInstance`, `VideoContextBuilder::build_instance` and `VideoContextBuilder::build_on`, to build contexts one after another on one shared Vulkan instance. Each context still gets a device of its own, and dropping it destroys the device with everything it still holds. An application that builds a context per stream should share an instance: when the last instance of a process is destroyed, the Vulkan loader unloads the driver, and NVIDIA's driver fails `vkCreateInstance` after about 26 reloads (`libnvidia-tls.so` uses static TLS, which glibc does not give back).
+
+### Changed
+
+- `VideoContextBuilder::build` creates its instance through `build_instance` and its context through `build_on`. Its behaviour is the same.
+
 ## [0.13.0] - 18-11-2026
 
 ### Added
