@@ -1170,6 +1170,9 @@ pub(crate) struct DeviceVideoCaps {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_reference_pictures: u32,
+    /// `minBitstreamBufferSizeAlignment`: the encode's destination range is a
+    /// multiple of it.
+    pub min_bitstream_buffer_size_alignment: vk::DeviceSize,
     pub flags: vk::VideoCapabilityFlagsKHR,
     pub std_header_version: vk::ExtensionProperties,
 }
@@ -1234,6 +1237,7 @@ pub(crate) fn query_video_caps(
         max_coded_extent: capabilities.max_coded_extent,
         max_dpb_slots: capabilities.max_dpb_slots,
         max_active_reference_pictures: capabilities.max_active_reference_pictures,
+        min_bitstream_buffer_size_alignment: capabilities.min_bitstream_buffer_size_alignment,
         flags: capabilities.flags,
         std_header_version: capabilities.std_header_version,
     })
@@ -1491,6 +1495,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     let upload_queue_family = context.transfer_queue_family();
     let cmd = create_command_resources(context, encode_queue_family, upload_queue_family)?;
 
+    // Each encode writes the whole buffer as its destination range, which has
+    // to be a multiple of the device's alignment. A size from the frame's
+    // pixel count often is not (2736x1260).
+    let size_alignment = (capabilities.min_bitstream_buffer_size_alignment as usize).max(1);
+    let bitstream_buffer_size = req.bitstream_buffer_size.next_multiple_of(size_alignment);
+
     let pipeline = EncodePipeline::new(&PipelineConfig {
         context,
         aligned_width,
@@ -1499,7 +1509,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         rgb_input: req.rgb_input.is_some(),
         chroma_format: config.chroma_format,
         bit_depth: config.bit_depth,
-        bitstream_buffer_size: req.bitstream_buffer_size,
+        bitstream_buffer_size,
         profile_info,
         command_pool: cmd.command_pool,
         held_frames: config.b_frames as usize,
