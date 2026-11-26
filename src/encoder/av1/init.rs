@@ -60,6 +60,7 @@ impl Av1 {
             // DPB slot index in 0..=7 (the range the [u8; 8] order-hint array
             // and `1 << slot` refresh mask can represent).
             max_reference_window: 7,
+            max_dpb_pictures: None,
             // Inter frames use single-reference prediction, so each may name
             // at most this many references, and only names in the mask.
             max_frame_references: (av1_caps.max_single_reference_count as usize)

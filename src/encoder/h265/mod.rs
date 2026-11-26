@@ -5,6 +5,7 @@
 //! (`record`), and its VPS/SPS/PPS generation (`session_params`).
 
 mod init;
+mod level;
 mod record;
 mod session_params;
 
@@ -40,6 +41,9 @@ pub(crate) struct H265 {
     /// predicts from one shown after it.
     b_l0_reference_count: u32,
     profile_idc: u32,
+    /// The level the parameter sets give, from the stream's size and frame
+    /// rate. The DPB was sized to fit it.
+    level_idc: ash::vk::native::StdVideoH265LevelIdc,
 }
 
 /// The picture type of the frame `plan`.

@@ -1,4 +1,4 @@
-use super::{H264, MB_SIZE, ReferenceInfo};
+use super::{H264, MB_SIZE, ReferenceInfo, level};
 
 use crate::converter::RgbFormat;
 use crate::encoder::EncodeConfig;
@@ -60,6 +60,18 @@ impl H264 {
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
             .max(config.dimensions.width as usize * config.dimensions.height as usize);
 
+        // A larger DPB raises the level (see `level_idc`), up to
+        // `dpb_level_cap`. The DPB holds what that level allows, so a window
+        // of references cannot make the stream break its level, or raise it
+        // to a level that decoders do not take.
+        let max_level_idc = h264_caps.max_level_idc;
+        let max_dpb_pictures = |width: u32, height: u32| {
+            let cap = level::dpb_level_cap(&config, profile_idc, width, height, max_level_idc);
+            // `max_dec_frame_buffering` leaves out the frame being decoded,
+            // which takes a DPB slot of its own here.
+            level::max_dpb_frames(width / MB_SIZE, height / MB_SIZE, cap) as usize + 1
+        };
+
         let init = build_encoder_common(CommonInitRequest {
             context: &context,
             config: &config,
@@ -68,6 +80,7 @@ impl H264 {
             caps: &caps,
             align_unit: MB_SIZE,
             max_reference_window: 32,
+            max_dpb_pictures: Some(&max_dpb_pictures),
             max_frame_references: h264_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
             allow_layered_dpb: true,
@@ -94,7 +107,7 @@ impl H264 {
             pending_unmark_frame_nums: Vec::new(),
             profile_idc,
             preferred_entropy_cabac,
-            max_level_idc: h264_caps.max_level_idc,
+            max_level_idc,
         };
 
         let mut encoder = CodecEncoder { common, codec };

@@ -4,7 +4,7 @@ use super::{H264, level};
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ChromaFormat, ColorDescription, RateControl};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -226,23 +226,13 @@ impl H264 {
     /// size, frame rate, DPB of `dpb_frames` and peak bitrate, and at most
     /// the highest level the device has.
     fn level_idc(&self, common: &EncoderCommon, dpb_frames: u8) -> StdVideoH264LevelIdc {
-        let config = &common.config;
-        let rate = config.frame_rate;
-        let max_bitrate = match config.rate_control {
-            RateControl::Cqp { .. } => 0,
-            RateControl::Cbr { bitrate } => u64::from(bitrate),
-            RateControl::Vbr { max, .. } => u64::from(max),
-        };
-        let high_444 = self.profile_idc()
-            == ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE;
-        let needed = level::level_for(&level::Needs {
-            width_in_mbs: common.aligned_width / 16,
-            height_in_mbs: common.aligned_height / 16,
-            frame_rate: rate.numerator.div_ceil(rate.denominator.max(1)),
-            dpb_frames: u32::from(dpb_frames),
-            max_bitrate,
-            bitrate_factor: if high_444 { 4000 } else { 1250 },
-        });
+        let needed = level::level_for(&level::Needs::of_stream(
+            &common.config,
+            self.profile_idc(),
+            common.aligned_width,
+            common.aligned_height,
+            u32::from(dpb_frames),
+        ));
         if needed > self.max_level_idc {
             tracing::warn!(
                 "H.264: the stream needs level {needed} (as StdVideoH264LevelIdc), and the \

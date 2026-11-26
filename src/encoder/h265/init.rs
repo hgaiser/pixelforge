@@ -1,4 +1,4 @@
-use super::{CTB_SIZE, H265};
+use super::{CTB_SIZE, H265, level};
 use crate::encoder::references::ReferenceSet;
 
 use crate::converter::RgbFormat;
@@ -58,6 +58,23 @@ impl H265 {
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
             .max(config.dimensions.width as usize * config.dimensions.height as usize);
 
+        // The DPB holds what the level allows at the stream's size, so a
+        // window of references cannot make the stream break its level.
+        let rate = config.frame_rate;
+        let frame_rate = rate.numerator.div_ceil(rate.denominator.max(1));
+        let max_level_idc = h265_caps.max_level_idc;
+        let max_dpb_pictures = |width: u32, height: u32| {
+            let level = level::level_for(
+                &level::Needs {
+                    width,
+                    height,
+                    frame_rate,
+                },
+                max_level_idc,
+            );
+            level::max_dpb_size(width, height, level) as usize
+        };
+
         let init = build_encoder_common(CommonInitRequest {
             context: &context,
             config: &config,
@@ -66,6 +83,7 @@ impl H265 {
             caps: &caps,
             align_unit: CTB_SIZE,
             max_reference_window: 15,
+            max_dpb_pictures: Some(&max_dpb_pictures),
             max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
             allow_layered_dpb: true,
@@ -81,6 +99,18 @@ impl H265 {
         let b_l0_reference_count = (init.session_active_references.saturating_sub(1))
             .min(h265_caps.max_b_picture_l0_reference_count);
         let common = init.common;
+        let level_idc = level::level_for(
+            &level::Needs {
+                width: common.aligned_width,
+                height: common.aligned_height,
+                frame_rate,
+            },
+            max_level_idc,
+        );
+        info!(
+            "H.265 level {level_idc} (as StdVideoH265LevelIdc), DPB of {} pictures",
+            common.dpb_slot_count
+        );
 
         let codec = H265 {
             header_data: None,
@@ -88,6 +118,7 @@ impl H265 {
             active_reference_count,
             b_l0_reference_count,
             profile_idc,
+            level_idc,
         };
 
         let mut encoder = CodecEncoder { common, codec };

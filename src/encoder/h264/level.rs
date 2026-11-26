@@ -1,5 +1,6 @@
 //! The H.264 level a stream needs (Annex A, Table A-1).
 
+use crate::encoder::{EncodeConfig, RateControl};
 use ash::vk::native::StdVideoH264LevelIdc;
 
 /// What a level allows, from Table A-1.
@@ -74,6 +75,54 @@ pub(super) struct Needs {
     pub bitrate_factor: u64,
 }
 
+impl Needs {
+    /// What a stream of `config` with a coded extent of `width` x `height`
+    /// and a DPB of `dpb_frames` needs.
+    pub fn of_stream(
+        config: &EncodeConfig,
+        profile_idc: u32,
+        width: u32,
+        height: u32,
+        dpb_frames: u32,
+    ) -> Self {
+        let rate = config.frame_rate;
+        let max_bitrate = match config.rate_control {
+            RateControl::Cqp { .. } => 0,
+            RateControl::Cbr { bitrate } => u64::from(bitrate),
+            RateControl::Vbr { max, .. } => u64::from(max),
+        };
+        let high_444 = profile_idc
+            == ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE;
+        Self {
+            width_in_mbs: width / 16,
+            height_in_mbs: height / 16,
+            frame_rate: rate.numerator.div_ceil(rate.denominator.max(1)),
+            dpb_frames,
+            max_bitrate,
+            bitrate_factor: if high_444 { 4000 } else { 1250 },
+        }
+    }
+}
+
+/// Level 5.2, the highest level that a larger DPB raises the stream to.
+/// Decoders often stop at level 5.2, and a stream needs level 6 for its size
+/// or frame rate only.
+pub(super) const HIGHEST_FOR_DPB: StdVideoH264LevelIdc = 15;
+
+/// The highest level the DPB of a stream of `config` may raise it to: the
+/// level its size, frame rate and bitrate need, at least [`HIGHEST_FOR_DPB`],
+/// and at most `max_level`, the highest level the device encodes.
+pub(super) fn dpb_level_cap(
+    config: &EncodeConfig,
+    profile_idc: u32,
+    width: u32,
+    height: u32,
+    max_level: StdVideoH264LevelIdc,
+) -> StdVideoH264LevelIdc {
+    let without_dpb = level_for(&Needs::of_stream(config, profile_idc, width, height, 1));
+    without_dpb.max(HIGHEST_FOR_DPB).min(max_level)
+}
+
 /// The lowest level from [`LOWEST`] that allows `needs`, or the highest
 /// level there is if none does.
 pub(super) fn level_for(needs: &Needs) -> StdVideoH264LevelIdc {
@@ -93,6 +142,22 @@ pub(super) fn level_for(needs: &Needs) -> StdVideoH264LevelIdc {
         .filter(|limits| limits.level >= LOWEST)
         .find(|limits| fits(limits))
         .map_or(LEVELS[LEVELS.len() - 1].level, |limits| limits.level)
+}
+
+/// `MaxDpbFrames` (A.3.1): the most frames the DPB of a stream of
+/// `width_in_mbs` x `height_in_mbs` macroblocks holds at `level`.
+pub(super) fn max_dpb_frames(
+    width_in_mbs: u32,
+    height_in_mbs: u32,
+    level: StdVideoH264LevelIdc,
+) -> u32 {
+    let max_dpb_mbs = LEVELS
+        .iter()
+        .find(|limits| limits.level == level)
+        .map_or(LEVELS[LEVELS.len() - 1].max_dpb_mbs, |limits| {
+            limits.max_dpb_mbs
+        });
+    (max_dpb_mbs / (width_in_mbs * height_in_mbs).max(1)).min(16)
 }
 
 #[cfg(test)]
@@ -134,6 +199,30 @@ mod tests {
         let mut stream = needs(1920, 1080, 30, 4);
         stream.max_bitrate = 80_000_000;
         assert_eq!(level_for(&stream), 13);
+    }
+
+    #[test]
+    fn the_dpb_shrinks_with_the_frame() {
+        // 1920x1088 and 3840x2160 in macroblocks.
+        assert_eq!(max_dpb_frames(120, 68, 11), 4);
+        assert_eq!(max_dpb_frames(120, 68, 15), 16);
+        assert_eq!(max_dpb_frames(240, 135, 15), 5);
+        assert_eq!(max_dpb_frames(240, 135, 16), 16);
+    }
+
+    #[test]
+    fn the_dpb_raises_the_level_to_5_2_at_most() {
+        const HIGH: u32 = ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH;
+        let cap = |frame_rate: u32, max_level: StdVideoH264LevelIdc| {
+            let config = EncodeConfig::h264(3840, 2160)
+                .with_rate_control(RateControl::Cqp { qp: 30 })
+                .with_frame_rate(frame_rate, 1);
+            dpb_level_cap(&config, HIGH, 3840, 2160, max_level)
+        };
+        assert_eq!(cap(60, 18), 15);
+        // 4K at 120 fps needs level 6 for its frame rate.
+        assert_eq!(cap(120, 18), 16);
+        assert_eq!(cap(60, 14), 14);
     }
 
     #[test]

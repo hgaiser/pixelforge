@@ -50,7 +50,7 @@ impl H265 {
                 __bindgen_padding_0: [0; 3],
             },
             general_profile_idc: self.profile_idc(),
-            general_level_idc: ash::vk::native::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_5_1,
+            general_level_idc: self.level_idc,
         };
 
         let dec_pic_buf_mgr = ash::vk::native::StdVideoH265DecPicBufMgr {

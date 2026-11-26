@@ -1133,6 +1133,10 @@ pub(crate) struct CommonInitRequest<'a> {
     pub align_unit: u32,
     /// Upper bound on the reference window the codec's syntax allows.
     pub max_reference_window: usize,
+    /// The most pictures, the current one included, that the DPB of a stream
+    /// of the given aligned coded extent may hold, from the codec's level
+    /// limits. `None` when the codec's syntax is the only limit.
+    pub max_dpb_pictures: Option<&'a dyn Fn(u32, u32) -> usize>,
     /// How many references one frame may predict from, from the codec's own
     /// capabilities (`maxPPictureL0ReferenceCount`, `maxSingleReferenceCount`).
     pub max_frame_references: usize,
@@ -1379,9 +1383,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     // The B-frames of a pyramid that are references are held on top of the
     // window, which is the P-frames.
     let b_reference_count = gop.b_reference_count();
+    let level_dpb_limit = req
+        .max_dpb_pictures
+        .map_or(usize::MAX, |limit| limit(aligned_width, aligned_height));
     let window_limit = req
         .max_reference_window
         .min(max_dpb_slots_supported - 1)
+        .min(level_dpb_limit.saturating_sub(1))
         .min(MAX_DPB_SLOTS - 1)
         .saturating_sub(b_reference_count)
         .max(1);
