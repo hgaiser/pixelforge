@@ -35,7 +35,7 @@ use crate::video::{
 };
 use crate::vulkan::VideoContext;
 
-/// One DPB image and everything that lives and dies with it.
+/// One decoder image and everything that lives and dies with it.
 ///
 /// Held behind an `Arc` shared with every frame decoded into it, so a session
 /// rebuild frees only the images nothing is still holding. The rest outlive the
@@ -44,11 +44,26 @@ use crate::vulkan::VideoContext;
 /// full stop, with no exception for a stream that changes resolution.
 pub(crate) struct DpbImage {
     context: VideoContext,
-    image: vk::Image,
+    pub(super) image: vk::Image,
     memory: vk::DeviceMemory,
     /// One view per slot backed by this image: all of them for a layered DPB,
     /// exactly one when each slot has an image of its own.
     views: Vec<vk::ImageView>,
+}
+
+impl DpbImage {
+    pub(super) fn without_views(
+        context: VideoContext,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+    ) -> Self {
+        Self {
+            context,
+            image,
+            memory,
+            views: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for DpbImage {

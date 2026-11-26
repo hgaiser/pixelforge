@@ -46,10 +46,6 @@ pub(crate) struct DecodedPicture {
     pub film_grain: bool,
 }
 
-/// An image in the frame pool, by index.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PoolIndex(usize);
-
 /// DPB slots reserved by frames the caller is still holding.
 ///
 /// A pinned slot is one the driver decoded into and the caller is now reading,
@@ -123,36 +119,14 @@ impl SlotPins {
     }
 }
 
-/// Pins released by frames the caller has dropped, waiting to be reclaimed.
-///
-/// A [`DecodedFrame`] can be dropped on any thread, including while the decoder
-/// is submitting the next picture, so releases land here and the decoder folds
-/// them in the next time it needs storage.
-#[derive(Debug, Default)]
-pub(crate) struct ReleaseQueue {
-    released: Mutex<Vec<PoolIndex>>,
-}
-
-impl ReleaseQueue {
-    fn push(&self, index: PoolIndex) {
-        self.released.lock().unwrap().push(index);
-    }
-
-    fn take(&self) -> Vec<PoolIndex> {
-        std::mem::take(&mut *self.released.lock().unwrap())
-    }
-}
-
 /// Keeps a [`DecodedFrame`]'s storage reserved for as long as the frame lives.
 ///
 /// Dropping the frame drops this, which returns the storage to the decoder.
 #[derive(Debug)]
 pub(crate) enum FramePin {
-    /// A copy in the frame pool. Released lazily: the decoder never waits on
-    /// pool images, it just allocates another one.
     Pool {
-        index: PoolIndex,
-        releases: Arc<ReleaseQueue>,
+        #[allow(dead_code)]
+        image: Arc<DpbImage>,
     },
     /// The DPB slot the picture was decoded into, handed out without a copy.
     /// Releases the slot on drop, and holds the image itself so that a session
@@ -167,22 +141,10 @@ pub(crate) enum FramePin {
 
 impl Drop for FramePin {
     fn drop(&mut self) {
-        match self {
-            FramePin::Pool { index, releases } => releases.push(*index),
-            FramePin::DpbSlot { slot, pins, .. } => pins.release(*slot),
+        if let FramePin::DpbSlot { slot, pins, .. } = self {
+            pins.release(*slot);
         }
     }
-}
-
-/// State of one image in the frame pool.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PoolState {
-    /// Reusable.
-    Free,
-    /// Holds a decoded picture awaiting its turn in display order.
-    Buffered,
-    /// Handed to the caller; reserved until their [`DecodedFrame`] is dropped.
-    HandedOut,
 }
 
 /// One pooled image, sized to the picture it currently holds.
@@ -191,12 +153,10 @@ enum PoolState {
 /// reading one needs a view built for how they intend to read it (a sampled
 /// multi-planar view needs a ycbcr conversion, a copy needs no view at all).
 struct PoolImage {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
+    storage: Arc<DpbImage>,
     coded_width: u32,
     coded_height: u32,
     format: vk::Format,
-    state: PoolState,
 }
 
 /// Images that decoded pictures are copied into so they outlive their DPB slot.
@@ -211,29 +171,20 @@ struct PoolImage {
 /// are ordinary allocations rather than a hardware-bounded resource.
 struct FramePool {
     images: Vec<PoolImage>,
-    releases: Arc<ReleaseQueue>,
 }
 
 impl FramePool {
     fn new() -> Self {
-        Self {
-            images: Vec::new(),
-            releases: Arc::new(ReleaseQueue::default()),
-        }
-    }
-
-    /// Fold in the images released by dropped frames.
-    fn reclaim(&mut self) {
-        for PoolIndex(i) in self.releases.take() {
-            self.images[i].state = PoolState::Free;
-        }
+        Self { images: Vec::new() }
     }
 
     /// A free image matching `picture`'s geometry, creating or resizing one as
     /// needed. Resolution changes recreate a mismatched image.
-    fn acquire(&mut self, common: &DecoderCommon, picture: &DecodedPicture) -> Result<usize> {
-        self.reclaim();
-
+    fn acquire(
+        &mut self,
+        common: &DecoderCommon,
+        picture: &DecodedPicture,
+    ) -> Result<Arc<DpbImage>> {
         let format = common
             .session
             .as_ref()
@@ -241,13 +192,13 @@ impl FramePool {
             .expect("session active while decoding");
 
         let matching = self.images.iter().position(|p| {
-            p.state == PoolState::Free
+            Arc::strong_count(&p.storage) == 1
                 && p.coded_width == picture.coded_width
                 && p.coded_height == picture.coded_height
                 && p.format == format
         });
         if let Some(i) = matching {
-            return Ok(i);
+            return Ok(self.images[i].storage.clone());
         }
 
         let (image, memory) = create_pool_image(
@@ -257,61 +208,30 @@ impl FramePool {
             format,
             &common.picture_sharing_families(),
         )?;
-        let slot = PoolImage {
+        let storage = Arc::new(DpbImage::without_views(
+            common.context.clone(),
             image,
             memory,
+        ));
+        let slot = PoolImage {
+            storage: storage.clone(),
             coded_width: picture.coded_width,
             coded_height: picture.coded_height,
             format,
-            state: PoolState::Free,
         };
 
         // Reuse a free-but-mismatched image if one exists, else grow the pool.
-        if let Some(i) = self.images.iter().position(|p| p.state == PoolState::Free) {
-            self.destroy_image(common, i);
+        if let Some(i) = self
+            .images
+            .iter()
+            .position(|p| Arc::strong_count(&p.storage) == 1)
+        {
+            common.pipeline.wait_all_free();
             self.images[i] = slot;
-            Ok(i)
         } else {
             self.images.push(slot);
-            Ok(self.images.len() - 1)
         }
-    }
-
-    /// Mark `index` as handed to the caller and mint its pin.
-    fn hand_out(&mut self, index: usize) -> FramePin {
-        self.images[index].state = PoolState::HandedOut;
-        FramePin::Pool {
-            index: PoolIndex(index),
-            releases: self.releases.clone(),
-        }
-    }
-
-    fn destroy_image(&mut self, common: &DecoderCommon, i: usize) {
-        let p = &self.images[i];
-        if p.image == vk::Image::null() {
-            return;
-        }
-        unsafe {
-            // The pool image may be a copy target of a submission in flight.
-            common.pipeline.wait_all_free();
-            common.context.device().destroy_image(p.image, None);
-            common.context.device().free_memory(p.memory, None);
-        }
-    }
-
-    /// Whether any frame handed to the caller is still alive.
-    fn has_live_frames(&mut self) -> bool {
-        self.reclaim();
-        self.images.iter().any(|p| p.state == PoolState::HandedOut)
-    }
-
-    /// Free every pool image. The caller must be done with handed-out frames.
-    fn destroy(&mut self, common: &DecoderCommon) {
-        for i in 0..self.images.len() {
-            self.destroy_image(common, i);
-            self.images[i].image = vk::Image::null();
-        }
-        self.images.clear();
+        Ok(storage)
     }
 }
 
@@ -333,7 +253,7 @@ enum Retained {
         array_layer: u32,
     },
     /// A private copy in the frame pool.
-    Pool { index: usize },
+    Pool { image: Arc<DpbImage> },
 }
 
 /// A buffered picture, awaiting its turn in display order.
@@ -473,20 +393,15 @@ impl ReorderBuffer {
             });
         }
 
-        let index = self.pool.acquire(common, picture)?;
-        common.record_picture_copy(picture, self.pool.images[index].image)?;
+        let image = self.pool.acquire(common, picture)?;
+        common.record_picture_copy(picture, image.image)?;
         common.submit_copy()?;
-        self.pool.images[index].state = PoolState::Buffered;
-        Ok(Retained::Pool { index })
+        Ok(Retained::Pool { image })
     }
 
     /// Release buffered pictures once their GPU work has completed.
     pub fn discard(&mut self) {
-        for entry in self.buffered.drain(..) {
-            if let Retained::Pool { index } = entry.retained {
-                self.pool.images[index].state = PoolState::Free;
-            }
-        }
+        self.buffered.clear();
     }
 
     /// Emit every buffered picture in display order. Call at end of stream.
@@ -524,8 +439,8 @@ impl ReorderBuffer {
                 layout,
                 array_layer,
             } => (image, image_view, layout, array_layer, pin),
-            Retained::Pool { index } => (
-                self.pool.images[index].image,
+            Retained::Pool { image } => (
+                image.image,
                 // Pool images carry no view (see PoolImage); a caller needing
                 // one for GPU work creates it over `image` with the usage it
                 // wants.
@@ -533,7 +448,7 @@ impl ReorderBuffer {
                 // copy_picture_to_image leaves the pool image in TRANSFER_DST.
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 0,
-                self.pool.hand_out(index),
+                FramePin::Pool { image },
             ),
         };
 
@@ -556,23 +471,6 @@ impl ReorderBuffer {
             generation: entry.generation,
             pin: Some(pin),
         }
-    }
-
-    /// Release everything this buffer holds.
-    ///
-    /// Drops the buffered pictures first, which releases the DPB slots they
-    /// pinned, then frees the pool images. Frames the caller still holds point
-    /// at these images, so this warns rather than silently leaving dangling
-    /// handles behind.
-    pub fn destroy(&mut self, common: &DecoderCommon) {
-        self.buffered.clear();
-        if self.pool.has_live_frames() {
-            tracing::warn!(
-                "decoder dropped while decoded frames are still alive; their images \
-                 are now invalid. Drop every DecodedFrame before the Decoder."
-            );
-        }
-        self.pool.destroy(common);
     }
 }
 
@@ -651,6 +549,42 @@ fn create_pool_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Vulkan Video device"]
+    fn pooled_frame_outlives_decoder() -> Result<()> {
+        use crate::{Codec, DecodeConfig, Decoder, FramePoll, VideoContextBuilder, YuvDownloader};
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let context = VideoContextBuilder::new()
+            .require_decode(Codec::H264)
+            .enable_validation(std::env::var_os("PIXELFORGE_VALIDATION").is_some())
+            .build()?;
+        let mut downloader = YuvDownloader::new(&context)?;
+        let mut decoder = Decoder::new(context, DecodeConfig::new(Codec::H264).with_byte_stream())?;
+        decoder.decode(include_bytes!("../../tests/data/bframes.264"), 0)?;
+        decoder.flush()?;
+        let frame = loop {
+            let FramePoll::Frame(frame) = decoder.try_next_frame()? else {
+                panic!("expected a copied frame")
+            };
+            if frame.layout() == vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+                break frame;
+            }
+        };
+        let Some(FramePin::Pool { image }) = &frame.pin else {
+            panic!("missing pool image owner")
+        };
+        let allocation = Arc::downgrade(image);
+        let before = downloader.download(&frame)?;
+        drop(decoder);
+        assert_eq!(allocation.strong_count(), 1);
+        let after = downloader.download(&frame)?;
+        assert!(before.y == after.y && before.uv == after.uv);
+        drop(frame);
+        assert_eq!(allocation.strong_count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn a_slot_pinned_twice_stays_pinned_until_both_release() {
