@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 26-11-2026
+
+### Fixed
+
+- Keep the H.264 and H.265 DPB within what the stream's level allows. At large sizes the encoder holds fewer references than `max_reference_frames` asks for (5 at 4K) instead of breaking the level. Apple VideoToolbox stops decoding an H.265 stream whose DPB is too large for its level. A larger DPB raises an H.264 stream to level 5.2 at most.
+- Give H.265 streams the level their size and frame rate need, instead of always level 5.1. 4K at 120 fps gets level 5.2.
+- Make the bitstream buffer size a multiple of `minBitstreamBufferSizeAlignment`. At sizes such as 2736x1260 the encode broke a Vulkan valid usage rule.
+
 ## [0.14.0] - 20-11-2026
 
 ### Added
